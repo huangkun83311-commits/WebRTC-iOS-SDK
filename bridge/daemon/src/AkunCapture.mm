@@ -12,7 +12,7 @@ typedef int (*OpenFn)(uint32_t service, uint32_t owningTask, uint32_t type, IOMo
 typedef int (*GetSurfaceFn)(IOMobileFramebufferRef fb, int layer, IOSurfaceRef *out);
 typedef void (*RenderDisplayFn)(uint32_t ctx, CFStringRef display, IOSurfaceRef surface, int x, int y);
 
-static const int kFPS = 30;
+static const int kDefaultFPS = 12;
 
 @implementation AkunCapture {
     IOMobileFramebufferRef _fb;
@@ -29,6 +29,7 @@ static const int kFPS = 30;
 - (instancetype)init {
     if ((self = [super init])) {
         _queue = dispatch_queue_create("com.akun.capture", DISPATCH_QUEUE_SERIAL);
+        _fps = kDefaultFPS;
         _open = (OpenFn)dlsym(RTLD_DEFAULT, "IOMobileFramebufferOpen");
         _getSurface = (GetSurfaceFn)dlsym(RTLD_DEFAULT, "IOMobileFramebufferGetLayerDefaultSurface");
         _renderDisplay = (RenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
@@ -129,13 +130,14 @@ static const int kFPS = 30;
         return NO;
     }
     _running = YES;
+    int fps = (_fps > 0 && _fps <= 60) ? _fps : kDefaultFPS;
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
     dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
-                              NSEC_PER_SEC / kFPS, NSEC_PER_SEC / kFPS / 2);
+                              NSEC_PER_SEC / fps, NSEC_PER_SEC / fps / 2);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{ [weakSelf grabOneFrame]; });
     dispatch_resume(_timer);
-    NSLog(@"[capture] 已启动 %d fps", kFPS);
+    NSLog(@"[capture] 已启动 %d fps", fps);
     return YES;
 }
 

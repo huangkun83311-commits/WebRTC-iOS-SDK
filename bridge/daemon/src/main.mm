@@ -100,10 +100,23 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     NSDictionary *prefs = [self loadPrefs];
     self.serverBase = prefs[@"ServerBase"] ?: @"";
     self.deviceId = prefs[@"DeviceId"] ?: @"dev001";
-    NSLog(@"[daemon] server=%@ device=%@", self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId);
+
+    // 输出参数默认对齐 AKUN 出厂值：scale 0.35 / 12fps / 1.5Mbps。
+    // 这三个值决定了 30M 上行能带多少台还不卡，改之前先看 README。
+    double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
+    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 12;
+    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 1500000;
+    if (scale <= 0.0) { scale = 0.35; }
+    if (fps <= 0) { fps = 12; }
+    if (maxBitrate <= 0) { maxBitrate = 1500000; }
+
+    NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
+          self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId,
+          scale, fps, (long)maxBitrate);
 
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
+    self.capture.fps = fps;
 
     __weak typeof(self) weakSelf = self;
     self.capture.frameHandler = ^(CVPixelBufferRef pixelBuffer) {
@@ -119,6 +132,7 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 
     // 发现是异步的（广播+扫描要几秒），推流端先用占位地址起来，拿到地址后再切
     self.rtc = [[AkunRTC alloc] initWithServerBase:self.serverBase ?: @"" deviceId:self.deviceId];
+    [self.rtc configureWithScale:scale fps:fps maxBitrateBps:maxBitrate];
     [self.rtc start];
 
     if (![self.capture start]) {

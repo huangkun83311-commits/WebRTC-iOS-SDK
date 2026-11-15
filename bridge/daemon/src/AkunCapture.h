@@ -17,6 +17,9 @@
 @property (nonatomic, readonly) NSUInteger width;
 @property (nonatomic, readonly) NSUInteger height;
 
+/// 抓屏帧率，默认 12（对齐 AKUN 的出厂默认；30fps 在群控场景里只会白烧 CPU 和带宽）。
+@property (nonatomic, assign) int fps;
+
 /// 每帧回调（在内部串行队列上调用）。返回的 pixelBuffer 在回调返回后失效。
 @property (nonatomic, copy) void (^frameHandler)(CVPixelBufferRef pixelBuffer);
 

@@ -1,6 +1,7 @@
 #import "AkunRTC.h"
 #import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCVideoFrame.h>
+#import <math.h>
 
 @interface AkunRTC () <RTCPeerConnectionDelegate>
 @property (nonatomic, copy) NSString *serverBase;
@@ -17,6 +18,15 @@
 @property (nonatomic, assign) BOOL remoteDescriptionSet;
 @property (nonatomic, assign) NSInteger reconnectAttempt;
 @property (nonatomic, assign) NSUInteger pushedFrames;
+@property (nonatomic, strong) RTCRtpSender *sender;
+
+// 输出参数（对齐 AKUN 默认：0.35 / 12fps / 1.5Mbps）
+@property (nonatomic, assign) double scale;
+@property (nonatomic, assign) int targetFps;
+@property (nonatomic, assign) NSInteger maxBitrateBps;
+@property (nonatomic, assign) NSInteger sourceWidth;
+@property (nonatomic, assign) NSInteger sourceHeight;
+@property (nonatomic, assign) BOOL formatApplied;
 @end
 
 @implementation AkunRTC
@@ -26,8 +36,45 @@
         _serverBase = [base copy];
         _deviceId = [deviceId copy];
         _pendingCandidates = [NSMutableArray array];
+        _scale = 0.35;
+        _targetFps = 12;
+        _maxBitrateBps = 1500000;
     }
     return self;
+}
+
+- (void)configureWithScale:(double)scale fps:(int)fps maxBitrateBps:(NSInteger)maxBitrateBps {
+    self.scale = (scale > 0.05 && scale <= 1.0) ? scale : 0.35;
+    self.targetFps = (fps > 0 && fps <= 60) ? fps : 12;
+    self.maxBitrateBps = maxBitrateBps > 0 ? maxBitrateBps : 1500000;
+    NSLog(@"[rtc] 输出参数 scale=%.2f fps=%d maxBitrate=%ld",
+          self.scale, self.targetFps, (long)self.maxBitrateBps);
+    if (self.pc) { [self applyOutputFormat]; }
+}
+
+/// 把 scale/fps 应用到视频源，同时给这条 RTP 流加码率上限（对应 AKUN 的 AverageBitRate）。
+- (void)applyOutputFormat {
+    if (!self.videoSource) { return; }
+
+    if (self.sourceWidth > 0 && self.sourceHeight > 0) {
+        int w = (int)lround((double)self.sourceWidth * self.scale);
+        int h = (int)lround((double)self.sourceHeight * self.scale);
+        // H.264 友好：宽高必须是偶数
+        w -= (w % 2); h -= (h % 2);
+        if (w < 64) { w = 64; }
+        if (h < 64) { h = 64; }
+        [self.videoSource adaptOutputFormatToWidth:w height:h fps:self.targetFps];
+        NSLog(@"[rtc] 输出 %dx%d @%dfps（源 %ldx%ld，scale=%.2f）",
+              w, h, self.targetFps, (long)self.sourceWidth, (long)self.sourceHeight, self.scale);
+        self.formatApplied = YES;
+    }
+
+    if (self.maxBitrateBps > 0 && self.pc) {
+        BOOL ok = [self.pc setBweMinBitrateBps:nil
+                             currentBitrateBps:nil
+                                 maxBitrateBps:@(self.maxBitrateBps)];
+        NSLog(@"[rtc] 码率上限 %ld bps 设置%@", (long)self.maxBitrateBps, ok ? @"成功" : @"失败");
+    }
 }
 
 - (NSString *)wsURLString {
@@ -53,7 +100,6 @@
     self.factory = [[RTCPeerConnectionFactory alloc] initWithEncoderFactory:encoder decoderFactory:decoder];
 
     self.videoSource = [self.factory videoSourceForScreenCast:YES];
-    [self.videoSource adaptOutputFormatToWidth:720 height:1280 fps:30];
 
     self.capturer = [[RTCVideoCapturer alloc] initWithDelegate:self.videoSource];
     self.videoTrack = [self.factory videoTrackWithSource:self.videoSource trackId:@"screen0"];
@@ -68,7 +114,17 @@
     RTCMediaConstraints *constraints =
         [[RTCMediaConstraints alloc] initWithMandatoryConstraints:nil optionalConstraints:nil];
     self.pc = [self.factory peerConnectionWithConfiguration:config constraints:constraints delegate:self];
-    [self.pc addTrack:self.videoTrack streamIds:@[@"screen"]];
+    self.sender = [self.pc addTrack:self.videoTrack streamIds:@[@"screen"]];
+
+    // 带宽不够时优先保帧率、降分辨率（跟 AKUN 的「固定低帧率 + 缩放」一个取向），
+    // 这样群控里手感不会越用越滞后。
+    RTCRtpParameters *params = self.sender.parameters;
+    if (params) {
+        params.degradationPreference = @(RTCDegradationPreferenceMaintainFramerate);
+        self.sender.parameters = params;
+    }
+
+    [self applyOutputFormat];
     NSLog(@"[rtc] peer connection 就绪");
 }
 
@@ -211,6 +267,14 @@
 
 - (void)pushPixelBuffer:(CVPixelBufferRef)pixelBuffer {
     if (!self.videoSource || !pixelBuffer) { return; }
+
+    // 首帧拿到真实屏幕尺寸后再算输出尺寸：scale 0.35 → 1170×2532 变成约 410×886
+    if (self.sourceWidth == 0 || self.sourceHeight == 0) {
+        self.sourceWidth = (NSInteger)CVPixelBufferGetWidth(pixelBuffer);
+        self.sourceHeight = (NSInteger)CVPixelBufferGetHeight(pixelBuffer);
+        [self applyOutputFormat];
+    }
+
     RTCCVPixelBuffer *buffer = [[RTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
     int64_t ns = (int64_t)(CACurrentMediaTime() * 1000000000.0);
     RTCVideoFrame *frame = [[RTCVideoFrame alloc] initWithBuffer:buffer
