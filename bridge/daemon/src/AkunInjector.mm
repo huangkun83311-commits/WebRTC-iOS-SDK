@@ -270,6 +270,10 @@ static double clamp01(double v) {
             usleep(12000);
         }
         [self dispatchPhase:HID_PHASE_ENDED x:x2 y:y2];
+    } else if ([t isEqualToString:@"hk"]) {
+        uint32_t usage = (uint32_t)[cmd[@"usage"] unsignedIntValue];
+        NSLog(@"[inject] 键盘 usage=0x%x", usage);
+        [self sendConsumerUsage:usage];
     } else if ([t isEqualToString:@"k"]) {
         NSLog(@"[inject] key %@", cmd[@"code"]);
         [self dispatchKey:cmd[@"code"]];
@@ -280,6 +284,11 @@ static double clamp01(double v) {
 /// 键盘事件走的也是 IOHIDEventSystemClientDispatchEvent，但构造简单得多：
 /// 如果键盘能生效、触摸不行，说明分发通道是通的，问题只在 digitizer 事件的构造。
 - (void)sendKeyboardHome {
+    [self sendConsumerUsage:0x223];   // kHIDUsage_Csmr_ACHome
+}
+
+/// 对照实验：发一个 Consumer 页键盘事件（音量键能看到系统 HUD，最适合验证分发通道）。
+- (void)sendConsumerUsage:(uint32_t)usage {
     CreateKeyboardEventFn createKey =
         (CreateKeyboardEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventCreateKeyboardEvent");
     if (!createKey || !_dispatch || !_client) {
@@ -289,7 +298,7 @@ static double clamp01(double v) {
     for (int down = 1; down >= 0; down--) {
         IOHIDEventRef key = createKey(kCFAllocatorDefault, mach_absolute_time(),
                                       0x0C,      // kHIDPage_Consumer
-                                      0x223,     // kHIDUsage_Csmr_ACHome
+                                      usage,
                                       down, 0);
         if (!key) { continue; }
         if (_setSenderID) { _setSenderID(key, kSenderID); }

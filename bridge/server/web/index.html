@@ -192,6 +192,7 @@
       ctrlWs.send(JSON.stringify(payload));
     }
   }
+  window.__ctrlSend = ctrl;   // 调试用：控制台可直接 __ctrlSend({t:'hk',usage:233})
 
   /* ---------------- 触摸映射 ---------------- */
   function norm(ev) {
