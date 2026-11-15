@@ -61,8 +61,9 @@ typedef void (*DispatchEventFn)(IOHIDEventSystemClientRef, IOHIDEventRef);
 #define HID_TYPE_HAND 3
 #define HID_TYPE_FINGER 2
 
-// AKUN 用的发送者 ID；内置触摸屏修饰位不一致时它是关键一项
-static const uint64_t kSenderID = 0x8000000817319371ULL;
+// 发送者 ID。AKUN 源码注释：0x8000000817319371 对应 iOS 9+，0x8000000817319372 在 iOS 14.8~26 有效。
+// 本机是 iOS 16.7.16，先按新系统的值来。
+static const uint64_t kSenderID = 0x8000000817319372ULL;
 static const double kMinEventInterval = 0.012;
 
 @implementation AkunInjector {
