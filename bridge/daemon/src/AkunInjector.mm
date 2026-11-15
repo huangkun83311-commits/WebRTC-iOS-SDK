@@ -48,6 +48,19 @@ typedef uint32_t (*GetTypeFn)(IOHIDEventRef);
 typedef uint64_t (*GetSenderIDFn)(IOHIDEventRef);
 typedef double (*GetFloatFn)(IOHIDEventRef, int32_t);
 typedef IOHIDEventRef (*CreateKeyboardEventFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, Boolean, uint32_t);
+typedef void (*SetDispatchQueueFn)(IOHIDEventSystemClientRef, dispatch_queue_t);
+
+/// 全局唯一的 HID 串行队列（AKUN 也是在固定队列上发事件）。
+static dispatch_queue_t AkunHIDQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_attr_t attr =
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        q = dispatch_queue_create("com.akun.bridge.hid", attr);
+    });
+    return q;
+}
 
 // IOHIDEventField 数值（对照 AKUN include-spi/IOKitSPI.h 的枚举）
 #define kHIDFieldIsBuiltIn 4                                  // kIOHIDEventTypeNULL 基址 + 4
@@ -121,6 +134,22 @@ static const double kMinEventInterval = 0.012;
         if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) {
             NSLog(@"[inject] 私有符号不全，注入功能不可用（看上面指针哪个是 0）");
         }
+
+        // iOS 14+ 的 IOHIDEventSystemClient 需要激活后才接收/分发事件；
+        // 不激活时 DispatchEvent 会静默丢弃（表现就是"发了但没反应"）。
+        ActivateClientFn act = (ActivateClientFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientActivate");
+        if (_client && act) {
+            act(_client);
+            NSLog(@"[inject] 已 Activate dispatch client");
+        } else {
+            NSLog(@"[inject] 没有 Activate 符号（act=%p）", act);
+        }
+        SetDispatchQueueFn setQueue =
+            (SetDispatchQueueFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientSetDispatchQueue");
+        if (_client && setQueue) {
+            setQueue(_client, AkunHIDQueue());
+            NSLog(@"[inject] 已给 dispatch client 绑定队列");
+        }
     }
     return self;
 }
@@ -182,17 +211,10 @@ static double clamp01(double v) {
 
         // 完全照 AKUN 的发法：串行队列 + CFRetain 后异步 dispatch，发完才 release。
         // 同步 dispatch 紧接着 CFRelease，事件常常还没走完 XPC 就被回收 → 表现就是“点了没反应”。
-        static dispatch_queue_t hidQueue;
-        static dispatch_once_t onceQueue;
-        dispatch_once(&onceQueue, ^{
-            dispatch_queue_attr_t attr =
-                dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
-            hidQueue = dispatch_queue_create("com.akun.bridge.hid", attr);
-        });
         IOHIDEventRef strong = (IOHIDEventRef)CFRetain(hand);
         IOHIDEventSystemClientRef client = _client;
         DispatchEventFn send = _dispatch;
-        dispatch_async(hidQueue, ^{
+        dispatch_async(AkunHIDQueue(), ^{
             send(client, strong);
             CFRelease(strong);
             NSLog(@"[inject] 已发 phase=%u mask=0x%x (%.3f, %.3f)", phase, mask, x, y);
