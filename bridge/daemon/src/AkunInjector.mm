@@ -39,6 +39,15 @@ typedef IOHIDEventSystemClientRef (*ClientCreateFn)(CFAllocatorRef);
 typedef IOHIDEventSystemClientRef (*ClientCreateWithTypeFn)(CFAllocatorRef, int, void *);
 typedef void (*DispatchEventFn)(IOHIDEventSystemClientRef, IOHIDEventRef);
 
+// 事件监听（诊断用）：看注入的事件到底有没有进系统事件流
+typedef void (^HIDEventCallbackBlock)(void *target, void *service, IOHIDEventRef event);
+typedef void (*RegisterCallbackFn)(IOHIDEventSystemClientRef, HIDEventCallbackBlock, void *, dispatch_queue_t);
+typedef void (*SetMatchingFn)(IOHIDEventSystemClientRef, CFDictionaryRef);
+typedef void (*ActivateClientFn)(IOHIDEventSystemClientRef);
+typedef uint32_t (*GetTypeFn)(IOHIDEventRef);
+typedef uint64_t (*GetSenderIDFn)(IOHIDEventRef);
+typedef double (*GetFloatFn)(IOHIDEventRef, int32_t);
+
 // IOHIDEventField 数值（对照 AKUN include-spi/IOKitSPI.h 的枚举）
 #define kHIDFieldIsBuiltIn 4                                  // kIOHIDEventTypeNULL 基址 + 4
 #define kHIDFieldDigitizerIsDisplayIntegrated 0x00030019      // 基址 0x30000 + 20 + 5
@@ -111,6 +120,8 @@ static const double kMinEventInterval = 0.012;
         if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) {
             NSLog(@"[inject] 私有符号不全，注入功能不可用（看上面指针哪个是 0）");
         }
+
+        [self startEventMonitor:createWithType];
     }
     return self;
 }
@@ -190,6 +201,39 @@ static double clamp01(double v) {
     }
     if (finger) { CFRelease(finger); }
     if (hand) { CFRelease(hand); }
+}
+
+/// 诊断：挂一个 HID 事件监听，把收到的 digitizer 事件打出来。
+/// 用来区分“注入没发出去”和“发出去了但 SpringBoard 不认”。
+- (void)startEventMonitor:(ClientCreateWithTypeFn)createWithType {
+    if (!createWithType) { return; }
+    RegisterCallbackFn reg = (RegisterCallbackFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientRegisterEventCallback");
+    ActivateClientFn act = (ActivateClientFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientActivate");
+    GetTypeFn getType = (GetTypeFn)dlsym(RTLD_DEFAULT, "IOHIDEventGetType");
+    GetSenderIDFn getSender = (GetSenderIDFn)dlsym(RTLD_DEFAULT, "IOHIDEventGetSenderID");
+    if (!reg) {
+        NSLog(@"[inject] 没有 RegisterEventCallback，跳过监听");
+        return;
+    }
+    @try {
+        IOHIDEventSystemClientRef mon = createWithType(kCFAllocatorDefault, 1, NULL);  // 1 = Monitor
+        if (!mon) {
+            NSLog(@"[inject] 监听 client 创建失败");
+            return;
+        }
+        dispatch_queue_t q = dispatch_queue_create("com.akun.bridge.hid-monitor", DISPATCH_QUEUE_SERIAL);
+        reg(mon, ^(void *target, void *service, IOHIDEventRef event) {
+            if (!event || !getType) { return; }
+            uint32_t t = getType(event);
+            if (t != 11) { return; }   // 11 = kIOHIDEventTypeDigitizer
+            uint64_t sid = getSender ? getSender(event) : 0;
+            NSLog(@"[inject] 监听到 digitizer 事件 sender=0x%llx", sid);
+        }, NULL, q);
+        if (act) { act(mon); }
+        NSLog(@"[inject] 事件监听已启动");
+    } @catch (NSException *e) {
+        NSLog(@"[inject] 监听启动异常：%@", e);
+    }
 }
 
 - (void)handleCommand:(NSDictionary *)cmd {
