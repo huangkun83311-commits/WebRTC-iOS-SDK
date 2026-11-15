@@ -207,7 +207,14 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
             NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             if ([cmd isKindOfClass:[NSDictionary class]]) {
                 NSString *type = cmd[@"t"];
-                if ([type isEqualToString:@"cfg"]) {
+                if ([type isEqualToString:@"ping"]) {
+                    // 只测控制链路往返，不触发任何动作
+                    NSDictionary *pong = @{@"t" : @"pong", @"ts" : cmd[@"ts"] ?: @0};
+                    NSData *d = [NSJSONSerialization dataWithJSONObject:pong options:0 error:nil];
+                    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                    [self.ctrlTask sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:s]
+                              completionHandler:^(NSError *e) {}];
+                } else if ([type isEqualToString:@"cfg"]) {
                     // 中控/网页在线改画质，不用重装包
                     double scale = self.cfgScale;
                     int fps = self.cfgFps;

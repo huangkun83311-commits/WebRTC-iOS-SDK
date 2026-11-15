@@ -53,7 +53,7 @@
   const $ = (id) => document.getElementById(id);
   const stage = $('stage'), screenEl = $('screen'), video = $('video');
 
-  let videoWs = null, ctrlWs = null, pc = null, videoRetry = null;
+  let videoWs = null, ctrlWs = null, pc = null, videoRetry = null, pingTimer = null;
   let lastMoveSent = 0;
 
   const WS_BASE = (function () {
@@ -197,12 +197,30 @@
   }
 
   /* ---------------- 控制：WebSocket 转发 ---------------- */
+  let rttMs = null;   // 控制链路往返时延（网页↔中继↔设备），用来判断「点击迟钝」是不是链路问题
+
   function startControl(room) {
     ctrlWs = new WebSocket(WS_BASE + '/ws?room=ctrl-' + encodeURIComponent(room) + '&role=pc');
 
-    ctrlWs.onopen = () => { setDot($('ctrlDot'), true); log('control open'); };
-    ctrlWs.onclose = () => { setDot($('ctrlDot'), false); log('control closed'); };
-    ctrlWs.onmessage = (ev) => log('ctrl recv', ev.data);
+    ctrlWs.onopen = () => {
+      setDot($('ctrlDot'), true);
+      log('control open');
+      // 每秒一次 ping，设备端原样回 pong，只测控制链路
+      if (pingTimer) clearInterval(pingTimer);
+      pingTimer = setInterval(() => ctrl({ t: 'ping', ts: Date.now() }), 1000);
+    };
+    ctrlWs.onclose = () => {
+      setDot($('ctrlDot'), false);
+      log('control closed');
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    };
+    ctrlWs.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        if (m && m.t === 'pong' && m.ts) { rttMs = Date.now() - m.ts; return; }
+      } catch (e) {}
+      log('ctrl recv', ev.data);
+    };
   }
 
   function ctrl(payload) {
@@ -302,7 +320,8 @@
           const dt = lastStatTs ? (now - lastStatTs) / 1000 : 0;
           const kbps = dt > 0 ? ((r.bytesReceived - lastBytes) * 8 / 1000 / dt) : 0;
           lastBytes = r.bytesReceived; lastStatTs = now;
-          line = `${r.frameWidth || 0}x${r.frameHeight || 0} ${Math.round(kbps)}kbps 丢${r.packetsLost || 0}`;
+          line = `${r.frameWidth || 0}x${r.frameHeight || 0} ${Math.round(kbps)}kbps 丢${r.packetsLost || 0}`
+               + (rttMs !== null ? ` 延迟${Math.round(rttMs)}ms` : '');
         }
       });
       if (line) $('stat').textContent = line;
@@ -321,6 +340,7 @@
 
   function stopAll() {
     if (videoRetry) { clearInterval(videoRetry); videoRetry = null; }
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     try { pc && pc.close(); } catch (e) {}
     pc = null;
     if (videoWs) { videoWs.onclose = null; videoWs.close(); videoWs = null; }
