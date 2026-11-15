@@ -1,0 +1,111 @@
+#!/bin/sh
+# 装完立刻把 daemon 拉起来。
+#
+# 为什么必须有这个脚本：Dopamine / rootless 环境下，dpkg 只是把 plist 放到
+# /var/jb/Library/LaunchDaemons，launchd 并不会自己拾取（尤其 rootd 安装路径）。
+# 不显式 load，进程永远是死的 —— 表现就是手机一个包都不发、网页画面一直红。
+#
+# 写法对照 AKUN（com.82flex.trollvnc）的 postinst：先试 kickstart，
+# 不行再 load -w -F，再不行退化 load，全都失败才放弃，并把过程写进 /tmp 方便排查。
+
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin"
+export PATH
+
+exec 3>&1 >/dev/null 2>&1
+
+LABEL="com.akun.bridge"
+LOG="/tmp/akun-bridge-postinst.log"
+
+log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
+
+LAUNCHCTL="$(command -v launchctl 2>/dev/null)"
+[ -x "$LAUNCHCTL" ] || LAUNCHCTL="/bin/launchctl"
+[ -x "$LAUNCHCTL" ] || LAUNCHCTL="/usr/bin/launchctl"
+[ -x "$LAUNCHCTL" ] || LAUNCHCTL="/var/jb/usr/bin/launchctl"
+[ -x "$LAUNCHCTL" ] || LAUNCHCTL=""
+
+find_plist() {
+    for base in /var/jb/Library/LaunchDaemons /Library/LaunchDaemons /private/var/jb/Library/LaunchDaemons; do
+        if [ -f "$base/$LABEL.plist" ]; then
+            echo "$base/$LABEL.plist"
+            return 0
+        fi
+    done
+    return 1
+}
+
+has_job() {
+    [ -x "$LAUNCHCTL" ] && "$LAUNCHCTL" list 2>/dev/null | awk '{print $3}' | grep -qx "$LABEL"
+}
+
+: > "$LOG" 2>/dev/null
+log "===== postinst ====="
+log "PATH=$PATH"
+log "launchctl=[$LAUNCHCTL]  uid=$(id -u 2>/dev/null)"
+
+PLIST="$(find_plist)"
+log "plist=[$PLIST]"
+if [ -z "$PLIST" ]; then
+    log "找不到 plist，放弃（包没装全？）"
+    exit 0
+fi
+
+# 二进制与框架可执行位兜底
+for b in /var/jb/usr/bin/akund /usr/bin/akund; do
+    [ -f "$b" ] && chmod 0755 "$b" && log "chmod 0755 $b"
+done
+for f in /var/jb/usr/lib/WebRTC.framework/WebRTC; do
+    [ -f "$f" ] && log "found $f"
+done
+log "--- ldid -e 自检（顶层 entitlements 头两行） ---"
+(command -v ldid >/dev/null 2>&1 && ldid -e /var/jb/usr/bin/akund 2>&1 | head -3) >> "$LOG" 2>&1
+
+# 等 dpkg 收尾，避免和正在写数据库的进程抢
+sleep 2
+
+if [ ! -x "$LAUNCHCTL" ]; then
+    log "launchctl 不可用，只能等下次开机由 launchd 拉起"
+    exit 0
+fi
+
+if has_job; then
+    log "job 已存在，kickstart -k"
+    "$LAUNCHCTL" kickstart -k "system/$LABEL" >> "$LOG" 2>&1
+    sleep 2
+else
+    log "job 不存在，load -w -F $PLIST"
+    "$LAUNCHCTL" load -w -F "$PLIST" >> "$LOG" 2>&1
+    sleep 2
+    if ! has_job; then
+        log "load -w -F 失败，退化 load"
+        "$LAUNCHCTL" load "$PLIST" >> "$LOG" 2>&1
+        sleep 2
+    fi
+    if ! has_job; then
+        log "load 也失败，试 bootstrap system"
+        "$LAUNCHCTL" bootstrap system "$PLIST" >> "$LOG" 2>&1
+        sleep 2
+    fi
+fi
+
+# 再给 launchd 的 ThrottleInterval(5s) 一点时间自愈一次
+i=0
+while [ "$i" -lt 10 ]; do
+    if has_job; then break; fi
+    sleep 1
+    i=$((i+1))
+done
+
+log "--- launchctl list 结果 ---"
+"$LAUNCHCTL" list 2>/dev/null | grep -i "akun" >> "$LOG" 2>&1
+
+if has_job; then
+    log "结果：daemon 已登记"
+else
+    log "结果：daemon 未登记（看上面日志与 /tmp/akund-stderr.log）"
+fi
+
+log "--- akund-stderr.log 尾部 ---"
+tail -15 /tmp/akund-stderr.log >> "$LOG" 2>&1
+
+exit 0

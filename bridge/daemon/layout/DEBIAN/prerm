@@ -1,0 +1,30 @@
+#!/bin/sh
+# 卸载/升级前停掉 daemon。升级时不杀，交给新包 postinst 重启（AKUN 同款处理）。
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin"
+export PATH
+
+exec 3>&1 >/dev/null 2>&1
+
+LABEL="com.akun.bridge"
+
+case "$1" in
+    upgrade|failed-upgrade)
+        exit 0
+        ;;
+esac
+
+LAUNCHCTL="$(command -v launchctl 2>/dev/null)"
+[ -x "$LAUNCHCTL" ] || LAUNCHCTL="/bin/launchctl"
+[ -x "$LAUNCHCTL" ] || LAUNCHCTL="/usr/bin/launchctl"
+[ -x "$LAUNCHCTL" ] || LAUNCHCTL=""
+
+if [ -x "$LAUNCHCTL" ]; then
+    "$LAUNCHCTL" remove "system/$LABEL" >/dev/null 2>&1
+    for base in /var/jb/Library/LaunchDaemons /Library/LaunchDaemons; do
+        [ -f "$base/$LABEL.plist" ] && "$LAUNCHCTL" unload "$base/$LABEL.plist" >/dev/null 2>&1
+    done
+fi
+
+command -v killall >/dev/null 2>&1 && killall akund >/dev/null 2>&1
+
+exit 0
