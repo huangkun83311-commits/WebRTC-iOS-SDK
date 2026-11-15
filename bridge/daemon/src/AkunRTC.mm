@@ -70,10 +70,30 @@
     }
 
     if (self.maxBitrateBps > 0 && self.pc) {
-        BOOL ok = [self.pc setBweMinBitrateBps:nil
-                             currentBitrateBps:nil
+        // 下限给足：默认起始码率很低，会先糊一阵再爬上来，局域网里没必要
+        NSNumber *minRate = @(MAX(300000, (NSInteger)(self.maxBitrateBps * 0.5)));
+        BOOL ok = [self.pc setBweMinBitrateBps:minRate
+                             currentBitrateBps:@(self.maxBitrateBps)
                                  maxBitrateBps:@(self.maxBitrateBps)];
-        NSLog(@"[rtc] 码率上限 %ld bps 设置%@", (long)self.maxBitrateBps, ok ? @"成功" : @"失败");
+        NSLog(@"[rtc] 码率 %ld~%ld bps 设置%@", (long)minRate.integerValue,
+              (long)self.maxBitrateBps, ok ? @"成功" : @"失败");
+    }
+
+    // 帧率上限 + 优先级：让 WebRTC 直接按我们要的节奏出帧，不要它自己再"平滑"一遍
+    if (self.sender) {
+        RTCRtpParameters *params = self.sender.parameters;
+        if (params && params.encodings.count > 0) {
+            RTCRtpEncodingParameters *enc = params.encodings.firstObject;
+            enc.maxFramerate = @(self.targetFps);
+            enc.maxBitrateBps = @(self.maxBitrateBps);
+            enc.minBitrateBps = @(MIN(self.maxBitrateBps, MAX(300000, (NSInteger)(self.maxBitrateBps * 0.5)));
+            enc.bitratePriority = 1.0;
+            enc.networkPriority = RTCPriorityHigh;
+            params.degradationPreference = @(RTCDegradationPreferenceMaintainFramerate);
+            self.sender.parameters = params;
+            NSLog(@"[rtc] 编码参数 maxFramerate=%d maxBitrate=%ld", self.targetFps,
+                  (long)self.maxBitrateBps);
+        }
     }
 }
 

@@ -35,6 +35,7 @@ int gOrientationFixQuad = 0;
     double _lastX;
     double _lastY;
     BOOL _dragging;
+    double _downTime;
 }
 
 - (instancetype)init {
@@ -105,6 +106,7 @@ static double clamp01(double v) {
         // 与 AKUN ptrAddEvent 一致：按下发 touchDown，移动发 _updateTouchPoints，抬起发 liftUp
         _dragging = YES;
         _startX = x; _startY = y; _lastX = x; _lastY = y;
+        _downTime = CACurrentMediaTime();
         CGPoint p = [self pointFromNormX:x y:y];
         NSLog(@"[inject] down (%f,%f)", p.x, p.y);
         [gen touchDownAtPoints:&p touchCount:1];
@@ -118,7 +120,10 @@ static double clamp01(double v) {
         if (_dragging) {
             _dragging = NO;
             CGPoint b = [self pointFromNormX:(x > 0 ? x : _lastX) y:(y > 0 ? y : _lastY)];
-            NSLog(@"[inject] up (%f,%f)", b.x, b.y);
+            // 最短按住 100ms：网页鼠标点按常常只有 20~40ms，SpringBoard 会当成无效触摸丢掉
+            double held = CACurrentMediaTime() - _downTime;
+            if (held < 0.10) { usleep((useconds_t)((0.10 - held) * 1e6)); }
+            NSLog(@"[inject] up (%f,%f) 按住 %.0fms", b.x, b.y, held * 1000);
             [gen liftUpAtPoints:&b touchCount:1];
         }
     } else if ([t isEqualToString:@"swipe"]) {

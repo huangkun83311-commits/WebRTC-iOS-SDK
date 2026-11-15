@@ -18,6 +18,8 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 
+#import "vendor/UIScreen+Private.h"
+
 typedef void (*RenderDisplayFn)(uint32_t ctx, CFStringRef display, IOSurfaceRef surface, int x, int y);
 typedef CFIndex (*GetDirtyFrameCountFn)(void *);
 
@@ -50,8 +52,16 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
 #pragma mark - 屏幕尺寸
 
-/// 像素尺寸：优先 UIScreen nativeBounds（daemon 里也能取到），失败再退常用值。
+/// 抓取尺寸：**必须**用渲染服务器实际出图的那块尺寸（_unjailedReferenceBoundsInPixels）。
+/// 用 nativeBounds（1080x1920）会小一圈，渲染结果被裁掉右侧/底部（图标列被切、坐标也整体偏）。
 - (CGSize)screenPixelSize {
+    @try {
+        UIScreen *screen = [UIScreen mainScreen];
+        CGRect r = [screen _unjailedReferenceBoundsInPixels];
+        if (r.size.width > 0 && r.size.height > 0) { return r.size; }
+    } @catch (NSException *e) {
+        NSLog(@"[capture] _unjailedReferenceBoundsInPixels 异常: %@", e.reason);
+    }
     @try {
         UIScreen *screen = [UIScreen mainScreen];
         CGSize s = screen.nativeBounds.size;
