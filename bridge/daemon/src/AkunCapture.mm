@@ -27,6 +27,10 @@ typedef void (*RenderDisplayFn)(uint32_t ctx, CFStringRef display, IOSurfaceRef 
 typedef CFIndex (*GetDirtyFrameCountFn)(void *);
 
 static const int kDefaultFPS = 12;
+/// 抓屏轮询间隔：8ms 一次「画面变了吗」。
+/// 以前是 1/fps（20fps=50ms）当节拍，最坏要等 50ms 才抓一次，这就是「点了之后慢半拍」的来源；
+/// 改成 8ms 轮询 + fps 闸门：变化一出现最迟 8ms 就被抓走，帧率仍被 fps 上限压住，不额外花 CPU。
+static const double kPollSec = 0.008;
 static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
 @implementation AkunCapture {
@@ -51,6 +55,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double _scaleMsSum;          // vImage 缩图耗时合计
     double _allocMsSum;          // 取池内目标缓冲的耗时合计（编码器占着池子时会卡这里）
     double _lastAllocMs;         // 本帧取缓冲耗时
+    NSTimeInterval _lastPushMono; // 上次真正推帧的时刻（fps 闸门用）
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
     // GPU 缩图（Core Image + Metal）：拿不到 Metal 就退回 vImage
@@ -183,10 +188,10 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
 - (void)applyTimerFps:(int)fps {
     if (!_timer) { return; }
-    int v = (fps >= 1 && fps <= 60) ? fps : kDefaultFPS;
-    // leeway 给 0：帧间隔必须准，抖动本身就是「卡顿感」的来源
+    // 节拍恒为 8ms 轮询；fps 只作闸门（见 grabOneFrame），改 fps 不需要重建定时器精度
+    (void)fps;
     dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
-                              NSEC_PER_SEC / v, 0);
+                              (uint64_t)(kPollSec * NSEC_PER_SEC), 0);
 }
 
 /// scale 只决定「缩图后的输出尺寸」，渲染 surface 始终是整屏，所以这里不用重建 surface。
@@ -326,13 +331,17 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         return;
     }
 
-    // 画面没变就不推（AKUN 用 dirtyFrameCount 做同样的判断），但每秒至少补一帧保活
+    NSTimeInterval now = CACurrentMediaTime();
+    // 画面没变就不推（AKUN 用 dirtyFrameCount 做同样的判断），但每 2s 至少补一帧保活
+    BOOL changed = YES;
     if (_dirtyFrameCount) {
         CFIndex c = _dirtyFrameCount(NULL);
-        // 静止画面只留 2s 一次保活帧（以前是 1s）：静止时上行几乎归零，动一下立刻就有帧
-        if (c == _lastDirtyCount && (CACurrentMediaTime() - _lastPushTime) < 2.0) { return; }
+        if (c == _lastDirtyCount && (now - _lastPushTime) < 2.0) { return; }
+        changed = (c != _lastDirtyCount);
         _lastDirtyCount = c;
     }
+    // fps 闸门：画面在变时，按 fps 上限限流；不足一帧间隔的这次轮询直接跳过，让下一次尽早补上
+    if (changed && (now - _lastPushMono) < (1.0 / (double)MAX(1, _activeFps)) - 0.001) { return; }
 
     int slot = _cur;
     IOSurfaceRef surface = _surfaces[slot];
@@ -347,6 +356,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     // 推上一帧的槽位（双缓冲，交替）
     _cur = 1 - _cur;
     _lastPushTime = CACurrentMediaTime();
+    _lastPushMono = _lastPushTime;
 
     CVPixelBufferRef out = [self scaleFrame:pbuf];
     NSTimeInterval t2 = CACurrentMediaTime();
@@ -412,14 +422,13 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         return NO;
     }
     _running = YES;
-    int fps = (_fps > 0 && _fps <= 60) ? _fps : kDefaultFPS;
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
     dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
-                              NSEC_PER_SEC / fps, NSEC_PER_SEC / fps / 2);
+                              (uint64_t)(kPollSec * NSEC_PER_SEC), 0);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{ [weakSelf grabOneFrame]; });
     dispatch_resume(_timer);
-    NSLog(@"[capture] 已启动 %d fps", fps);
+    NSLog(@"[capture] 已启动：8ms 轮询抓变化，fps 上限 %d", _activeFps > 0 ? _activeFps : _fps);
     return YES;
 }
 
