@@ -78,11 +78,20 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     if (_surfaces[0]) { return YES; }
 
     CGSize sz = [self screenPixelSize];
-    size_t w = (size_t)lround(sz.width);
-    size_t h = (size_t)lround(sz.height);
-    NSLog(@"[capture] 屏像素 %zu x %zu", w, h);
-    if (w == 0 || h == 0) { return NO; }
+    _screenWidth = (NSInteger)lround(sz.width);
+    _screenHeight = (NSInteger)lround(sz.height);
+    NSLog(@"[capture] 屏像素 %ld x %ld", (long)_screenWidth, (long)_screenHeight);
+    if (_screenWidth == 0 || _screenHeight == 0) { return NO; }
+
+    // 出图尺寸 = 屏像素 × scale：让渲染服务器直接按目标尺寸出图（GPU 缩放，零 CPU），
+    // 编码器输入就是 434x772 这种小图，不必再由 libwebrtc 逐帧缩放（那是延迟的大头）。
+    double s = (_outputScale > 0.05 && _outputScale <= 1.0) ? _outputScale : 1.0;
+    size_t w = (size_t)lround((double)_screenWidth * s);
+    size_t h = (size_t)lround((double)_screenHeight * s);
     w &= ~1UL; h &= ~1UL;                     // 宽高取偶数
+    if (w < 16) { w = 16; }
+    if (h < 16) { h = 16; }
+    NSLog(@"[capture] 出图 %zux%zu（scale=%.2f）", w, h, s);
 
     size_t bytesPerRow = ((w * 4) + 63) & ~63UL;   // 64 字节对齐
 
@@ -134,6 +143,22 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     _height = h;
     NSLog(@"[capture] surface %zux%zu stride=%zu（零拷贝，双缓冲）", w, h, bytesPerRow);
     return YES;
+}
+
+/// scale 变了要重建 surface（出图尺寸跟着变），否则画面会一直停在旧尺寸
+- (void)setOutputScale:(double)scale {
+    double s = (scale > 0.05 && scale <= 1.0) ? scale : 1.0;
+    if (fabs(s - _outputScale) < 0.001) { return; }
+    @synchronized (self) {
+        _outputScale = s;
+        // 释放旧的两块，下一帧 grabOneFrame 会按新尺寸重建
+        for (int i = 0; i < 2; i++) {
+            if (_pixelBuffers[i]) { CVPixelBufferRelease(_pixelBuffers[i]); _pixelBuffers[i] = NULL; }
+            if (_surfaces[i]) { CFRelease(_surfaces[i]); _surfaces[i] = NULL; }
+        }
+        _width = 0; _height = 0;
+        NSLog(@"[capture] 输出缩放到 %.2f，重建 surface", s);
+    }
 }
 
 #pragma mark - 抓帧

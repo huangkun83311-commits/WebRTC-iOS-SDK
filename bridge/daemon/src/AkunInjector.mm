@@ -9,6 +9,7 @@
 //  _unjailedReferenceBoundsInPixels（1080x1920）再喂 HID，所以网页来的 0~1 要先乘回来。
 
 #import "AkunInjector.h"
+#import "AkunOrientation.h"
 
 #import <UIKit/UIKit.h>
 
@@ -76,9 +77,46 @@ static double clamp01(double v) {
     return v;
 }
 
+/// 归一化坐标 → 竖屏物理像素。
+/// quad != 0 时，客户端看到的是「转过的画面」，这里按 AKUN 的 vncPointToDevicePoint
+/// 反向旋转，保证点哪就是哪（不修这段，横屏下点按会整体偏、甚至点不中）。
 - (CGPoint)pointFromNormX:(double)x y:(double)y {
     CGSize s = [self pixelSize];
-    return CGPointMake(clamp01(x) * s.width, clamp01(y) * s.height);
+    double W = s.width, H = s.height;
+    double nx = clamp01(x), ny = clamp01(y);
+    int q = [AkunOrientation quad];
+
+    // 旋转后的舞台尺寸
+    double rotW = (q % 2 == 0) ? W : H;
+    double rotH = (q % 2 == 0) ? H : W;
+    double stX = nx * rotW;
+    double stY = ny * rotH;
+
+    double dx = 0, dy = 0;
+    switch (q) {
+    case 1:  // 90°CW：stageX = srcH-1-srcY, stageY = srcX  =>  srcX = stageY, srcY = srcH-1-stageX
+        dx = stY;
+        dy = (H - 1) - stX;
+        break;
+    case 2:  // 180°
+        dx = (W - 1) - stX;
+        dy = (H - 1) - stY;
+        break;
+    case 3:  // 270°CW
+        dx = (W - 1) - stY;
+        dy = stX;
+        break;
+    case 0:
+    default:
+        dx = stX;
+        dy = stY;
+        break;
+    }
+    if (dx < 0) { dx = 0; }
+    if (dy < 0) { dy = 0; }
+    if (dx > W - 1) { dx = W - 1; }
+    if (dy > H - 1) { dy = H - 1; }
+    return CGPointMake(dx, dy);
 }
 
 - (void)handleCommand:(NSDictionary *)cmd {

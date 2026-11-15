@@ -1,4 +1,5 @@
 #import "AkunRTC.h"
+#import "AkunOrientation.h"
 #import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCVideoFrame.h>
 #import <math.h>
@@ -289,17 +290,29 @@
 - (void)pushPixelBuffer:(CVPixelBufferRef)pixelBuffer {
     if (!self.videoSource || !pixelBuffer) { return; }
 
-    // 首帧拿到真实屏幕尺寸后再算输出尺寸：scale 0.35 → 1170×2532 变成约 410×886
-    if (self.sourceWidth == 0 || self.sourceHeight == 0) {
-        self.sourceWidth = (NSInteger)CVPixelBufferGetWidth(pixelBuffer);
-        self.sourceHeight = (NSInteger)CVPixelBufferGetHeight(pixelBuffer);
+    // 抓屏层可能随时改出图尺寸（在线改档位），尺寸变了就重算一次输出格式
+    NSInteger pw = (NSInteger)CVPixelBufferGetWidth(pixelBuffer);
+    NSInteger ph = (NSInteger)CVPixelBufferGetHeight(pixelBuffer);
+    if (self.sourceWidth != pw || self.sourceHeight != ph) {
+        self.sourceWidth = pw;
+        self.sourceHeight = ph;
         [self applyOutputFormat];
+        NSLog(@"[rtc] 输入尺寸变成 %ldx%ld", (long)pw, (long)ph);
     }
 
     RTCCVPixelBuffer *buffer = [[RTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
     int64_t ns = (int64_t)(CACurrentMediaTime() * 1000000000.0);
+    // 设备转了就随帧带旋转信息：libwebrtc 会把画面转成对应方向再编码，
+    // 接收端自然看到横屏画面（和 AKUN 的 OrientationSync 一个效果）
+    RTCVideoRotation rot = RTCVideoRotation_0;
+    switch ([AkunOrientation quad]) {
+    case 1: rot = RTCVideoRotation_90; break;
+    case 2: rot = RTCVideoRotation_180; break;
+    case 3: rot = RTCVideoRotation_270; break;
+    default: rot = RTCVideoRotation_0; break;
+    }
     RTCVideoFrame *frame = [[RTCVideoFrame alloc] initWithBuffer:buffer
-                                                        rotation:RTCVideoRotation_0
+                                                        rotation:rot
                                                      timeStampNs:ns];
     [self.videoSource capturer:self.capturer didCaptureVideoFrame:frame];
 

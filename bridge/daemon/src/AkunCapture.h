@@ -16,6 +16,12 @@
 
 @property (nonatomic, readonly) NSUInteger width;
 @property (nonatomic, readonly) NSUInteger height;
+/// 屏幕真实像素尺寸（未缩放，坐标映射用这个）
+@property (nonatomic, readonly) NSInteger screenWidth;
+@property (nonatomic, readonly) NSInteger screenHeight;
+
+/// 出图缩放：渲染服务器按 屏像素 × scale 直接出图（GPU 缩放，省掉 CPU 逐帧缩放）
+@property (nonatomic, assign) double outputScale;
 
 /// 抓屏帧率，默认 12（对齐 AKUN 的出厂默认；30fps 在群控场景里只会白烧 CPU 和带宽）。
 @property (nonatomic, assign) int fps;
