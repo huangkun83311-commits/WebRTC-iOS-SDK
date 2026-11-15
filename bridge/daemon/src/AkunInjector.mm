@@ -26,6 +26,7 @@ int gOrientationFixQuad = 0;
 - (void)touchDownAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
 - (void)liftUpAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
 - (void)_updateTouchPoints:(CGPoint *)points count:(NSUInteger)count;
+- (CGSize)akun_physicalScreenSize;
 @end
 
 @implementation AkunInjector {
@@ -44,17 +45,28 @@ int gOrientationFixQuad = 0;
     return self;
 }
 
-/// 屏幕像素尺寸（AKUN 内部也是拿这个做归一化基准：1080x1920）
+/// 屏幕像素尺寸：**必须**用 generator 内部同一份基准，
+/// 它据此除以归一化（我们这边若用别的尺寸，落点就会整体偏移）。
 - (CGSize)pixelSize {
-    CGRect r = CGRectZero;
-    @try {
-        r = [[UIScreen mainScreen] _unjailedReferenceBoundsInPixels];
-    } @catch (NSException *e) {
+    CGSize s = CGSizeZero;
+    STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
+    s = [gen akun_physicalScreenSize];
+    if (s.width < 1 || s.height < 1) {
+        CGRect r = CGRectZero;
+        @try {
+            r = [[UIScreen mainScreen] _unjailedReferenceBoundsInPixels];
+        } @catch (NSException *e) {
+        }
+        if (r.size.width < 1 || r.size.height < 1) {
+            r = CGRectMake(0, 0, 1080, 1920);
+        }
+        s = r.size;
     }
-    if (r.size.width < 1 || r.size.height < 1) {
-        r = CGRectMake(0, 0, 1080, 1920);
-    }
-    return r.size;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSLog(@"[inject] generator 归一化基准 = %.0fx%.0f", s.width, s.height);
+    });
+    return s;
 }
 
 static double clamp01(double v) {

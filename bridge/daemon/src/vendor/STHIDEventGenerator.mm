@@ -186,6 +186,12 @@ NS_INLINE void _DTXCalcLinearPinchStartEndPoints(CGRect bounds, CGFloat pixelsSc
     return self;
 }
 
+// akun-bridge 追加（AKUN 原文件没有）：把内部归一化基准暴露出来，
+// 让注入层用同一个尺寸换算坐标，避免两边取到的屏幕尺寸不一致导致落点偏移。
+- (CGSize)akun_physicalScreenSize {
+    return _physicalScreenSize;
+}
+
 #pragma mark - Keep Alive Timer
 
 - (void)_invalidateKeepAliveTimer {
