@@ -2,6 +2,7 @@
 #import "AkunOrientation.h"
 #import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCVideoFrame.h>
+#import <WebRTC/RTCStatisticsReport.h>
 #import <math.h>
 
 @interface AkunRTC () <RTCPeerConnectionDelegate>
@@ -29,6 +30,17 @@
 @property (nonatomic, assign) NSInteger sourceHeight;
 @property (nonatomic, assign) BOOL formatApplied;
 @property (nonatomic, assign) int appliedQuad;   // 上次套用输出格式时的象限
+
+// ---- 自适应 ----
+@property (nonatomic, assign) BOOL adaptiveEnabled;
+@property (nonatomic, assign) double baseScale;         // 用户/中控设定的清晰度上限
+@property (nonatomic, assign) NSInteger baseBitrateBps; // 用户/中控设定的码率上限
+@property (nonatomic, assign) double adaptScale;        // 当前自适应生效的 scale
+@property (nonatomic, assign) NSInteger adaptBitrateBps;
+@property (nonatomic, strong) NSTimer *statTimer;
+@property (nonatomic, assign) NSUInteger goodStreak;    // 连续健康次数（升档需要）
+@property (nonatomic, assign) NSUInteger badStreak;     // 连续拥塞次数（降档需要）
+@property (nonatomic, assign) double lastFramesEncoded;
 @end
 
 @implementation AkunRTC
@@ -41,6 +53,11 @@
         _scale = 0.35;
         _targetFps = 12;
         _maxBitrateBps = 1500000;
+        _adaptiveEnabled = YES;
+        _baseScale = 0.35;
+        _baseBitrateBps = 1500000;
+        _adaptScale = 0.35;
+        _adaptBitrateBps = 1500000;
     }
     return self;
 }
@@ -52,6 +69,30 @@
     NSLog(@"[rtc] 输出参数 scale=%.2f fps=%d maxBitrate=%ld",
           self.scale, self.targetFps, (long)self.maxBitrateBps);
     if (self.pc) { [self applyOutputFormat]; }
+}
+
+/// 设置自适应基线（用户/中控想要的清晰度与码率上限）；自适应只在这个值以下活动。
+- (void)setAdaptiveBaseScale:(double)baseScale bitrate:(NSInteger)baseBitrateBps {
+    if (baseScale > 0.05 && baseScale <= 1.0) {
+        self.baseScale = baseScale;
+        self.adaptScale = baseScale;
+    }
+    if (baseBitrateBps > 0) {
+        self.baseBitrateBps = baseBitrateBps;
+        self.adaptBitrateBps = baseBitrateBps;
+    }
+    self.goodStreak = 0;
+    self.badStreak = 0;
+    if (self.sender) {
+        RTCRtpParameters *params = self.sender.parameters;
+        if (params && params.encodings.count > 0) {
+            RTCRtpEncodingParameters *enc = params.encodings.firstObject;
+            enc.maxBitrateBps = @(self.adaptBitrateBps);
+            enc.minBitrateBps = @(MIN(self.adaptBitrateBps, MAX(300000, (NSInteger)(self.adaptBitrateBps * 0.5))));
+            self.sender.parameters = params;
+        }
+    }
+    NSLog(@"[adapt] 基线 scale=%.2f bitrate=%ld", self.adaptScale, (long)self.adaptBitrateBps);
 }
 
 /// 把 scale/fps 应用到视频源，同时给这条 RTP 流加码率上限（对应 AKUN 的 AverageBitRate）。
@@ -183,6 +224,7 @@
     self.ws = [self.session webSocketTaskWithURL:url];
     [self.ws resume];
     [self receiveLoop];
+    [self startStatTimer];
 }
 
 - (void)receiveLoop {
@@ -293,6 +335,138 @@
     [self.pendingCandidates removeAllObjects];
 }
 
+#pragma mark - 自适应（丢包/时延 → 自动降清晰度，保住帧率）
+
+/// 每 2 秒看一次远端反馈：丢包率、往返时延。
+/// 判断依据只用「接收端真的丢了多少、来回多久」，不看编码器自报的码率，
+/// 因为群控场景里卡顿几乎都来自上行带宽/网络抖动，而不是编码能力。
+- (void)pollStats {
+    if (!self.pc || !self.adaptiveEnabled) { return; }
+    __weak typeof(self) weakSelf = self;
+    [self.pc statisticsWithCompletionHandler:^(RTCStatisticsReport *report) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) { return; }
+        [self handleStatsReport:report];
+    }];
+}
+
+- (void)handleStatsReport:(RTCStatisticsReport *)report {
+    if (!report) { return; }
+    double fractionLost = -1.0;
+    double rttSeconds = -1.0;
+    double framesEncoded = -1.0;
+    double totalEncodeTime = -1.0;
+
+    for (NSString *key in report.statistics) {
+        RTCStatistics *st = report.statistics[key];
+        NSDictionary *v = st.values;
+        NSString *kind = [v[@"kind"] isKindOfClass:[NSString class]] ? (NSString *)v[@"kind"] : @"";
+        if (![kind isEqualToString:@"video"]) { continue; }
+        if ([st.type isEqualToString:@"remote-inbound-rtp"]) {
+            if ([v[@"fractionLost"] isKindOfClass:[NSNumber class]]) {
+                fractionLost = [v[@"fractionLost"] doubleValue];
+            }
+            if ([v[@"roundTripTime"] isKindOfClass:[NSNumber class]]) {
+                rttSeconds = [v[@"roundTripTime"] doubleValue];
+            }
+        } else if ([st.type isEqualToString:@"outbound-rtp"]) {
+            if ([v[@"framesEncoded"] isKindOfClass:[NSNumber class]]) {
+                framesEncoded = [v[@"framesEncoded"] doubleValue];
+            }
+            if ([v[@"totalEncodeTime"] isKindOfClass:[NSNumber class]]) {
+                totalEncodeTime = [v[@"totalEncodeTime"] doubleValue];
+            }
+        }
+    }
+
+    // 没有远端反馈（还没收到 RTCP）时不做判断
+    if (fractionLost < 0 && rttSeconds < 0 && framesEncoded < 0) { return; }
+
+    BOOL congested = NO;
+    if (fractionLost > 0.05) { congested = YES; }        // 丢包 >5% 就是网络扛不住了
+    if (rttSeconds > 0.25) { congested = YES; }          // 时延 >250ms，手感已经明显拖
+    // 编码跟不上（单帧编码时间 > 12ms，A11 上意味着渲染→编码这条链在排队）
+    if (framesEncoded > 0 && totalEncodeTime > 0) {
+        double avgMs = (totalEncodeTime / framesEncoded) * 1000.0;
+        if (avgMs > 12.0) { congested = YES; }
+    }
+
+    if (congested) {
+        self.badStreak++;
+        self.goodStreak = 0;
+        // 连续两次（≈4 秒）都拥塞才降，避免一次网络抖动就来回跳档
+        if (self.badStreak >= 2) { [self stepDown]; }
+    } else {
+        self.goodStreak++;
+        self.badStreak = 0;
+        // 连续 3 次（≈6 秒）健康才升档，升得慢，降得快
+        if (self.goodStreak >= 3) { [self stepUp]; }
+    }
+
+    NSLog(@"[adapt] 丢包=%.1f%% rtt=%.0fms 编码=%.1fms scale=%.2f bitrate=%ld",
+          fractionLost > 0 ? fractionLost * 100.0 : -1.0,
+          rttSeconds > 0 ? rttSeconds * 1000.0 : -1.0,
+          (framesEncoded > 0 && totalEncodeTime > 0) ? (totalEncodeTime / framesEncoded) * 1000.0 : -1.0,
+          self.adaptScale, (long)self.adaptBitrateBps);
+}
+
+- (void)applyAdaptiveValues {
+    if (self.adaptiveScaleHandler) { self.adaptiveScaleHandler(self.adaptScale); }
+    if (self.sender) {
+        RTCRtpParameters *params = self.sender.parameters;
+        if (params && params.encodings.count > 0) {
+            RTCRtpEncodingParameters *enc = params.encodings.firstObject;
+            enc.maxBitrateBps = @(self.adaptBitrateBps);
+            self.sender.parameters = params;
+        }
+    }
+    if (self.pc) {
+        [self.pc setBweMinBitrateBps:@(MAX(200000, self.adaptBitrateBps / 2))
+                    currentBitrateBps:@(self.adaptBitrateBps)
+                        maxBitrateBps:@(self.adaptBitrateBps)];
+    }
+}
+
+- (void)stepDown {
+    double ns = self.adaptScale - 0.03;
+    if (ns < 0.30) { ns = 0.30; }          // 字体可读下限，不再往下掉
+    NSInteger nb = (NSInteger)(self.adaptBitrateBps * 0.8);
+    if (nb < 350000) { nb = 350000; }      // 再省也要留够动态画面的码率
+    if (fabs(ns - self.adaptScale) < 0.001 && nb == self.adaptBitrateBps) { return; }
+    self.adaptScale = ns;
+    self.adaptBitrateBps = nb;
+    self.goodStreak = 0;
+    [self applyAdaptiveValues];
+    NSLog(@"[adapt] 网络拥塞 → 降档 scale=%.2f bitrate=%ld（保帧率优先）", ns, (long)nb);
+}
+
+- (void)stepUp {
+    double ns = self.adaptScale + 0.02;
+    if (ns > self.baseScale) { ns = self.baseScale; }     // 不超过用户/中控设的上限
+    NSInteger nb = (NSInteger)(self.adaptBitrateBps * 1.15);
+    if (nb > self.baseBitrateBps) { nb = self.baseBitrateBps; }
+    if (fabs(ns - self.adaptScale) < 0.001 && nb == self.adaptBitrateBps) {
+        self.goodStreak = 0;
+        return;
+    }
+    self.adaptScale = ns;
+    self.adaptBitrateBps = nb;
+    self.goodStreak = 0;
+    [self applyAdaptiveValues];
+    NSLog(@"[adapt] 网络恢复 → 升档 scale=%.2f bitrate=%ld", ns, (long)nb);
+}
+
+- (void)startStatTimer {
+    if (self.statTimer) { return; }
+    __weak typeof(self) weakSelf = self;
+    self.statTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+        __strong typeof(weakSelf) s = weakSelf;
+        if (!s) { [t invalidate]; return; }
+        [s pollStats];
+    }];
+    NSLog(@"[adapt] 已启动自适应（每 2s 采样丢包/时延）");
+}
+
 #pragma mark - 推帧
 
 - (void)pushPixelBuffer:(CVPixelBufferRef)pixelBuffer {
@@ -339,6 +513,8 @@
 }
 
 - (void)stop {
+    [self.statTimer invalidate];
+    self.statTimer = nil;
     [self.ws cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
     self.ws = nil;
     [self.pc close];

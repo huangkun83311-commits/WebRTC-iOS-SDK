@@ -147,8 +147,16 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 
     // 发现是异步的（广播+扫描要几秒），推流端先用占位地址起来，拿到地址后再切
     self.rtc = [[AkunRTC alloc] initWithServerBase:self.serverBase ?: @"" deviceId:self.deviceId];
+    // 自适应降档时只改抓屏缩图比例，编码器那边自动跟着重算输出尺寸
+    self.rtc.adaptiveScaleHandler = ^(double s) {
+        __strong typeof(weakSelf) strong = weakSelf;
+        if (!strong) { return; }
+        [strong.capture setOutputScale:s];
+    };
     // 输入已经是缩好的小图，编码器侧 scale 用 1.0，避免二次缩放（多一道缩放既糊又费 CPU）
     [self.rtc configureWithScale:1.0 fps:fps maxBitrateBps:maxBitrate];
+    // 自适应基线 = 用户/中控设定的清晰度与码率上限，自适应只往下动
+    [self.rtc setAdaptiveBaseScale:scale bitrate:maxBitrate];
     [self.rtc start];
 
     if (![self.capture start]) {
@@ -239,6 +247,7 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
                     // 缩图在抓屏层（vImage，整屏渲染 + 一次性缩到目标尺寸），编码器不再缩放
                     [self.capture setOutputScale:scale];
                     [self.rtc configureWithScale:1.0 fps:fps maxBitrateBps:br];
+                    [self.rtc setAdaptiveBaseScale:scale bitrate:br];
                     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br;
                     [self.capture setFps:fps];
                 } else {

@@ -25,4 +25,11 @@
 /// 自动发现拿到新地址后切换信令端点（不重建 PeerConnection，只重连 WS）。
 - (void)reconnectWithServerBase:(NSString *)base;
 
+/// 自适应：按实时丢包 / 往返时延自动降（或恢复）清晰度，回调里给出新的抓屏 scale。
+/// 只在 [0.30, 用户设定值] 之间动，字体清晰度的下限 0.30 不会被突破。
+@property (nonatomic, copy) void (^adaptiveScaleHandler)(double scale);
+
+/// 设置自适应基线（清晰度/码率上限）；自适应只在基线以下活动。
+- (void)setAdaptiveBaseScale:(double)baseScale bitrate:(NSInteger)baseBitrateBps;
+
 @end
