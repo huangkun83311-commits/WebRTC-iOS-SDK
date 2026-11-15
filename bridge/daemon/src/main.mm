@@ -127,8 +127,9 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
     self.capture.fps = fps;
-    // 抓屏必须按「整屏原始像素」渲染：surface 小于屏幕时 CARenderServer 是裁切而不是缩放，
-    // 表现就是「只看到屏幕的一个小角落」。缩放统一交给编码器（VideoAdapter），scale 只影响输出。
+    // 抓屏按「整屏原始像素」渲染（surface 小于屏幕时 CARenderServer 是裁切不是缩放），
+    // 缩图由抓屏层用 vImage 一次做完，编码器只管编码 → 省下每帧一次 2.7MP 的缩放+转码，卡顿的主要来源。
+    self.capture.outputScale = scale;
     __weak typeof(self) weakSelf = self;
     self.capture.frameHandler = ^(CVPixelBufferRef pixelBuffer) {
         weakSelf.frameCount++;
@@ -146,8 +147,8 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 
     // 发现是异步的（广播+扫描要几秒），推流端先用占位地址起来，拿到地址后再切
     self.rtc = [[AkunRTC alloc] initWithServerBase:self.serverBase ?: @"" deviceId:self.deviceId];
-    // 缩放交给编码器（libwebrtc VideoAdapter），这样是缩放不是裁切
-    [self.rtc configureWithScale:scale fps:fps maxBitrateBps:maxBitrate];
+    // 输入已经是缩好的小图，编码器侧 scale 用 1.0，避免二次缩放（多一道缩放既糊又费 CPU）
+    [self.rtc configureWithScale:1.0 fps:fps maxBitrateBps:maxBitrate];
     [self.rtc start];
 
     if (![self.capture start]) {
@@ -235,9 +236,9 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
                     if (fps < 8) { fps = 8; }
                     if (fps > 30) { fps = 30; }
                     NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld", scale, fps, (long)br);
-                    // 缩放由抓屏层做（GPU 出小图），编码器侧不再缩放
-                    [self.capture setOutputScale:1.0];
-                    [self.rtc configureWithScale:scale fps:fps maxBitrateBps:br];
+                    // 缩图在抓屏层（vImage，整屏渲染 + 一次性缩到目标尺寸），编码器不再缩放
+                    [self.capture setOutputScale:scale];
+                    [self.rtc configureWithScale:1.0 fps:fps maxBitrateBps:br];
                     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br;
                     [self.capture setFps:fps];
                 } else {

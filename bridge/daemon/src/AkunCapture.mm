@@ -16,6 +16,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
+#import <Accelerate/Accelerate.h>
 #import <dlfcn.h>
 
 #import "vendor/UIScreen+Private.h"
@@ -37,6 +38,9 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     CVPixelBufferRef _pixelBuffers[2];
     int _cur;
     BOOL _running;
+    // 缩图用：目标尺寸 + 缓冲池（每帧复用，不反复 malloc）
+    CVPixelBufferPoolRef _pool;
+    size_t _poolW, _poolH;
 }
 
 - (instancetype)init {
@@ -83,15 +87,12 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     NSLog(@"[capture] 屏像素 %ld x %ld", (long)_screenWidth, (long)_screenHeight);
     if (_screenWidth == 0 || _screenHeight == 0) { return NO; }
 
-    // 出图尺寸 = 屏像素 × scale：让渲染服务器直接按目标尺寸出图（GPU 缩放，零 CPU），
-    // 编码器输入就是 434x772 这种小图，不必再由 libwebrtc 逐帧缩放（那是延迟的大头）。
-    double s = (_outputScale > 0.05 && _outputScale <= 1.0) ? _outputScale : 1.0;
-    size_t w = (size_t)lround((double)_screenWidth * s);
-    size_t h = (size_t)lround((double)_screenHeight * s);
-    w &= ~1UL; h &= ~1UL;                     // 宽高取偶数
-    if (w < 16) { w = 16; }
-    if (h < 16) { h = 16; }
-    NSLog(@"[capture] 出图 %zux%zu（scale=%.2f）", w, h, s);
+    // 渲染 surface 永远是「整屏原始像素」：surface 比屏幕小的时候
+    // CARenderServerRenderDisplay 是裁切而不是缩放（会只看到屏幕的一个角落）。
+    // 缩放改在抓帧后由 vImage 一次做完（见 scaleFrame:），然后才交给编码器。
+    size_t w = (size_t)_screenWidth;
+    size_t h = (size_t)_screenHeight;
+    NSLog(@"[capture] 渲染面 %zux%zu（输出 scale=%.2f）", w, h, _outputScale);
 
     size_t bytesPerRow = ((w * 4) + 63) & ~63UL;   // 64 字节对齐
 
@@ -145,23 +146,78 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     return YES;
 }
 
-/// scale 变了要重建 surface（出图尺寸跟着变），否则画面会一直停在旧尺寸
+/// scale 只决定「缩图后的输出尺寸」，渲染 surface 始终是整屏，所以这里不用重建 surface。
 - (void)setOutputScale:(double)scale {
     double s = (scale > 0.05 && scale <= 1.0) ? scale : 1.0;
     if (fabs(s - _outputScale) < 0.001) { return; }
     @synchronized (self) {
         _outputScale = s;
-        // 释放旧的两块，下一帧 grabOneFrame 会按新尺寸重建
-        for (int i = 0; i < 2; i++) {
-            if (_pixelBuffers[i]) { CVPixelBufferRelease(_pixelBuffers[i]); _pixelBuffers[i] = NULL; }
-            if (_surfaces[i]) { CFRelease(_surfaces[i]); _surfaces[i] = NULL; }
-        }
-        _width = 0; _height = 0;
-        NSLog(@"[capture] 输出缩放到 %.2f，重建 surface", s);
+        NSLog(@"[capture] 输出缩放到 %.2f（渲染仍是整屏，缩图走 vImage）", s);
     }
 }
 
 #pragma mark - 抓帧
+
+/// 把整屏大图一次性缩到目标尺寸（vImage，SIMD），并复用缓冲池。
+/// 不缩的话，后面 libwebrtc 每帧要对 1242x2208 的 BGRA 做缩放+转 I420，20fps 下 CPU 直接被吃满——
+/// 表现就是画面一顿一顿、点按发迟。
+- (CVPixelBufferRef)scaleFrame:(CVPixelBufferRef)src CF_RETURNS_RETAINED {
+    double s = (_outputScale > 0.05 && _outputScale < 0.999) ? _outputScale : 1.0;
+    if (s >= 0.999) { CVPixelBufferRetain(src); return src; }
+
+    size_t w = (size_t)lround((double)_width * s);
+    size_t h = (size_t)lround((double)_height * s);
+    w &= ~1UL; h &= ~1UL;
+    if (w < 16 || h < 16) { CVPixelBufferRetain(src); return src; }
+
+    if (!_pool || _poolW != w || _poolH != h) {
+        if (_pool) { CVPixelBufferPoolRelease(_pool); _pool = NULL; }
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+            (id)kCVPixelBufferWidthKey : @(w),
+            (id)kCVPixelBufferHeightKey : @(h),
+        };
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
+                                (__bridge CFDictionaryRef)attrs, &_pool);
+        _poolW = w; _poolH = h;
+        NSLog(@"[capture] 缩图缓冲池 %zux%zu", w, h);
+    }
+    if (!_pool) { CVPixelBufferRetain(src); return src; }
+
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) != kCVReturnSuccess || !dst) {
+        CVPixelBufferRetain(src);
+        return src;
+    }
+
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+    vImage_Buffer sb = {
+        .data = CVPixelBufferGetBaseAddress(src),
+        .height = CVPixelBufferGetHeight(src),
+        .width = CVPixelBufferGetWidth(src),
+        .rowBytes = CVPixelBufferGetBytesPerRow(src),
+    };
+    vImage_Buffer db = {
+        .data = CVPixelBufferGetBaseAddress(dst),
+        .height = CVPixelBufferGetHeight(dst),
+        .width = CVPixelBufferGetWidth(dst),
+        .rowBytes = CVPixelBufferGetBytesPerRow(dst),
+    };
+    vImage_Error err = vImageScale_ARGB8888(&sb, &db, NULL, kvImageNoFlags);
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+
+    if (err != kvImageNoError) {
+        static BOOL warned = NO;
+        if (!warned) { NSLog(@"[capture] vImageScale 失败 err=%ld，回退整屏推帧", (long)err); warned = YES; }
+        CVPixelBufferRelease(dst);
+        CVPixelBufferRetain(src);
+        return src;
+    }
+    return dst;
+}
 
 - (void)grabOneFrame {
     if (![self buildSurfacesIfNeeded]) { return; }
@@ -190,7 +246,9 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     _cur = 1 - _cur;
     _lastPushTime = CACurrentMediaTime();
 
-    if (self.frameHandler) { self.frameHandler(pbuf); }
+    CVPixelBufferRef out = [self scaleFrame:pbuf];
+    if (out && self.frameHandler) { self.frameHandler(out); }
+    if (out) { CVPixelBufferRelease(out); }
 }
 
 - (BOOL)start {
