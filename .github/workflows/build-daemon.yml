@@ -99,6 +99,18 @@ jobs:
           path: out/*.tipa
           if-no-files-found: error
 
+      - name: Delete stale release assets
+        if: success()
+        run: |
+          set +e
+          for f in out/*; do
+            n=$(basename "$f")
+            gh release delete-asset daemon-latest "$n" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null && \
+              echo "已删除旧资产 $n" || echo "旧资产 $n 不存在（跳过）"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish to release (public download)
         if: success()
         uses: softprops/action-gh-release@v2
