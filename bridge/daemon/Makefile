@@ -11,9 +11,16 @@ WEBRTC_DIR := $(THEOS_PROJECT_DIR)/../../WebRTC.xcframework/ios-arm64
 
 akund_FILES := src/main.mm src/AkunCapture.mm src/AkunInjector.mm src/AkunRTC.mm
 akund_FRAMEWORKS := Foundation CoreVideo CoreGraphics CoreMedia QuartzCore IOSurface IOKit
+# Linux 上没有 Apple 的 ld64，必须走 ld64.lld；macOS runner 用系统 ld64 即可
+ifeq ($(shell uname -s),Darwin)
+LINKER_FLAGS := -Wl,-undefined,dynamic_lookup -Wl,-adhoc_codesign
+else
+LINKER_FLAGS := -fuse-ld=lld -Wl,-undefined,dynamic_lookup -Wl,-adhoc_codesign
+endif
+
 akund_CFLAGS  += -fobjc-arc -stdlib=libc++ -F$(WEBRTC_DIR) -Wno-arc-retain-cycles
-akund_CCFLAGS += -stdlib=libc++ -fuse-ld=lld
-akund_LDFLAGS += -fuse-ld=lld -Wl,-adhoc_codesign -Wl,-undefined,dynamic_lookup
+akund_CCFLAGS += -stdlib=libc++ $(LINKER_FLAGS)
+akund_LDFLAGS += $(LINKER_FLAGS)
 akund_LDFLAGS += -F$(WEBRTC_DIR) -framework WebRTC
 # usr/bin 装二进制、usr/lib 装框架；App 形态下框架在 .app/Frameworks，两条 rpath 都留
 akund_LDFLAGS += -Wl,-rpath,@executable_path/../lib -Wl,-rpath,@executable_path/Frameworks
