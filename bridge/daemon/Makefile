@@ -10,7 +10,7 @@ TOOL_NAME := akund
 WEBRTC_DIR := $(THEOS_PROJECT_DIR)/../../WebRTC.xcframework/ios-arm64
 
 akund_FILES := src/main.mm src/AkunCapture.mm src/AkunInjector.mm src/AkunRTC.mm src/AkunDiscovery.mm src/AkunOrientation.mm src/vendor/STHIDEventGenerator.mm
-akund_FRAMEWORKS := Foundation UIKit CoreVideo CoreGraphics CoreMedia QuartzCore IOSurface IOKit Accelerate
+akund_FRAMEWORKS := Foundation UIKit CoreVideo CoreGraphics CoreMedia QuartzCore IOSurface IOKit Accelerate CoreImage Metal
 # Linux 上没有 Apple 的 ld64，必须走 ld64.lld；macOS runner 用系统 ld64 即可
 ifeq ($(shell uname -s),Darwin)
 LINKER_FLAGS := -Wl,-undefined,dynamic_lookup -Wl,-adhoc_codesign
