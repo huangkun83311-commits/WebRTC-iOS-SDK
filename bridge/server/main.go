@@ -173,8 +173,33 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		logRelay(room, role, payload)
 		h.broadcast(c, payload)
 	}
+}
+
+// logRelay 打印一条转发的报文概要（只取 type 与长度），排障用。
+func logRelay(room, role string, payload []byte) {
+	var meta struct {
+		Type      string `json:"type"`
+		Candidate string `json:"candidate"`
+		Sdp       string `json:"sdp"`
+	}
+	if err := json.Unmarshal(payload, &meta); err != nil {
+		log.Printf("relay room=%s role=%s size=%d (非JSON)", room, role, len(payload))
+		return
+	}
+	extra := ""
+	if meta.Type == "candidate" && len(meta.Candidate) > 0 {
+		if len(meta.Candidate) > 80 {
+			extra = meta.Candidate[:80]
+		} else {
+			extra = meta.Candidate
+		}
+	} else if len(meta.Sdp) > 0 {
+		extra = fmt.Sprintf("sdp=%d字节", len(meta.Sdp))
+	}
+	log.Printf("relay room=%s role=%s type=%s size=%d %s", room, role, meta.Type, len(payload), extra)
 }
 
 func (h *hub) handleRooms(w http.ResponseWriter, r *http.Request) {

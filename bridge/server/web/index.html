@@ -50,7 +50,7 @@
   const $ = (id) => document.getElementById(id);
   const stage = $('stage'), screenEl = $('screen'), video = $('video');
 
-  let videoWs = null, ctrlWs = null, pc = null;
+  let videoWs = null, ctrlWs = null, pc = null, videoRetry = null;
   let lastMoveSent = 0;
 
   const WS_BASE = (function () {
@@ -69,6 +69,17 @@
     videoWs.onopen = () => {
       log('video signaling open');
       createPeerConnection();
+      // 连上就发一次 offer：viewer 通常比设备晚到，收不到 _peerJoined，
+      // 不发的话两边就干等（真机上表现为永远 未连接）。
+      setTimeout(() => { negotiate(); }, 200);
+      // 没等到 answer 就重发，设备刚上线/刚重连时很有用
+      clearInterval(videoRetry);
+      videoRetry = setInterval(() => {
+        if (!pc || !videoWs || videoWs.readyState !== 1) return;
+        if (pc.remoteDescription && pc.remoteDescription.type) return;
+        log('offer 重发');
+        negotiate();
+      }, 3000);
     };
 
     videoWs.onmessage = async (ev) => {
@@ -250,6 +261,7 @@
   $('disconnect').onclick = stopAll;
 
   function stopAll() {
+    if (videoRetry) { clearInterval(videoRetry); videoRetry = null; }
     try { pc && pc.close(); } catch (e) {}
     pc = null;
     if (videoWs) { videoWs.onclose = null; videoWs.close(); videoWs = null; }

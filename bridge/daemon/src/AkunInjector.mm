@@ -14,6 +14,7 @@
 
 #import <CoreGraphics/CGGeometry.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 
@@ -100,6 +101,16 @@ static const double kMinEventInterval = 0.012;
     return self;
 }
 
+/// 触摸坐标用的是「点」（UIScreen bounds），不是像素。
+- (CGSize)screenPointSize {
+    @try {
+        CGSize s = [UIScreen mainScreen].bounds.size;
+        if (s.width > 1 && s.height > 1) { return s; }
+    } @catch (NSException *e) {
+    }
+    return CGSizeMake(414, 736);
+}
+
 - (void)dispatchPhase:(uint32_t)phase x:(double)x y:(double)y {
     if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) { return; }
 
@@ -138,8 +149,16 @@ static const double kMinEventInterval = 0.012;
 - (void)handleCommand:(NSDictionary *)cmd {
     NSString *t = cmd[@"t"];
     if (![t isKindOfClass:[NSString class]]) { return; }
-    double x = [cmd[@"x"] doubleValue];
-    double y = [cmd[@"y"] doubleValue];
+    // 网页端发来的是 0~1 归一化坐标，注入 API 要的是屏幕点坐标，必须先乘屏幕尺寸。
+    // 之前直接当像素用，等于永远点在左上角（真机上表现为点了没反应）。
+    CGSize sz = [self screenPointSize];
+    double x = [cmd[@"x"] doubleValue] * sz.width;
+    double y = [cmd[@"y"] doubleValue] * sz.height;
+
+    static dispatch_once_t onceLog;
+    dispatch_once(&onceLog, ^{
+        NSLog(@"[inject] 坐标换算基准 %.0fx%.0f 点", sz.width, sz.height);
+    });
 
     if ([t isEqualToString:@"d"]) {
         [self dispatchPhase:HID_PHASE_BEGAN x:x y:y];
@@ -152,8 +171,8 @@ static const double kMinEventInterval = 0.012;
         usleep(30000);
         [self dispatchPhase:HID_PHASE_ENDED x:x y:y];
     } else if ([t isEqualToString:@"swipe"]) {
-        double x2 = [cmd[@"x2"] doubleValue];
-        double y2 = [cmd[@"y2"] doubleValue];
+        double x2 = [cmd[@"x2"] doubleValue] * sz.width;
+        double y2 = [cmd[@"y2"] doubleValue] * sz.height;
         int steps = 12;
         [self dispatchPhase:HID_PHASE_BEGAN x:x y:y];
         for (int i = 1; i <= steps; i++) {
@@ -171,10 +190,11 @@ static const double kMinEventInterval = 0.012;
 /// Home 手势：从下缘外往上滑，回桌面。
 - (void)dispatchKey:(NSString *)code {
     if (![code isKindOfClass:[NSString class]]) { return; }
+    CGSize sz = [self screenPointSize];
     if ([code isEqualToString:@"home"]) {
-        [self dispatchPhase:HID_PHASE_BEGAN x:0.5 y:0.995];
-        [self dispatchPhase:HID_PHASE_MOVED x:0.5 y:0.85];
-        [self dispatchPhase:HID_PHASE_ENDED x:0.5 y:0.75];
+        [self dispatchPhase:HID_PHASE_BEGAN x:0.5 * sz.width y:0.995 * sz.height];
+        [self dispatchPhase:HID_PHASE_MOVED x:0.5 * sz.width y:0.85 * sz.height];
+        [self dispatchPhase:HID_PHASE_ENDED x:0.5 * sz.width y:0.75 * sz.height];
     }
 }
 
