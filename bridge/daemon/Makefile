@@ -19,6 +19,9 @@ LINKER_FLAGS := -fuse-ld=lld -Wl,-undefined,dynamic_lookup -Wl,-adhoc_codesign
 endif
 
 akund_CFLAGS  += -fobjc-arc -stdlib=libc++ -F$(WEBRTC_DIR) -Wno-arc-retain-cycles
+# AKUN 源码里有新版 clang 才认识的 #pragma clang diagnostic ignored 分组名，
+# 老 clang 会把它当 error；忽略「未知警告名」即可，不影响行为。
+akund_CFLAGS  += -Wno-unknown-warning-option
 akund_CCFLAGS += -stdlib=libc++ $(LINKER_FLAGS)
 akund_LDFLAGS += $(LINKER_FLAGS)
 akund_LDFLAGS += -F$(WEBRTC_DIR) -framework WebRTC

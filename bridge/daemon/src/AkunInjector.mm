@@ -32,8 +32,6 @@ int gOrientationFixQuad = 0;
 - (instancetype)init {
     if ((self = [super init])) {
         tvncLoggingEnabled = YES;   // 它内部的 TVLog 走 NSLog，方便真机排错
-        UIView *v = [[UIView alloc] init];   // 确保 UIKit 已加载
-        v = nil;
         NSLog(@"[inject] 使用 AKUN STHIDEventGenerator 注入");
     }
     return self;
