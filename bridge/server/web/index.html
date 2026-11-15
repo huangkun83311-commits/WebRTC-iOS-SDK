@@ -32,6 +32,14 @@
   <input id="room" value="dev001" spellcheck="false" />
   <button id="connect">连接</button>
   <button id="disconnect" class="ghost">断开</button>
+  <!-- 画质档位：默认「标准」= AKUN 出厂值 0.35 / 12fps / 1.5Mbps；
+       授权给别人看用「省流」，自己中控看用「高清/超清」，切换即时生效不用重装 -->
+  <select id="quality" title="画质档位（改的是设备端的 scale/fps/码率，即时生效）">
+    <option value="0.25,12,600000">省流 0.25 / 12fps / 0.6M</option>
+    <option value="0.35,12,1500000" selected>标准 0.35 / 12fps / 1.5M</option>
+    <option value="0.5,20,2500000">高清 0.5 / 20fps / 2.5M</option>
+    <option value="0.75,24,4000000">超清 0.75 / 24fps / 4M</option>
+  </select>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -337,6 +345,18 @@
   };
 
   $('disconnect').onclick = stopAll;
+
+  // 画质档位：直接打设备端配置接口，设备收到后立即重建编码参数，不重装、不断流
+  $('quality').onchange = async (ev) => {
+    const room = ($('room').value || 'dev001').trim();
+    const [scale, fps, bitrate] = ev.target.value.split(',');
+    try {
+      const r = await fetch(`/api/config?room=${encodeURIComponent(room)}&scale=${scale}&fps=${fps}&bitrate=${bitrate}`);
+      const j = await r.json();
+      log('画质下发', j.payload, '设备数', j.sent);
+      if (!j.sent) $('stat').textContent = '设备未连控制通道，档位没下发';
+    } catch (e) { log('画质下发失败', e.message); }
+  };
 
   function stopAll() {
     if (videoRetry) { clearInterval(videoRetry); videoRetry = null; }
