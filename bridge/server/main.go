@@ -54,9 +54,10 @@ func (c *client) send(payload []byte) error {
 type hub struct {
 	mu    sync.RWMutex
 	rooms map[string]map[*client]struct{}
+	sfu   *sfu
 }
 
-func newHub() *hub { return &hub{rooms: make(map[string]map[*client]struct{})} }
+func newHub() *hub { return &hub{rooms: make(map[string]map[*client]struct{}), sfu: newSFU()} }
 
 func (h *hub) join(c *client) int {
 	h.mu.Lock()
@@ -116,6 +117,11 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	if role == "" {
 		role = "anonymous"
+	}
+	// 视频房间走 SFU：手机只推一路，服务器转给所有观看端（原来广播信令会让多个观看端互相打死）。
+	if strings.HasPrefix(room, "video-") && (role == "publisher" || role == "viewer") {
+		h.sfu.handleSFU(w, r, room, role)
+		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
