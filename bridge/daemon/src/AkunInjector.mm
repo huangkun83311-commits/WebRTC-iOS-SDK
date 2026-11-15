@@ -77,7 +77,12 @@ static double clamp01(double v) {
         // 带断言编译（我们这份）会直接 abort；改按下/抬起两段，节奏与 AKUN 一致
         // （fingerLiftDelay = 50ms），且每段各自带 marker 事件。
         [gen touchDown:p];
-        usleep(60000);
+        // 按住时长可调（默认 120ms）：几十毫秒的"闪电点"SpringBoard 未必认，真实手指点按约 100~150ms
+        NSUInteger ms = cmd[@"ms"] ? [cmd[@"ms"] unsignedIntValue] : 120;
+        if (ms < 30) { ms = 30; }
+        if (ms > 800) { ms = 800; }
+        NSLog(@"[inject] 按住 %lu ms", (unsigned long)ms);
+        usleep((useconds_t)(ms * 1000));
         [gen liftUp:p];
         NSLog(@"[inject] tap 调用返回");
     } else if ([t isEqualToString:@"d"]) {
