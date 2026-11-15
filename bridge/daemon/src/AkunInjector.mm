@@ -1,168 +1,55 @@
-//  AkunInjector — 触摸事件注入
+//  AkunInjector — 触摸注入入口
 //
-//  与 AKUN（TrollVNC 的 STHIDEventGenerator）同一套私有 API，但全部走 dlsym：
+//  这里不再自己拼 IOHIDEvent：直接把 AKUN（TrollVNC）的 STHIDEventGenerator 原样搬进
+//  src/vendor/ 逐字复用（它是真机验证过能控制 SpringBoard 的那一份）。
+//  我们自己手搓的版本试过归一化坐标、掩码、异步发送、senderID 等多种组合，控制始终无效果，
+//  所以改成"用它的代码、只换传输层为 WebRTC"。
 //
-//  为什么不能直接 extern 声明：
-//    链接时用 -Wl,-undefined,dynamic_lookup，缺的符号会变成「陷阱桩」，
-//    一旦调用就 dyld: missing symbol called 直接崩，而且不给符号名。
-//    iOS 16 上 IOHIDEventSystemClientCreateSimpleClient 就已经不存在了，
-//    直接调用必然是这条路 —— 真机上表现为启动日志打完配置行就死。
-//
-//  正确的取法是 IOHIDEventSystemClientCreate（AKUN 用的就是它），依次回退。
+//  注意坐标口：STHIDEventGenerator 收的是**屏幕像素坐标**，内部自己除以
+//  _unjailedReferenceBoundsInPixels（1080x1920）再喂 HID，所以网页来的 0~1 要先乘回来。
 
 #import "AkunInjector.h"
 
-#import <CoreGraphics/CGGeometry.h>
-#import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>
-#import <mach/mach_time.h>
 
-typedef struct __IOHIDEvent *IOHIDEventRef;
-typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+#import "vendor/STHIDEventGenerator.h"
+#import "vendor/Logging.h"
+#import "vendor/UIScreen+Private.h"
 
-// 真实签名（15 参）：alloc, time, type, index, identityMask, eventMask,
-//                     buttonMask, x, y, z, tipPressure, twist, range, touch, options
-typedef IOHIDEventRef (*CreateDigitizerEventFn)(CFAllocatorRef, uint64_t, int, uint32_t, uint32_t,
-                                                uint32_t, uint32_t, double, double, double,
-                                                double, double, Boolean, Boolean, uint32_t);
-// 真实签名（13 参）：alloc, time, index, identity, eventMask, x, y, z,
-//                     tipPressure, twist, range, touch, options
-typedef IOHIDEventRef (*CreateFingerEventFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t,
-                                             uint32_t, double, double, double, double, double,
-                                             Boolean, Boolean, uint32_t);
-typedef void (*AppendEventFn)(IOHIDEventRef, IOHIDEventRef, uint32_t);
-typedef void (*SetIntegerValueFn)(IOHIDEventRef, int32_t, int64_t);
-typedef void (*SetFloatValueFn)(IOHIDEventRef, int32_t, double);
-typedef void (*SetSenderIDFn)(IOHIDEventRef, uint64_t);
-typedef IOHIDEventSystemClientRef (*ClientCreateFn)(CFAllocatorRef);
-typedef IOHIDEventSystemClientRef (*ClientCreateWithTypeFn)(CFAllocatorRef, int, void *);
-typedef void (*DispatchEventFn)(IOHIDEventSystemClientRef, IOHIDEventRef);
-
-// 事件监听（诊断用）：看注入的事件到底有没有进系统事件流
-typedef void (^HIDEventCallbackBlock)(void *target, void *service, IOHIDEventRef event);
-typedef void (*RegisterCallbackFn)(IOHIDEventSystemClientRef, HIDEventCallbackBlock, void *, dispatch_queue_t);
-typedef void (*SetMatchingFn)(IOHIDEventSystemClientRef, CFDictionaryRef);
-typedef void (*ActivateClientFn)(IOHIDEventSystemClientRef);
-typedef uint32_t (*GetTypeFn)(IOHIDEventRef);
-typedef uint64_t (*GetSenderIDFn)(IOHIDEventRef);
-typedef double (*GetFloatFn)(IOHIDEventRef, int32_t);
-typedef IOHIDEventRef (*CreateKeyboardEventFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, Boolean, uint32_t);
-typedef void (*SetDispatchQueueFn)(IOHIDEventSystemClientRef, dispatch_queue_t);
-
-/// 全局唯一的 HID 串行队列（AKUN 也是在固定队列上发事件）。
-static dispatch_queue_t AkunHIDQueue(void) {
-    static dispatch_queue_t q;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        dispatch_queue_attr_t attr =
-            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
-        q = dispatch_queue_create("com.akun.bridge.hid", attr);
-    });
-    return q;
-}
-
-// IOHIDEventField 数值（对照 AKUN include-spi/IOKitSPI.h 的枚举）
-#define kHIDFieldIsBuiltIn 4                                  // kIOHIDEventTypeNULL 基址 + 4
-#define kHIDFieldDigitizerIsDisplayIntegrated 0x00030019      // 基址 0x30000 + 20 + 5
-#define kHIDFieldDigitizerMajorRadius 0x00030014              // 基址 0x30000 + 20
-#define kHIDFieldDigitizerMinorRadius 0x00030015
-
-#define HID_PHASE_BEGAN 1
-#define HID_PHASE_MOVED 2
-#define HID_PHASE_ENDED 4
-
-// IOHIDDigitizerEventMask（照 IOKitSPI.h 的位定义：Identity=1<<5、Attribute=1<<6）
-#define HID_MASK_RANGE     0x00000001
-#define HID_MASK_TOUCH     0x00000002
-#define HID_MASK_POSITION  0x00000004
-#define HID_MASK_IDENTITY  0x00000020
-#define HID_MASK_ATTRIBUTE 0x00000040
-
-#define HID_FINGER_ID 2   // AKUN 的 fingerIdentifiers[0]
-
-#define HID_TYPE_HAND 3
-#define HID_TYPE_FINGER 2
-
-// 发送者 ID。AKUN 源码注释：0x8000000817319371 对应 iOS 9+，0x8000000817319372 在 iOS 14.8~26 有效。
-// 本机是 iOS 16.7.16，先按新系统的值来。
-static const uint64_t kSenderID = 0x8000000817319372ULL;
-static const double kMinEventInterval = 0.012;
+// STHIDEventGenerator 依赖的外部符号
+BOOL tvncLoggingEnabled = NO;
+BOOL tvncVerboseLoggingEnabled = NO;
+int gOrientationFixQuad = 0;
 
 @implementation AkunInjector {
-    IOHIDEventSystemClientRef _client;
-    NSTimeInterval _lastDispatch;
-
-    CreateDigitizerEventFn _createHand;
-    CreateFingerEventFn _createFinger;
-    AppendEventFn _appendEvent;
-    SetIntegerValueFn _setInteger;
-    SetFloatValueFn _setFloat;
-    SetSenderIDFn _setSenderID;
-    DispatchEventFn _dispatch;
+    double _startX;   // 0~1
+    double _startY;
+    double _lastX;
+    double _lastY;
+    BOOL _dragging;
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _createHand = (CreateDigitizerEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventCreateDigitizerEvent");
-        _createFinger = (CreateFingerEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventCreateDigitizerFingerEvent");
-        _appendEvent = (AppendEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventAppendEvent");
-        _setInteger = (SetIntegerValueFn)dlsym(RTLD_DEFAULT, "IOHIDEventSetIntegerValue");
-        _setFloat = (SetFloatValueFn)dlsym(RTLD_DEFAULT, "IOHIDEventSetFloatValue");
-        _setSenderID = (SetSenderIDFn)dlsym(RTLD_DEFAULT, "IOHIDEventSetSenderID");
-        _dispatch = (DispatchEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientDispatchEvent");
-
-        ClientCreateFn simpleFn =
-            (ClientCreateFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCreateSimpleClient");
-        ClientCreateFn createFn = (ClientCreateFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCreate");
-        ClientCreateWithTypeFn createWithType =
-            (ClientCreateWithTypeFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCreateWithType");
-
-        if (createFn) {
-            _client = createFn(kCFAllocatorDefault);
-        } else if (simpleFn) {
-            _client = simpleFn(kCFAllocatorDefault);
-        } else if (createWithType) {
-            _client = createWithType(kCFAllocatorDefault, 3, NULL);   // 3 = digitizer
-        }
-
-        NSLog(@"[inject] client=%p (create=%p simple=%p withType=%p) symbols hand=%p finger=%p "
-              @"append=%p dispatch=%p senderID=%p",
-              _client, createFn, simpleFn, createWithType,
-              _createHand, _createFinger, _appendEvent, _dispatch, _setSenderID);
-
-        if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) {
-            NSLog(@"[inject] 私有符号不全，注入功能不可用（看上面指针哪个是 0）");
-        }
-
-        // iOS 14+ 的 IOHIDEventSystemClient 需要激活后才接收/分发事件；
-        // 不激活时 DispatchEvent 会静默丢弃（表现就是"发了但没反应"）。
-        ActivateClientFn act = (ActivateClientFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientActivate");
-        if (_client && act) {
-            act(_client);
-            NSLog(@"[inject] 已 Activate dispatch client");
-        } else {
-            NSLog(@"[inject] 没有 Activate 符号（act=%p）", act);
-        }
-        SetDispatchQueueFn setQueue =
-            (SetDispatchQueueFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientSetDispatchQueue");
-        if (_client && setQueue) {
-            setQueue(_client, AkunHIDQueue());
-            NSLog(@"[inject] 已给 dispatch client 绑定队列");
-        }
+        tvncLoggingEnabled = YES;   // 它内部的 TVLog 走 NSLog，方便真机排错
+        UIView *v = [[UIView alloc] init];   // 确保 UIKit 已加载
+        v = nil;
+        NSLog(@"[inject] 使用 AKUN STHIDEventGenerator 注入");
     }
     return self;
 }
 
-/// 注入 API 的 x/y 是「0~1 归一化」坐标（AKUN 里也是先把点坐标除以屏幕像素再喂进去），
-/// 所以要拿的是屏幕像素尺寸只用于日志，真正喂给 HID 的必须是 0~1。
-- (CGSize)screenPointSize {
+/// 屏幕像素尺寸（AKUN 内部也是拿这个做归一化基准：1080x1920）
+- (CGSize)pixelSize {
+    CGRect r = CGRectZero;
     @try {
-        CGSize s = [UIScreen mainScreen].bounds.size;
-        if (s.width > 1 && s.height > 1) { return s; }
+        r = [[UIScreen mainScreen] _unjailedReferenceBoundsInPixels];
     } @catch (NSException *e) {
     }
-    return CGSizeMake(414, 736);
+    if (r.size.width < 1 || r.size.height < 1) {
+        r = CGRectMake(0, 0, 1080, 1920);
+    }
+    return r.size;
 }
 
 static double clamp01(double v) {
@@ -171,181 +58,49 @@ static double clamp01(double v) {
     return v;
 }
 
-- (void)dispatchPhase:(uint32_t)phase x:(double)x y:(double)y {
-    if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) { return; }
-
-    NSTimeInterval now = CACurrentMediaTime();
-    if (now - _lastDispatch < kMinEventInterval && phase == HID_PHASE_MOVED) { return; }
-    _lastDispatch = now;
-
-    uint64_t ts = mach_absolute_time();
-    Boolean touching = (phase != HID_PHASE_ENDED);
-
-    // 掩码照 AKUN：按下/抬起 = Touch|Identity，移动 = Position|Attribute
-    uint32_t mask = (phase == HID_PHASE_MOVED)
-                        ? (HID_MASK_POSITION | HID_MASK_ATTRIBUTE)
-                        : (HID_MASK_TOUCH | HID_MASK_IDENTITY);
-
-    IOHIDEventRef hand = _createHand(kCFAllocatorDefault, ts, HID_TYPE_HAND,
-                                     0, 0, mask, 0,
-                                     0, 0, 0,          // x, y, z —— 坐标只放 finger 子事件（同 AKUN）
-                                     0, 0,             // tipPressure, twist
-                                     0, touching,      // range, touch
-                                     0);               // options
-    IOHIDEventRef finger = _createFinger(kCFAllocatorDefault, ts,
-                                         HID_FINGER_ID, HID_FINGER_ID, mask,
-                                         x, y, 0, 0, 90.0,
-                                         touching, touching,   // range / touch：按住在 in-range
-                                         0);                   // options
-
-    if (hand && finger) {
-        // 这两项让系统认为事件来自内置触摸屏（AKUN 一样是必设的）
-        _setInteger(hand, kHIDFieldIsBuiltIn, 1);
-        _setInteger(hand, kHIDFieldDigitizerIsDisplayIntegrated, 1);
-        if (_setFloat) {
-            _setFloat(finger, kHIDFieldDigitizerMajorRadius, 5.0);
-            _setFloat(finger, kHIDFieldDigitizerMinorRadius, 5.0);
-        }
-        _appendEvent(hand, finger, 0);
-        if (_setSenderID) { _setSenderID(hand, kSenderID); }
-
-        // 完全照 AKUN 的发法：串行队列 + CFRetain 后异步 dispatch，发完才 release。
-        // 同步 dispatch 紧接着 CFRelease，事件常常还没走完 XPC 就被回收 → 表现就是“点了没反应”。
-        IOHIDEventRef strong = (IOHIDEventRef)CFRetain(hand);
-        IOHIDEventSystemClientRef client = _client;
-        DispatchEventFn send = _dispatch;
-        dispatch_async(AkunHIDQueue(), ^{
-            send(client, strong);
-            CFRelease(strong);
-            NSLog(@"[inject] 已发 phase=%u mask=0x%x (%.3f, %.3f)", phase, mask, x, y);
-        });
-    }
-    if (finger) { CFRelease(finger); }
-    if (hand) { CFRelease(hand); }
-}
-
-/// 诊断：挂一个 HID 事件监听，把收到的 digitizer 事件打出来。
-/// 用来区分“注入没发出去”和“发出去了但 SpringBoard 不认”。
-- (void)startEventMonitor:(ClientCreateWithTypeFn)createWithType {
-    if (!createWithType) { return; }
-    RegisterCallbackFn reg = (RegisterCallbackFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientRegisterEventCallback");
-    ActivateClientFn act = (ActivateClientFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientActivate");
-    GetTypeFn getType = (GetTypeFn)dlsym(RTLD_DEFAULT, "IOHIDEventGetType");
-    GetSenderIDFn getSender = (GetSenderIDFn)dlsym(RTLD_DEFAULT, "IOHIDEventGetSenderID");
-    if (!reg) {
-        NSLog(@"[inject] 没有 RegisterEventCallback，跳过监听");
-        return;
-    }
-    @try {
-        IOHIDEventSystemClientRef mon = createWithType(kCFAllocatorDefault, 1, NULL);  // 1 = Monitor
-        if (!mon) {
-            NSLog(@"[inject] 监听 client 创建失败");
-            return;
-        }
-        dispatch_queue_t q = dispatch_queue_create("com.akun.bridge.hid-monitor", DISPATCH_QUEUE_SERIAL);
-        reg(mon, ^(void *target, void *service, IOHIDEventRef event) {
-            if (!event || !getType) { return; }
-            uint32_t t = getType(event);
-            if (t != 11) { return; }   // 11 = kIOHIDEventTypeDigitizer
-            uint64_t sid = getSender ? getSender(event) : 0;
-            NSLog(@"[inject] 监听到 digitizer 事件 sender=0x%llx", sid);
-        }, NULL, q);
-        if (act) { act(mon); }
-        NSLog(@"[inject] 事件监听已启动");
-    } @catch (NSException *e) {
-        NSLog(@"[inject] 监听启动异常：%@", e);
-    }
+- (CGPoint)pointFromNormX:(double)x y:(double)y {
+    CGSize s = [self pixelSize];
+    return CGPointMake(clamp01(x) * s.width, clamp01(y) * s.height);
 }
 
 - (void)handleCommand:(NSDictionary *)cmd {
     NSString *t = cmd[@"t"];
     if (![t isKindOfClass:[NSString class]]) { return; }
-    // 网页端发来的是 0~1 归一化坐标；HID 注入同样吃 0~1，直接透传（越界夹一下）。
-    // 之前乘成 414x736 的点坐标去喂 HID，等于每个触点都在屏幕外，表现就是点了没反应。
-    CGSize sz = [self screenPointSize];
+
     double x = clamp01([cmd[@"x"] doubleValue]);
     double y = clamp01([cmd[@"y"] doubleValue]);
+    STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
 
-    static dispatch_once_t onceLog;
-    dispatch_once(&onceLog, ^{
-        NSLog(@"[inject] 屏 %.0fx%.0f 点，坐标按 0~1 归一化注入", sz.width, sz.height);
-    });
-
-    if ([t isEqualToString:@"d"]) {
-        [self dispatchPhase:HID_PHASE_BEGAN x:x y:y];
+    if ([t isEqualToString:@"tap"]) {
+        [gen tap:[self pointFromNormX:x y:y]];
+    } else if ([t isEqualToString:@"d"]) {
+        _dragging = YES;
+        _startX = x; _startY = y; _lastX = x; _lastY = y;
     } else if ([t isEqualToString:@"m"]) {
-        [self dispatchPhase:HID_PHASE_MOVED x:x y:y];
+        if (_dragging) { _lastX = x; _lastY = y; }
     } else if ([t isEqualToString:@"u"]) {
-        [self dispatchPhase:HID_PHASE_ENDED x:x y:y];
-    } else if ([t isEqualToString:@"tap"]) {
-        [self dispatchPhase:HID_PHASE_BEGAN x:x y:y];
-        usleep(60000);
-        [self dispatchPhase:HID_PHASE_ENDED x:x y:y];
-    } else if ([t isEqualToString:@"swipe"]) {
-        double x2 = clamp01([cmd[@"x2"] doubleValue]);
-        double y2 = clamp01([cmd[@"y2"] doubleValue]);
-        int steps = 12;
-        [self dispatchPhase:HID_PHASE_BEGAN x:x y:y];
-        for (int i = 1; i <= steps; i++) {
-            double k = (double)i / steps;
-            [self dispatchPhase:HID_PHASE_MOVED x:x + (x2 - x) * k y:y + (y2 - y) * k];
-            usleep(12000);
+        if (_dragging) {
+            _dragging = NO;
+            CGPoint a = [self pointFromNormX:_startX y:_startY];
+            CGPoint b = [self pointFromNormX:(x > 0 ? x : _lastX) y:(y > 0 ? y : _lastY)];
+            if (fabs(b.x - a.x) + fabs(b.y - a.y) > 2) {
+                [gen dragLinearWithStartPoint:a endPoint:b duration:0.25];
+            }
         }
-        [self dispatchPhase:HID_PHASE_ENDED x:x2 y:y2];
-    } else if ([t isEqualToString:@"hk"]) {
-        uint32_t usage = (uint32_t)[cmd[@"usage"] unsignedIntValue];
-        NSLog(@"[inject] 键盘 usage=0x%x", usage);
-        [self sendConsumerUsage:usage];
+    } else if ([t isEqualToString:@"swipe"]) {
+        CGPoint a = [self pointFromNormX:x y:y];
+        CGPoint b = [self pointFromNormX:[cmd[@"x2"] doubleValue] y:[cmd[@"y2"] doubleValue]];
+        [gen dragLinearWithStartPoint:a endPoint:b duration:0.25];
     } else if ([t isEqualToString:@"k"]) {
-        NSLog(@"[inject] key %@", cmd[@"code"]);
-        [self dispatchKey:cmd[@"code"]];
-    }
-}
-
-/// 对照实验：发一个硬件键盘事件（Consumer 页 Home 键）。
-/// 键盘事件走的也是 IOHIDEventSystemClientDispatchEvent，但构造简单得多：
-/// 如果键盘能生效、触摸不行，说明分发通道是通的，问题只在 digitizer 事件的构造。
-- (void)sendKeyboardHome {
-    [self sendConsumerUsage:0x223];   // kHIDUsage_Csmr_ACHome
-}
-
-/// 对照实验：发一个 Consumer 页键盘事件（音量键能看到系统 HUD，最适合验证分发通道）。
-- (void)sendConsumerUsage:(uint32_t)usage {
-    CreateKeyboardEventFn createKey =
-        (CreateKeyboardEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventCreateKeyboardEvent");
-    if (!createKey || !_dispatch || !_client) {
-        NSLog(@"[inject] 键盘事件不可用");
-        return;
-    }
-    for (int down = 1; down >= 0; down--) {
-        IOHIDEventRef key = createKey(kCFAllocatorDefault, mach_absolute_time(),
-                                      0x0C,      // kHIDPage_Consumer
-                                      usage,
-                                      down, 0);
-        if (!key) { continue; }
-        if (_setSenderID) { _setSenderID(key, kSenderID); }
-        IOHIDEventRef strong = (IOHIDEventRef)CFRetain(key);
-        IOHIDEventSystemClientRef client = _client;
-        DispatchEventFn send = _dispatch;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-            send(client, strong);
-            CFRelease(strong);
-        });
-        CFRelease(key);
-        usleep(50000);
-    }
-    NSLog(@"[inject] 已发键盘 Home");
-}
-
-/// Home 手势：从下缘外往上滑，回桌面（坐标同样是 0~1）。
-- (void)dispatchKey:(NSString *)code {
-    if (![code isKindOfClass:[NSString class]]) { return; }
-    if ([code isEqualToString:@"home"]) {
-        [self sendKeyboardHome];          // 先走键盘 Home：用来判定分发通道是否可用
-    } else if ([code isEqualToString:@"home-swipe"]) {
-        [self dispatchPhase:HID_PHASE_BEGAN x:0.5 y:0.995];
-        [self dispatchPhase:HID_PHASE_MOVED x:0.5 y:0.85];
-        [self dispatchPhase:HID_PHASE_ENDED x:0.5 y:0.75];
+        NSString *code = cmd[@"code"];
+        if ([code isEqualToString:@"home"]) {
+            [gen menuPress];
+        }
+    } else if ([t isEqualToString:@"hk"]) {
+        unsigned int usage = [cmd[@"usage"] unsignedIntValue];
+        if (usage == 0xE9) { [gen volumeIncrementPress]; }
+        else if (usage == 0xEA) { [gen volumeDecrementPress]; }
+        else if (usage == 0x223) { [gen menuPress]; }
     }
 }
 
