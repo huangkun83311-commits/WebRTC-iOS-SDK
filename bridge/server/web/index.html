@@ -193,29 +193,46 @@
   }
 
   let dragging = false;
+  let pressStart = null;          // 按下时的归一化坐标 + 时间
+  const DRAG_THRESHOLD = 0.006;   // 归一化位移超过它才算拖动
 
   screenEl.addEventListener('pointerdown', (ev) => {
     if (!ctrlWs || ctrlWs.readyState !== 1) return;
-    screenEl.setPointerCapture(ev.pointerId);
-    dragging = true;
+    try { screenEl.setPointerCapture(ev.pointerId); } catch (e) {}
+    dragging = false;
     const p = norm(ev);
-    ctrl({ t: 'd', x: p.x, y: p.y });
+    pressStart = { x: p.x, y: p.y, t: performance.now() };
   });
 
   screenEl.addEventListener('pointermove', (ev) => {
-    if (!dragging) return;
+    if (!pressStart) return;
     const now = performance.now();
     if (now - lastMoveSent < 16) return;   // 最高 60Hz
-    lastMoveSent = now;
     const p = norm(ev);
+    if (!dragging) {
+      const dx = Math.abs(p.x - pressStart.x);
+      const dy = Math.abs(p.y - pressStart.y);
+      if (dx < DRAG_THRESHOLD && dy < DRAG_THRESHOLD) return;   // 还没动够，先不发
+      dragging = true;
+      ctrl({ t: 'd', x: pressStart.x, y: pressStart.y });       // 拖动从按下点起手
+    }
+    lastMoveSent = now;
     ctrl({ t: 'm', x: p.x, y: p.y });
   });
 
   function endDrag(ev) {
-    if (!dragging) return;
-    dragging = false;
+    if (!pressStart) return;
     const p = norm(ev);
-    ctrl({ t: 'u', x: p.x, y: p.y });
+    const dt = performance.now() - pressStart.t;
+    if (dragging) {
+      ctrl({ t: 'u', x: p.x, y: p.y });
+    } else {
+      // 单击：直接发 tap（设备端一次 BEGAN + ENDED，不会被识别成滑动）
+      ctrl({ t: 'tap', x: pressStart.x, y: pressStart.y });
+      if (dt > 450) ctrl({ t: 'k', code: 'home' });   // 长按 → 回桌面
+    }
+    pressStart = null;
+    dragging = false;
   }
 
   screenEl.addEventListener('pointerup', endDrag);

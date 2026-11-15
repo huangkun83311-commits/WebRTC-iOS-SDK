@@ -101,7 +101,8 @@ static const double kMinEventInterval = 0.012;
     return self;
 }
 
-/// 触摸坐标用的是「点」（UIScreen bounds），不是像素。
+/// 注入 API 的 x/y 是「0~1 归一化」坐标（AKUN 里也是先把点坐标除以屏幕像素再喂进去），
+/// 所以要拿的是屏幕像素尺寸只用于日志，真正喂给 HID 的必须是 0~1。
 - (CGSize)screenPointSize {
     @try {
         CGSize s = [UIScreen mainScreen].bounds.size;
@@ -109,6 +110,12 @@ static const double kMinEventInterval = 0.012;
     } @catch (NSException *e) {
     }
     return CGSizeMake(414, 736);
+}
+
+static double clamp01(double v) {
+    if (v < 0) { return 0; }
+    if (v > 1) { return 1; }
+    return v;
 }
 
 - (void)dispatchPhase:(uint32_t)phase x:(double)x y:(double)y {
@@ -128,7 +135,7 @@ static const double kMinEventInterval = 0.012;
     IOHIDEventRef finger = _createFinger(kCFAllocatorDefault, ts,
                                          0, 1, phase,
                                          x, y, 0, 0, 0,
-                                         0, touching);
+                                         touching, touching);   // range / touch 同 AKUN：按住在 in-range
 
     if (hand && finger) {
         // 这两项让系统认为事件来自内置触摸屏（AKUN 一样是必设的）
@@ -149,15 +156,15 @@ static const double kMinEventInterval = 0.012;
 - (void)handleCommand:(NSDictionary *)cmd {
     NSString *t = cmd[@"t"];
     if (![t isKindOfClass:[NSString class]]) { return; }
-    // 网页端发来的是 0~1 归一化坐标，注入 API 要的是屏幕点坐标，必须先乘屏幕尺寸。
-    // 之前直接当像素用，等于永远点在左上角（真机上表现为点了没反应）。
+    // 网页端发来的是 0~1 归一化坐标；HID 注入同样吃 0~1，直接透传（越界夹一下）。
+    // 之前乘成 414x736 的点坐标去喂 HID，等于每个触点都在屏幕外，表现就是点了没反应。
     CGSize sz = [self screenPointSize];
-    double x = [cmd[@"x"] doubleValue] * sz.width;
-    double y = [cmd[@"y"] doubleValue] * sz.height;
+    double x = clamp01([cmd[@"x"] doubleValue]);
+    double y = clamp01([cmd[@"y"] doubleValue]);
 
     static dispatch_once_t onceLog;
     dispatch_once(&onceLog, ^{
-        NSLog(@"[inject] 坐标换算基准 %.0fx%.0f 点", sz.width, sz.height);
+        NSLog(@"[inject] 屏 %.0fx%.0f 点，坐标按 0~1 归一化注入", sz.width, sz.height);
     });
 
     if ([t isEqualToString:@"d"]) {
@@ -168,11 +175,11 @@ static const double kMinEventInterval = 0.012;
         [self dispatchPhase:HID_PHASE_ENDED x:x y:y];
     } else if ([t isEqualToString:@"tap"]) {
         [self dispatchPhase:HID_PHASE_BEGAN x:x y:y];
-        usleep(30000);
+        usleep(60000);
         [self dispatchPhase:HID_PHASE_ENDED x:x y:y];
     } else if ([t isEqualToString:@"swipe"]) {
-        double x2 = [cmd[@"x2"] doubleValue] * sz.width;
-        double y2 = [cmd[@"y2"] doubleValue] * sz.height;
+        double x2 = clamp01([cmd[@"x2"] doubleValue]);
+        double y2 = clamp01([cmd[@"y2"] doubleValue]);
         int steps = 12;
         [self dispatchPhase:HID_PHASE_BEGAN x:x y:y];
         for (int i = 1; i <= steps; i++) {
@@ -187,14 +194,13 @@ static const double kMinEventInterval = 0.012;
     }
 }
 
-/// Home 手势：从下缘外往上滑，回桌面。
+/// Home 手势：从下缘外往上滑，回桌面（坐标同样是 0~1）。
 - (void)dispatchKey:(NSString *)code {
     if (![code isKindOfClass:[NSString class]]) { return; }
-    CGSize sz = [self screenPointSize];
     if ([code isEqualToString:@"home"]) {
-        [self dispatchPhase:HID_PHASE_BEGAN x:0.5 * sz.width y:0.995 * sz.height];
-        [self dispatchPhase:HID_PHASE_MOVED x:0.5 * sz.width y:0.85 * sz.height];
-        [self dispatchPhase:HID_PHASE_ENDED x:0.5 * sz.width y:0.75 * sz.height];
+        [self dispatchPhase:HID_PHASE_BEGAN x:0.5 y:0.995];
+        [self dispatchPhase:HID_PHASE_MOVED x:0.5 y:0.85];
+        [self dispatchPhase:HID_PHASE_ENDED x:0.5 y:0.75];
     }
 }
 

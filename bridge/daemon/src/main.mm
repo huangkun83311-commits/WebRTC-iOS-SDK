@@ -200,6 +200,7 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
         if (data) {
             NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             if ([cmd isKindOfClass:[NSDictionary class]]) {
+                NSLog(@"[ctrl] 收到 %@", message.string ?: @"<bin>");
                 [self.injector handleCommand:cmd];
             }
         }
