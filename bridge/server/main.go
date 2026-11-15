@@ -194,7 +194,7 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 
 // ---- 局域网自动发现：手机端不用手填 IP ----
 //
-// 手机广播一个探测包到 UDP 19941（沿用 AKUN 那套的端口习惯），本程序回自己的 http 地址。
+// 手机广播一个探测包到 UDP 19951，本程序回自己的 http 地址。
 // 回包里的 IP 用「朝对端 dial 一次取本地地址」的方式算出来，多网卡（有线/Wi-Fi/虚拟网卡）
 // 时也能给出对的那一个。
 
@@ -270,7 +270,7 @@ func httpPortFromAddr(addr string) int {
 
 func main() {
 	addr := flag.String("addr", ":8080", "监听地址，例如 :8080")
-	discPort := flag.Int("disc", 19941, "UDP 自动发现端口，0 表示关闭")
+	discPort := flag.Int("disc", 19951, "UDP 自动发现端口，0 表示关闭")
 	flag.Parse()
 
 	h := newHub()

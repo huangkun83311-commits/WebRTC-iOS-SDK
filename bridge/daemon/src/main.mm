@@ -7,7 +7,7 @@
 //       所以电脑端点击、滑动、回桌面都能作用到整个系统，而不只是自己这个 App。
 //
 //  服务地址默认不用手填：配置里 ServerBase 留空（或写 auto）就走局域网自动发现，
-//  先 UDP 19941 广播、失败再扫 /24 网段的 8080，和 AKUN 那套的发现习惯一致。
+//  先 UDP 19951 广播、失败再扫 /24 网段的 8080，和 AKUN 那套的发现习惯一致。
 
 #import <Foundation/Foundation.h>
 #import "AkunCapture.h"

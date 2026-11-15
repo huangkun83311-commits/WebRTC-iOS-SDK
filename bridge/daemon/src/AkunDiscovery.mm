@@ -12,7 +12,7 @@
 #import <string.h>
 #import <errno.h>
 
-static const uint16_t kDiscoveryPort = 19941;
+static const uint16_t kDiscoveryPort = 19951;
 static const uint16_t kHttpPort = 8080;
 static NSString *const kProbePacket = @"AKUNBRIDGE_DISCOVER";
 
