@@ -105,7 +105,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         videoSource = factory.videoSource(forScreenCast: true)
         videoSource.adaptOutputFormat(toWidth: 720, height: 1280, fps: 30)
 
-        videoCapturer = RTCVideoCapturer()
+        videoCapturer = RTCVideoCapturer(delegate: videoSource)
         videoTrack = factory.videoTrack(with: videoSource, trackId: "screen0")
 
         var iceServers: [RTCIceServer] = [RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"])]

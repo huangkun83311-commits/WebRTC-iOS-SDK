@@ -35,7 +35,7 @@ jobs:
 
       - name: Archive（不签名）
         run: |
-          set -euo pipefail
+          set -o pipefail
           xcodebuild archive \
             -project WebRTCiOSSDK.xcodeproj \
             -scheme "WebRTC-Sample-App" \
@@ -45,7 +45,22 @@ jobs:
             ARCHS=arm64 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$RUNNER_TEMP/build.log" | tail -n 120
+
+      # 编译失败时，把编译器报错原样打成 GitHub 注解（注解在 run 页面上公开可见，
+      # 这样不用 token 也能定位到具体文件和行号）。
+      - name: 编译失败时输出可读的报错注解
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          [ -f "$LOG" ] || { echo "::error ::没有找到 build.log"; exit 0; }
+          echo "===== grep error ====="
+          grep -E "(^|: )(error|fatal error): " "$LOG" | head -n 30 || true
+          echo "===== 结束 ====="
+          grep -E "(^|: )(error|fatal error): " "$LOG" | head -n 30 | while IFS= read -r line; do
+            echo "::error ::${line}"
+          done
 
       - name: 注入备用配置到扩展 Info.plist
         env:
