@@ -108,13 +108,14 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     self.serverBase = prefs[@"ServerBase"] ?: @"";
     self.deviceId = prefs[@"DeviceId"] ?: @"dev001";
 
-    // 输出参数默认值 = AKUN 出厂值：scale 0.35 / 12fps / 1.5Mbps（H264 硬编）。
+    // 输出参数默认值：scale 跟 AKUN 出厂一致（0.35，字体清晰度等同 AKUN），
     // 需要更清晰或更省流量时，不改包、走 /api/config 在线下发档位即可。
+    // fps 从 12 提到 20：这是「像视频流」的唯一决定性参数，清晰度不变、字体一样清楚。
     double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
-    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 12;
+    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 20;
     NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 1500000;
     if (scale <= 0.0) { scale = 0.35; }
-    if (fps <= 0) { fps = 12; }
+    if (fps <= 0) { fps = 20; }
     if (maxBitrate <= 0) { maxBitrate = 1500000; }
 
     NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
@@ -230,6 +231,11 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
                     if (cmd[@"scale"]) { scale = [cmd[@"scale"] doubleValue]; }
                     if (cmd[@"fps"]) { fps = [cmd[@"fps"] intValue]; }
                     if (cmd[@"bitrate"]) { br = [cmd[@"bitrate"] integerValue]; }
+                    // 下限保护：scale 再低字就糊了（0.30 ≈ 372x662），宁可降帧也不降到这里以下
+                    if (scale < 0.30) { scale = 0.30; }
+                    if (scale > 1.0) { scale = 1.0; }
+                    if (fps < 8) { fps = 8; }
+                    if (fps > 30) { fps = 30; }
                     NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld", scale, fps, (long)br);
                     // 缩放由抓屏层做（GPU 出小图），编码器侧不再缩放
                     [self.capture setOutputScale:scale];
