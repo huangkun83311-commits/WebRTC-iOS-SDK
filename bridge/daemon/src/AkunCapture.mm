@@ -41,6 +41,16 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     // 缩图用：目标尺寸 + 缓冲池（每帧复用，不反复 malloc）
     CVPixelBufferPoolRef _pool;
     size_t _poolW, _poolH;
+
+    // ---- 性能观测 + 帧率自适应 ----
+    int _activeFps;              // 当前真正生效的抓屏帧率（可能因机器吃力被下调）
+    NSUInteger _perfFrames;      // 本窗口内的帧数
+    double _renderMsSum;         // 渲染（GPU 抓屏）耗时合计
+    double _scaleMsSum;          // vImage 缩图耗时合计
+    double _pushMsSum;           // 交给 WebRTC 的耗时合计
+    NSTimeInterval _perfWindowStart;
+    int _lowStreak;              // 连续「机器吃力」窗口数
+    int _highStreak;             // 连续「机器轻松」窗口数
 }
 
 - (instancetype)init {
@@ -146,6 +156,28 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     return YES;
 }
 
+/// 帧率热更新：以前这个属性是自动合成的，改了 _fps 但定时器还是启动时的间隔，
+/// 等于「在线改 fps 不生效」。这里改成重建定时器（并清零自适应窗口）。
+- (void)setFps:(int)fps {
+    int v = (fps >= 8 && fps <= 30) ? fps : kDefaultFPS;
+    _fps = v;
+    if (v != _activeFps) {
+        _activeFps = v;
+        _lowStreak = 0;
+        _highStreak = 0;
+        if (_running) { [self applyTimerFps:v]; }
+        NSLog(@"[capture] 抓屏帧率设为 %d fps", v);
+    }
+}
+
+- (void)applyTimerFps:(int)fps {
+    if (!_timer) { return; }
+    int v = (fps >= 1 && fps <= 60) ? fps : kDefaultFPS;
+    // leeway 给 0：帧间隔必须准，抖动本身就是「卡顿感」的来源
+    dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              NSEC_PER_SEC / v, 0);
+}
+
 /// scale 只决定「缩图后的输出尺寸」，渲染 surface 始终是整屏，所以这里不用重建 surface。
 - (void)setOutputScale:(double)scale {
     double s = (scale > 0.05 && scale <= 1.0) ? scale : 1.0;
@@ -239,16 +271,68 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     CVPixelBufferRef pbuf = _pixelBuffers[slot];
     if (!surface || !pbuf) { return; }
 
+    NSTimeInterval t0 = CACurrentMediaTime();
     // 渲染服务器把主屏画进这块 surface。kIOSurfaceLock 不需要：渲染是同步完成的。
     _renderDisplay(0, CFSTR("LCD"), surface, 0, 0);
+    NSTimeInterval t1 = CACurrentMediaTime();
 
     // 推上一帧的槽位（双缓冲，交替）
     _cur = 1 - _cur;
     _lastPushTime = CACurrentMediaTime();
 
     CVPixelBufferRef out = [self scaleFrame:pbuf];
+    NSTimeInterval t2 = CACurrentMediaTime();
     if (out && self.frameHandler) { self.frameHandler(out); }
     if (out) { CVPixelBufferRelease(out); }
+    NSTimeInterval t3 = CACurrentMediaTime();
+
+    _perfFrames++;
+    _renderMsSum += (t1 - t0) * 1000.0;
+    _scaleMsSum  += (t2 - t1) * 1000.0;
+    _pushMsSum   += (t3 - t2) * 1000.0;
+    [self finishPerfWindowIfNeeded:t3];
+}
+
+/// 每 2 秒结算一次：报出渲染/缩图/推帧各占多少毫秒，以及实际帧率。
+/// 同时做「机器吃力就降帧率」的自适应：帧间隔稳不住的时候，20fps 只会变成抖动，
+/// 降到机器扛得住的节奏反而更顺（这也是 AKUN 在 A11 上用手感的做法）。
+- (void)finishPerfWindowIfNeeded:(NSTimeInterval)now {
+    NSTimeInterval span = now - _perfWindowStart;
+    if (span < 2.0 || _perfFrames == 0) { return; }
+
+    double n = (double)_perfFrames;
+    double renderMs = _renderMsSum / n;
+    double scaleMs = _scaleMsSum / n;
+    double pushMs = _pushMsSum / n;
+    double costMs = renderMs + scaleMs + pushMs;
+    double realFps = n / span;
+    double budgetMs = 1000.0 / (double)_activeFps;
+
+    NSLog(@"[perf] 实际 %.1ffps 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms",
+          realFps, renderMs, scaleMs, pushMs, costMs, budgetMs);
+
+    _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0;
+    _perfWindowStart = now;
+
+    if (costMs > budgetMs * 0.7) {
+        _lowStreak++; _highStreak = 0;
+        if (_lowStreak >= 2 && _activeFps > 8) {
+            int v = MAX(8, _activeFps - 3);
+            _activeFps = v; _lowStreak = 0;
+            [self applyTimerFps:v];
+            NSLog(@"[perf] 单帧耗时超预算，抓屏降到 %d fps（稳帧优先）", v);
+        }
+    } else if (costMs < budgetMs * 0.45) {
+        _highStreak++; _lowStreak = 0;
+        if (_highStreak >= 3 && _activeFps < _fps) {
+            int v = MIN(_fps, _activeFps + 2);
+            _activeFps = v; _highStreak = 0;
+            [self applyTimerFps:v];
+            NSLog(@"[perf] 余量充足，抓屏升回 %d fps", v);
+        }
+    } else {
+        _lowStreak = 0; _highStreak = 0;
+    }
 }
 
 - (BOOL)start {
