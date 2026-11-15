@@ -70,6 +70,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     CGSize sz = [self screenPixelSize];
     size_t w = (size_t)lround(sz.width);
     size_t h = (size_t)lround(sz.height);
+    NSLog(@"[capture] 屏像素 %zu x %zu", w, h);
     if (w == 0 || h == 0) { return NO; }
     w &= ~1UL; h &= ~1UL;                     // 宽高取偶数
 
@@ -90,17 +91,31 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     };
 
     for (int i = 0; i < 2; i++) {
-        _surfaces[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-        if (!_surfaces[i]) {
-            NSLog(@"[capture] IOSurfaceCreate 失败 slot=%d", i);
-            return NO;
+        // 首选 CoreVideo 自己建（它内部按系统要求填属性，比手搓 IOSurfaceCreate 成功率高），
+        // 失败再退回裸 IOSurfaceCreate。
+        CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                          kCVPixelFormatType_32BGRA,
+                                          (__bridge CFDictionaryRef)cvAttrs,
+                                          &_pixelBuffers[i]);
+        if (cr == kCVReturnSuccess && _pixelBuffers[i]) {
+            _surfaces[i] = CVPixelBufferGetIOSurface(_pixelBuffers[i]);
+            if (_surfaces[i]) { CFRetain(_surfaces[i]); }
         }
-        // 零拷贝：直接把 IOSurface 包成 CVPixelBuffer
-        CVReturn cr = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, _surfaces[i],
-                                                       (__bridge CFDictionaryRef)cvAttrs,
-                                                       &_pixelBuffers[i]);
-        if (cr != kCVReturnSuccess || !_pixelBuffers[i]) {
-            NSLog(@"[capture] CVPixelBufferCreateWithIOSurface 失败 slot=%d cr=%d", i, cr);
+        if (!_surfaces[i]) {
+            if (_pixelBuffers[i]) { CVPixelBufferRelease(_pixelBuffers[i]); _pixelBuffers[i] = NULL; }
+            _surfaces[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            if (_surfaces[i]) {
+                CVReturn cr2 = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, _surfaces[i],
+                                                                (__bridge CFDictionaryRef)cvAttrs,
+                                                                &_pixelBuffers[i]);
+                if (cr2 != kCVReturnSuccess) {
+                    NSLog(@"[capture] CVPixelBufferCreateWithIOSurface 失败 slot=%d cr=%d", i, (int)cr2);
+                    return NO;
+                }
+            }
+        }
+        if (!_surfaces[i] || !_pixelBuffers[i]) {
+            NSLog(@"[capture] slot=%d 两条路都没建出 surface（cv=%d）", i, (int)cr);
             return NO;
         }
     }
