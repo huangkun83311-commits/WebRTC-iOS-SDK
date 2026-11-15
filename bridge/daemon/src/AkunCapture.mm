@@ -30,7 +30,7 @@ static const int kDefaultFPS = 12;
 /// 抓屏轮询间隔：8ms 一次「画面变了吗」。
 /// 以前是 1/fps（20fps=50ms）当节拍，最坏要等 50ms 才抓一次，这就是「点了之后慢半拍」的来源；
 /// 改成 8ms 轮询 + fps 闸门：变化一出现最迟 8ms 就被抓走，帧率仍被 fps 上限压住，不额外花 CPU。
-static const double kPollSec = 0.008;
+static const double kPollSec = 0.004;
 static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
 @implementation AkunCapture {
@@ -55,6 +55,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double _scaleMsSum;          // vImage 缩图耗时合计
     double _allocMsSum;          // 取池内目标缓冲的耗时合计（编码器占着池子时会卡这里）
     double _lastAllocMs;         // 本帧取缓冲耗时
+    NSTimeInterval _lastChangeMono; // 最近一次「画面确实变了」的时刻
     NSTimeInterval _lastPushMono; // 上次真正推帧的时刻（fps 闸门用）
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
@@ -336,12 +337,15 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     BOOL changed = YES;
     if (_dirtyFrameCount) {
         CFIndex c = _dirtyFrameCount(NULL);
-        if (c == _lastDirtyCount && (now - _lastPushTime) < 2.0) { return; }
         changed = (c != _lastDirtyCount);
+        if (changed) { _lastChangeMono = now; }
         _lastDirtyCount = c;
+        // 静止才停：最近 0.5s 动过就按 fps 满速推（视频/游戏期间宁可多耗一点也要顺），
+        // 完全静止则 2s 一帧保活。以前只要「这一 tick 恰好没变」就跳，视频也会被跳成 14fps。
+        if (!changed && (now - _lastChangeMono) > 0.5 && (now - _lastPushTime) < 2.0) { return; }
     }
     // fps 闸门：画面在变时，按 fps 上限限流；不足一帧间隔的这次轮询直接跳过，让下一次尽早补上
-    if (changed && (now - _lastPushMono) < (1.0 / (double)MAX(1, _activeFps)) - 0.001) { return; }
+    if (changed && (now - _lastPushMono) < (1.0 / (double)MAX(1, _activeFps)) - kPollSec) { return; }
 
     int slot = _cur;
     IOSurfaceRef surface = _surfaces[slot];

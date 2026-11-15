@@ -114,10 +114,10 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     // 抓屏吃力时会由 AkunCapture 的帧率自适应往下退，所以这里可以给到 25。
     double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
     int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 30;
-    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 1500000;
+    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 900000;
     if (scale <= 0.0) { scale = 0.35; }
     if (fps <= 0) { fps = 30; }
-    if (maxBitrate <= 0) { maxBitrate = 1500000; }
+    if (maxBitrate <= 0) { maxBitrate = 900000; }
 
     NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
           self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId,
