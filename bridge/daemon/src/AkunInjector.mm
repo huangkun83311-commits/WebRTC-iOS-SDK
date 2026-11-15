@@ -167,8 +167,8 @@ static double clamp01(double v) {
         static dispatch_queue_t hidQueue;
         static dispatch_once_t onceQueue;
         dispatch_once(&onceQueue, ^{
-            dispatch_attr_t attr = DISPATCH_QUEUE_SERIAL;
-            dispatch_queue_attr_make_with_qos_class(attr, QOS_CLASS_USER_INTERACTIVE, 0);
+            dispatch_queue_attr_t attr =
+                dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
             hidQueue = dispatch_queue_create("com.akun.bridge.hid", attr);
         });
         IOHIDEventRef strong = (IOHIDEventRef)CFRetain(hand);
