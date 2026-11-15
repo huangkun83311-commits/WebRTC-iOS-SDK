@@ -197,9 +197,40 @@ func logRelay(room, role string, payload []byte) {
 			extra = meta.Candidate
 		}
 	} else if len(meta.Sdp) > 0 {
-		extra = fmt.Sprintf("sdp=%d字节", len(meta.Sdp))
+		extra = fmt.Sprintf("sdp=%d字节 %s", len(meta.Sdp), codecSummary(meta.Sdp))
 	}
 	log.Printf("relay room=%s role=%s type=%s size=%d %s", room, role, meta.Type, len(payload), extra)
+}
+
+// codecSummary 从 SDP 里扒出协商出的视频编码：m=video 行上的第一个 payload type，
+// 再回查 rtpmap。排障时用来确认到底走的是 H264（硬编）还是 VP8（软编）。
+func codecSummary(sdp string) string {
+	rtpmap := map[string]string{}
+	var firstPT string
+	lines := strings.Split(sdp, "\n")
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "a=rtpmap:") {
+			body := strings.TrimPrefix(ln, "a=rtpmap:")
+			if sp := strings.Index(body, " "); sp > 0 {
+				rtpmap[body[:sp]] = body[sp+1:]
+			}
+		}
+	}
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "m=video") {
+			fields := strings.Fields(ln)
+			if len(fields) > 3 {
+				firstPT = fields[3]
+			}
+			break
+		}
+	}
+	if firstPT == "" {
+		return ""
+	}
+	return fmt.Sprintf("video-pt=%s %s", firstPT, rtpmap[firstPT])
 }
 
 func (h *hub) handleRooms(w http.ResponseWriter, r *http.Request) {

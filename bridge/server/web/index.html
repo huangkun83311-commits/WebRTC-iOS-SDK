@@ -20,6 +20,8 @@
   video { display: block; width: 100%; height: auto; }
   .stage.is-idle .screen { width: 360px; height: 640px; display: grid; place-items: center; }
   .stage.is-idle video { display: none; }
+  /* 画面到齐后把"未连接"这句话彻底拿掉，否则它会在视频下面多占一行，看着像画面没铺满 */
+  .stage:not(.is-idle) .hint { display: none; }
   .hint { color: #6e7681; font-size: 12px; }
   #peers { color: #8b949e; font-size: 12px; }
 </style>

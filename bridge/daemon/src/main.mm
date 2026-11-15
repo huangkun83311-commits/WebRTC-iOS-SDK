@@ -107,10 +107,10 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     // 编码必须靠帧率才有"视频流"的手感，24fps×434×772 的 H264 只占 ~1.5Mbps）、2.0Mbps 上限。
     double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
     int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 24;
-    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 2000000;
+    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 3000000;
     if (scale <= 0.0) { scale = 0.35; }
     if (fps <= 0) { fps = 24; }
-    if (maxBitrate <= 0) { maxBitrate = 2000000; }
+    if (maxBitrate <= 0) { maxBitrate = 3000000; }
 
     NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
           self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId,
