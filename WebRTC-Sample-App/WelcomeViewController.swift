@@ -39,7 +39,9 @@ class WelcomeViewController: UIViewController {
     var clientToken: String!
     var isConnected = false
     var tapGesture: UITapGestureRecognizer!
-    let sharedDefault = UserDefaults(suiteName: "group.io.antmedia.ios.webrtc.sample")!
+    // App Group 需与 ScreenShare 扩展的 entitlements 保持一致；
+    // 若容器不可用（自签/TrollStore 未授予 App Group），回落到 standard，避免启动崩溃。
+    let sharedDefault: UserDefaults = UserDefaults(suiteName: "group.io.antmedia.ios.webrtc-sample") ?? UserDefaults.standard
     
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
@@ -59,7 +61,7 @@ class WelcomeViewController: UIViewController {
         super.viewDidAppear(animated)
         self.setGesture()
         
-        self.screenRecord.preferredExtension = "io.antmedia.ios.WebRTC-Sample-App.ScreenShare";
+        self.screenRecord.preferredExtension = "io.antmedia.ios.webrtc-sample.screen.share";
         self.screenRecord.showsMicrophoneButton = false;
 
         self.roomField.text = "stream1"

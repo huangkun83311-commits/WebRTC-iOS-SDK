@@ -1,0 +1,19 @@
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: akun-coturn
+    restart: unless-stopped
+    network_mode: host          # 中继需要大量 UDP 端口，host 模式最省事
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+
+  bridge:
+    build:
+      context: ../server
+    container_name: akun-bridge
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - TZ=Asia/Shanghai

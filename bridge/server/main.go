@@ -1,0 +1,220 @@
+// AKUN Device Bridge - 信令与指令中继服务器
+//
+// 职责只有两件事：
+//  1. WebRTC 信令中继（SDP offer/answer、ICE candidate），本身不碰媒体流，纯 P2P；
+//  2. 控制指令中继（手机端守护进程 <-> 浏览器），走 WebSocket 而不是 DataChannel，
+//     因为控制流量只有几百字节/秒，WS 足够且能让手机端不必再维持第二条 PeerConnection。
+//
+// 房间规则：/ws?room=<name>&role=<role>，同房间内的其它连接会收到你发的每一条消息。
+// 约定使用两个房间：video-<deviceID>（信令）和 ctrl-<deviceID>（指令）。
+package main
+
+import (
+	"embed"
+	"encoding/json"
+	"flag"
+	"io/fs"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+//go:embed web
+var webFS embed.FS
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	// 手机端与浏览器都可能来自任意来源，这里放开；生产环境请按域名收紧。
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+type client struct {
+	conn *websocket.Conn
+	room string
+	role string
+	mu   sync.Mutex
+}
+
+func (c *client) send(payload []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return c.conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+type hub struct {
+	mu    sync.RWMutex
+	rooms map[string]map[*client]struct{}
+}
+
+func newHub() *hub { return &hub{rooms: make(map[string]map[*client]struct{})} }
+
+func (h *hub) join(c *client) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	set, ok := h.rooms[c.room]
+	if !ok {
+		set = make(map[*client]struct{})
+		h.rooms[c.room] = set
+	}
+	set[c] = struct{}{}
+	return len(set)
+}
+
+func (h *hub) leave(c *client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if set, ok := h.rooms[c.room]; ok {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(h.rooms, c.room)
+		}
+	}
+}
+
+func (h *hub) peers(c *client) []*client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]*client, 0, 4)
+	for other := range h.rooms[c.room] {
+		if other != c {
+			out = append(out, other)
+		}
+	}
+	return out
+}
+
+func (h *hub) broadcast(c *client, payload []byte) {
+	for _, p := range h.peers(c) {
+		if err := p.send(payload); err != nil {
+			log.Printf("send to %s/%s failed: %v", p.room, p.role, err)
+		}
+	}
+}
+
+// notify 给房间里其它人发一条系统消息，用于双方感知对端上下线。
+func (h *hub) notify(c *client, typ string) {
+	payload, _ := json.Marshal(map[string]string{"type": typ, "role": c.role})
+	h.broadcast(c, payload)
+}
+
+func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
+	room := r.URL.Query().Get("room")
+	role := r.URL.Query().Get("role")
+	if room == "" {
+		http.Error(w, "room is required", http.StatusBadRequest)
+		return
+	}
+	if role == "" {
+		role = "anonymous"
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("upgrade failed: %v", err)
+		return
+	}
+
+	c := &client{conn: conn, room: room, role: role}
+	n := h.join(c)
+	log.Printf("join room=%s role=%s peers=%d", room, role, n)
+	h.notify(c, "_peerJoined")
+
+	defer func() {
+		h.leave(c)
+		h.notify(c, "_peerLeft")
+		_ = conn.Close()
+		log.Printf("leave room=%s role=%s", room, role)
+	}()
+
+	// 心跳：手机端在后台容易被 NAT / 运营商掐连接，靠 ping 保活。
+	conn.SetReadLimit(1 << 20)
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	})
+
+	pingDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.mu.Lock()
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				err := conn.WriteMessage(websocket.PingMessage, nil)
+				c.mu.Unlock()
+				if err != nil {
+					return
+				}
+			case <-pingDone:
+				return
+			}
+		}
+	}()
+	defer close(pingDone)
+
+	for {
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				log.Printf("read error room=%s role=%s: %v", room, role, err)
+			}
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		h.broadcast(c, payload)
+	}
+}
+
+func (h *hub) handleRooms(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make(map[string]int, len(h.rooms))
+	for name, set := range h.rooms {
+		out[name] = len(set)
+	}
+	writeJSON(w, out)
+}
+
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func main() {
+	addr := flag.String("addr", ":8080", "监听地址，例如 :8080")
+	flag.Parse()
+
+	h := newHub()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", h.handleWS)
+	mux.HandleFunc("/api/rooms", h.handleRooms)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]string{"status": "ok"})
+	})
+
+	static, err := fs.Sub(webFS, "web")
+	if err != nil {
+		log.Fatalf("embed web: %v", err)
+	}
+	mux.Handle("/", http.FileServer(http.FS(static)))
+
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	log.Printf("AKUN Device Bridge signaling listening on %s", *addr)
+	log.Printf("控制台: http://<服务器IP>%s/", *addr)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
+}
