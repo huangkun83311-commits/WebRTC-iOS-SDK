@@ -28,6 +28,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var turnURL: String? { SampleHandler.configCache["turnURL"] }
     private var turnUser: String? { SampleHandler.configCache["turnUser"] }
     private var turnPassword: String? { SampleHandler.configCache["turnPass"] }
+    private var stunURL: String? { SampleHandler.configCache["stunURL"] }
 
     // MARK: - WebRTC
 
@@ -65,6 +66,7 @@ class SampleHandler: RPBroadcastSampleHandler {
             if out["turnURL"] == nil, let v = info["WebRTCTurnURL"] as? String { out["turnURL"] = v }
             if out["turnUser"] == nil, let v = info["WebRTCTurnUser"] as? String { out["turnUser"] = v }
             if out["turnPass"] == nil, let v = info["WebRTCTurnPassword"] as? String { out["turnPass"] = v }
+            if out["stunURL"] == nil, let v = info["WebRTCStunURL"] as? String { out["stunURL"] = v }
         }
 
         return out.compactMapValues { $0.isEmpty ? nil : $0 }
@@ -105,7 +107,12 @@ class SampleHandler: RPBroadcastSampleHandler {
         videoCapturer = RTCVideoCapturer(delegate: videoSource)
         videoTrack = factory.videoTrack(with: videoSource, trackId: "screen0")
 
-        var iceServers: [RTCIceServer] = [RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"])]
+        // 局域网场景：同一网段直接用 host candidate 打洞，不需要 STUN/TURN。
+        // 只有显式配置了才启用，避免离线环境下等 STUN 超时。
+        var iceServers: [RTCIceServer] = []
+        if let stun = stunURL, !stun.isEmpty {
+            iceServers.append(RTCIceServer(urlStrings: [stun]))
+        }
         if let turnURL = turnURL, !turnURL.isEmpty {
             iceServers.append(RTCIceServer(urlStrings: [turnURL], username: turnUser, credential: turnPassword))
         }
