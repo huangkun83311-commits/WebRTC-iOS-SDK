@@ -21,12 +21,16 @@
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 
+// 真实签名（15 参）：alloc, time, type, index, identityMask, eventMask,
+//                     buttonMask, x, y, z, tipPressure, twist, range, touch, options
 typedef IOHIDEventRef (*CreateDigitizerEventFn)(CFAllocatorRef, uint64_t, int, uint32_t, uint32_t,
-                                                uint32_t, uint32_t, double, double, double, double,
-                                                double, double, double, double, Boolean, Boolean);
+                                                uint32_t, uint32_t, double, double, double,
+                                                double, double, Boolean, Boolean, uint32_t);
+// 真实签名（13 参）：alloc, time, index, identity, eventMask, x, y, z,
+//                     tipPressure, twist, range, touch, options
 typedef IOHIDEventRef (*CreateFingerEventFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t,
                                              uint32_t, double, double, double, double, double,
-                                             Boolean, Boolean);
+                                             Boolean, Boolean, uint32_t);
 typedef void (*AppendEventFn)(IOHIDEventRef, IOHIDEventRef, uint32_t);
 typedef void (*SetIntegerValueFn)(IOHIDEventRef, int32_t, int64_t);
 typedef void (*SetFloatValueFn)(IOHIDEventRef, int32_t, double);
@@ -144,12 +148,15 @@ static double clamp01(double v) {
 
     IOHIDEventRef hand = _createHand(kCFAllocatorDefault, ts, HID_TYPE_HAND,
                                      0, 0, mask, 0,
-                                     0, 0, 0, 0, 0, 0, 0, 0,   // 坐标只放在 finger 子事件里（同 AKUN）
-                                     0, touching);
+                                     0, 0, 0,          // x, y, z —— 坐标只放 finger 子事件（同 AKUN）
+                                     0, 0,             // tipPressure, twist
+                                     0, touching,      // range, touch
+                                     0);               // options
     IOHIDEventRef finger = _createFinger(kCFAllocatorDefault, ts,
                                          HID_FINGER_ID, HID_FINGER_ID, mask,
                                          x, y, 0, 0, 90.0,
-                                         touching, touching);   // range / touch 同 AKUN：按住在 in-range
+                                         touching, touching,   // range / touch：按住在 in-range
+                                         0);                   // options
 
     if (hand && finger) {
         // 这两项让系统认为事件来自内置触摸屏（AKUN 一样是必设的）
