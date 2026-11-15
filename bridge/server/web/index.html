@@ -37,6 +37,7 @@
     <span><span id="videoDot" class="dot"></span>画面</span>
     <span><span id="ctrlDot" class="dot"></span>控制</span>
     <span id="fps">--</span>
+    <span id="stat"></span>
   </span>
 </div>
 
@@ -287,6 +288,26 @@
   }
   if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVF);
   else setInterval(() => { $('fps').textContent = '--'; }, 2000);
+
+  /* ---------------- 链路指标（分辨率/码率/丢包），排障时一眼看出是带宽被限还是编码在缩 ---------------- */
+  let lastBytes = 0, lastStatTs = 0;
+  setInterval(async () => {
+    if (!pc || !pc.getStats) return;
+    try {
+      const stats = await pc.getStats();
+      let line = '';
+      stats.forEach(r => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video') {
+          const now = r.timestamp || performance.now();
+          const dt = lastStatTs ? (now - lastStatTs) / 1000 : 0;
+          const kbps = dt > 0 ? ((r.bytesReceived - lastBytes) * 8 / 1000 / dt) : 0;
+          lastBytes = r.bytesReceived; lastStatTs = now;
+          line = `${r.frameWidth || 0}x${r.frameHeight || 0} ${Math.round(kbps)}kbps 丢${r.packetsLost || 0}`;
+        }
+      });
+      if (line) $('stat').textContent = line;
+    } catch (e) {}
+  }, 2000);
 
   /* ---------------- 按钮 ---------------- */
   $('connect').onclick = () => {

@@ -90,7 +90,7 @@
             enc.minBitrateBps = @(minRate);
             enc.bitratePriority = 1.0;
             enc.networkPriority = RTCPriorityHigh;
-            params.degradationPreference = @(RTCDegradationPreferenceMaintainFramerate);
+            params.degradationPreference = @(RTCDegradationPreferenceMaintainResolution);
             self.sender.parameters = params;
             NSLog(@"[rtc] 编码参数 maxFramerate=%d maxBitrate=%ld", self.targetFps,
                   (long)self.maxBitrateBps);
@@ -305,7 +305,8 @@
 
     self.pushedFrames++;
     if (self.pushedFrames % 150 == 0) {
-        NSLog(@"[rtc] 已推 %lu 帧", (unsigned long)self.pushedFrames);
+        NSLog(@"[rtc] 已推 %lu 帧（源 %zux%zu）", (unsigned long)self.pushedFrames,
+              CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer));
     }
 }
 
