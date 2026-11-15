@@ -32,6 +32,10 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 @property (nonatomic, assign) BOOL discovering;
 @property (nonatomic, assign) NSInteger reconnectAttempt;
 @property (nonatomic, assign) uint64_t frameCount;
+// 当前生效的画质参数（AkunRTC 的 scale/targetFps/maxBitrateBps 没公开，这里自己存一份给 cfg 指令做基线）
+@property (nonatomic, assign) double cfgScale;
+@property (nonatomic, assign) int cfgFps;
+@property (nonatomic, assign) NSInteger cfgBitrate;
 @end
 
 @implementation AkunDaemon
@@ -115,6 +119,8 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
           self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId,
           scale, fps, (long)maxBitrate);
+
+    self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = maxBitrate;
 
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
@@ -203,14 +209,15 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
                 NSString *type = cmd[@"t"];
                 if ([type isEqualToString:@"cfg"]) {
                     // 中控/网页在线改画质，不用重装包
-                    double scale = self.rtc.scale;
-                    int fps = self.rtc.targetFps;
-                    NSInteger br = self.rtc.maxBitrateBps;
+                    double scale = self.cfgScale;
+                    int fps = self.cfgFps;
+                    NSInteger br = self.cfgBitrate;
                     if (cmd[@"scale"]) { scale = [cmd[@"scale"] doubleValue]; }
                     if (cmd[@"fps"]) { fps = [cmd[@"fps"] intValue]; }
                     if (cmd[@"bitrate"]) { br = [cmd[@"bitrate"] integerValue]; }
                     NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld", scale, fps, (long)br);
                     [self.rtc configureWithScale:scale fps:fps maxBitrateBps:br];
+                    self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br;
                     [self.capture setFps:fps];
                 } else {
                     NSLog(@"[ctrl] 收到 %@", message.string ?: @"<bin>");
