@@ -10,6 +10,8 @@
 //  先 UDP 19951 广播、失败再扫 /24 网段的 8080，和 AKUN 那套的发现习惯一致。
 
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
+#import <unistd.h>
 #import "AkunCapture.h"
 #import "AkunInjector.h"
 #import "AkunRTC.h"
@@ -252,9 +254,29 @@ didCloseWithCode:(NSURLSessionWebSocketCloseCode)code reason:(NSData *)reason {
 
 @end
 
+#pragma mark - jetsam 上限（launchd 起默认只有 6MB，抓屏建 surface 立刻被系统杀）
+
+#define kMemStatSetHighWaterMark 5   // 非致命上限
+#define kMemStatSetTaskLimit     6   // 致命上限
+
+static void AkunRaiseJetsamLimit(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "memorystatus_control");
+    NSLog(@"[jetsam] memorystatus_control=%p", sym);
+    if (!sym) {
+        return;
+    }
+    typedef int (*MemStatFn)(uint32_t, int32_t, uint32_t, void *, size_t);
+    MemStatFn fn = (MemStatFn)sym;
+    int32_t pid = (int32_t)getpid();
+    int rcHigh = fn(kMemStatSetHighWaterMark, pid, 0, NULL, 400);
+    int rcTask = fn(kMemStatSetTaskLimit, pid, 0, NULL, 400);
+    NSLog(@"[jetsam] 抬到 400MB: highWaterMark rc=%d taskLimit rc=%d", rcHigh, rcTask);
+}
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         NSLog(@"[daemon] 启动 argc=%d", argc);
+        AkunRaiseJetsamLimit();
         AkunDaemon *daemon = [[AkunDaemon alloc] init];
         [daemon start];
         [[NSRunLoop currentRunLoop] run];
