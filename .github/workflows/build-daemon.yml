@@ -8,6 +8,9 @@ on:
       - ".github/workflows/build-daemon.yml"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -45,6 +48,27 @@ jobs:
           set -o pipefail
           bash bridge/daemon/build-tipa.sh 2>&1 | tee /tmp/tipa.log
 
+      - name: Collect packages and write summary
+        id: collect
+        run: |
+          set -e
+          mkdir -p out
+          shopt -s nullglob
+          for f in bridge/daemon/packages/*.deb bridge/daemon/packages/*.tipa; do
+            cp "$f" out/
+          done
+          ls -l out
+          {
+            echo "## 本次产物"
+            echo ""
+            echo "| 文件 | 大小 | sha256 |"
+            echo "|---|---|---|"
+            for f in out/*; do
+              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) | \`$(shasum -a 256 "$f" | cut -d' ' -f1)\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "count=$(ls out | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
       - name: Surface compiler errors as annotations
         if: failure()
         run: |
@@ -59,12 +83,32 @@ jobs:
             done
           done
 
-      - name: Upload packages
+      - name: Upload deb
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: akun-bridge-packages
-          path: |
-            bridge/daemon/packages/*.deb
-            bridge/daemon/packages/*.tipa
-          if-no-files-found: warn
+          name: akun-bridge-deb
+          path: out/*.deb
+          if-no-files-found: error
+
+      - name: Upload tipa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: akun-bridge-tipa
+          path: out/*.tipa
+          if-no-files-found: error
+
+      - name: Publish to release (public download)
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: daemon-latest
+          name: "AKUN WebRTC Bridge (latest build)"
+          body: |
+            由 GitHub Actions 自动构建（${{ github.sha }}）。
+            - `*.deb`：Dopamine / rootless 直接安装
+            - `*.tipa`：TrollStore 安装
+          files: out/*
+          prerelease: true
+          draft: false
