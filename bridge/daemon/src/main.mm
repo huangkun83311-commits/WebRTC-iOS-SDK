@@ -276,6 +276,27 @@ static void AkunRaiseJetsamLimit(void) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        // 调试入口：`akund --tap 0.5 0.5` / `akund --key 233`，直接调注入器并退出。
+        // 这样在 SSH 里跑能看到崩溃信息（守护态下崩溃只能看到进程消失）。
+        if (argc >= 2 && strcmp(argv[1], "--tap") == 0) {
+            AkunInjector *inj = [[AkunInjector alloc] init];
+            double x = (argc > 3) ? atof(argv[2]) : 0.5;
+            double y = (argc > 3) ? atof(argv[3]) : 0.5;
+            NSLog(@"[cli] tap %f %f", x, y);
+            [inj handleCommand:@{@"t" : @"tap", @"x" : @(x), @"y" : @(y)}];
+            sleep(2);
+            NSLog(@"[cli] tap 返回（没崩溃）");
+            return 0;
+        }
+        if (argc >= 2 && strcmp(argv[1], "--key") == 0) {
+            AkunInjector *inj = [[AkunInjector alloc] init];
+            unsigned int usage = (argc > 2) ? (unsigned int)strtoul(argv[2], NULL, 0) : 0xE9;
+            NSLog(@"[cli] key 0x%x", usage);
+            [inj handleCommand:@{@"t" : @"hk", @"usage" : @(usage)}];
+            sleep(2);
+            NSLog(@"[cli] key 返回（没崩溃）");
+            return 0;
+        }
         NSLog(@"[daemon] 启动 argc=%d", argc);
         AkunRaiseJetsamLimit();
         AkunDaemon *daemon = [[AkunDaemon alloc] init];

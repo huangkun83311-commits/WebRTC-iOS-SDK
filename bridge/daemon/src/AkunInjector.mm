@@ -67,10 +67,14 @@ static double clamp01(double v) {
 
     double x = clamp01([cmd[@"x"] doubleValue]);
     double y = clamp01([cmd[@"y"] doubleValue]);
+
     STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
 
     if ([t isEqualToString:@"tap"]) {
-        [gen tap:[self pointFromNormX:x y:y]];
+        CGPoint p = [self pointFromNormX:x y:y];
+        NSLog(@"[inject] tap 像素 (%f,%f)", p.x, p.y);
+        [gen tap:p];
+        NSLog(@"[inject] tap 调用返回");
     } else if ([t isEqualToString:@"d"]) {
         _dragging = YES;
         _startX = x; _startY = y; _lastX = x; _lastY = y;
