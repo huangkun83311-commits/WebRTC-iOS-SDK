@@ -128,8 +128,11 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     private var signalingURL: URL? {
         var base = signalBase
-        if base.hasPrefix("http://") { base = "ws://" + base.dropFirst("http://".count) }
-        if base.hasPrefix("https://") { base = "wss://" + base.dropFirst("https://".count) }
+        if base.hasPrefix("http://") {
+            base = "ws://" + String(base.dropFirst("http://".count))
+        } else if base.hasPrefix("https://") {
+            base = "wss://" + String(base.dropFirst("https://".count))
+        }
         while base.hasSuffix("/") { base.removeLast() }
         return URL(string: "\(base)/ws?room=video-\(deviceId)&role=publisher")
     }
@@ -168,7 +171,7 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     private func schedulePing(on task: URLSessionWebSocketTask) {
         DispatchQueue.global().asyncAfter(deadline: .now() + 20) { [weak self, weak task] in
-            guard let self = self, let task = task, self.ws === task else { return }
+            guard let self = self, let task = task, let current = self.ws, current === task else { return }
             task.sendPing { error in
                 if let error = error {
                     os_log("ws ping failed: \(error.localizedDescription, privacy: .public)", log: self.logger, type: .error)
