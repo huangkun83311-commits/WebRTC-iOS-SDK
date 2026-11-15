@@ -161,7 +161,24 @@ static double clamp01(double v) {
         }
         _appendEvent(hand, finger, 0);
         if (_setSenderID) { _setSenderID(hand, kSenderID); }
-        _dispatch(_client, hand);
+
+        // 完全照 AKUN 的发法：串行队列 + CFRetain 后异步 dispatch，发完才 release。
+        // 同步 dispatch 紧接着 CFRelease，事件常常还没走完 XPC 就被回收 → 表现就是“点了没反应”。
+        static dispatch_queue_t hidQueue;
+        static dispatch_once_t onceQueue;
+        dispatch_once(&onceQueue, ^{
+            dispatch_attr_t attr = DISPATCH_QUEUE_SERIAL;
+            dispatch_queue_attr_make_with_qos_class(attr, QOS_CLASS_USER_INTERACTIVE, 0);
+            hidQueue = dispatch_queue_create("com.akun.bridge.hid", attr);
+        });
+        IOHIDEventRef strong = (IOHIDEventRef)CFRetain(hand);
+        IOHIDEventSystemClientRef client = _client;
+        DispatchEventFn send = _dispatch;
+        dispatch_async(hidQueue, ^{
+            send(client, strong);
+            CFRelease(strong);
+            NSLog(@"[inject] 已发 phase=%u mask=0x%x (%.3f, %.3f)", phase, mask, x, y);
+        });
     }
     if (finger) { CFRelease(finger); }
     if (hand) { CFRelease(hand); }
