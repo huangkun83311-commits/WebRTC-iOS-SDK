@@ -5,6 +5,7 @@ on:
     branches: [master, main]
     paths:
       - "bridge/daemon/**"
+      - "bridge/server/**"
       - ".github/workflows/build-daemon.yml"
   workflow_dispatch:
 
@@ -48,13 +49,23 @@ jobs:
           set -o pipefail
           bash bridge/daemon/build-tipa.sh 2>&1 | tee /tmp/tipa.log
 
+      - name: Build signaling server (Go, 多平台)
+        run: |
+          set -o pipefail
+          cd bridge/server
+          export GOFLAGS=-mod=mod
+          go mod tidy
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o ../daemon/packages/bridge-server-windows-amd64.exe .
+          GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o ../daemon/packages/bridge-server-linux-amd64 . 2>&1 | tee /tmp/server.log
+          ls -l ../daemon/packages/
+
       - name: Collect packages and write summary
         id: collect
         run: |
           set -e
           mkdir -p out
           shopt -s nullglob
-          for f in bridge/daemon/packages/*.deb bridge/daemon/packages/*.tipa; do
+          for f in bridge/daemon/packages/*.deb bridge/daemon/packages/*.tipa bridge/daemon/packages/bridge-server-*; do
             cp "$f" out/
           done
           ls -l out
@@ -121,6 +132,7 @@ jobs:
             由 GitHub Actions 自动构建（${{ github.sha }}）。
             - `*.deb`：Dopamine / rootless 直接安装
             - `*.tipa`：TrollStore 安装
+            - `bridge-server-windows-amd64.exe` / `bridge-server-linux-amd64`：信令+SFU 中继服务端（手机只推一路，多人观看不卡）
           files: out/*
           prerelease: true
           draft: false
