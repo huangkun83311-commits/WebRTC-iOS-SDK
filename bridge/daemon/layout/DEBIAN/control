@@ -1,0 +1,9 @@
+Package: com.akun.bridge
+Name: AKUN WebRTC Bridge
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 手机侧常驻守护进程：抓屏 + WebRTC 推流 + HID 注入（Dopamine 隐根 rootless）
+Maintainer: akun
+Author: akun
+Section: Tweaks
+Depends: firmware (>= 15.0)

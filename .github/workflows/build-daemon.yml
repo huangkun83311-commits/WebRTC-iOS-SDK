@@ -1,0 +1,66 @@
+name: Build daemon packages (deb + tipa)
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "bridge/daemon/**"
+      - ".github/workflows/build-daemon.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          set -e
+          brew install ldid dpkg xz || brew install ldid dpkg
+          echo "ldid: $(command -v ldid)"
+
+      - name: Install Theos + SDK
+        run: |
+          set -e
+          export THEOS=$HOME/theos
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks /tmp/theos-sdks
+          cd /tmp/theos-sdks && git sparse-checkout set iPhoneOS16.5.sdk
+          cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          mkdir -p "$THEOS/bin"
+          cp "$(command -v ldid)" "$THEOS/bin/ldid" && chmod +x "$THEOS/bin/ldid"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          ls "$THEOS/sdks"
+
+      - name: Build deb
+        run: |
+          set -o pipefail
+          bash bridge/daemon/build-deb.sh 2>&1 | tee /tmp/deb.log
+
+      - name: Build tipa
+        run: |
+          set -o pipefail
+          bash bridge/daemon/build-tipa.sh 2>&1 | tee /tmp/tipa.log
+
+      - name: Surface compiler errors as annotations
+        if: failure()
+        run: |
+          for f in /tmp/deb.log /tmp/tipa.log; do
+            [ -f "$f" ] || continue
+            grep -E "(^|: )(error|fatal error): " "$f" | head -30 | while IFS= read -r line; do
+              echo "::error ::$line"
+            done
+          done
+
+      - name: Upload packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: akun-bridge-packages
+          path: |
+            bridge/daemon/packages/*.deb
+            bridge/daemon/packages/*.tipa
+          if-no-files-found: warn
