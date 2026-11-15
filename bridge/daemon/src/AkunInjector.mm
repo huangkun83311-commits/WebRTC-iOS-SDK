@@ -21,6 +21,13 @@ BOOL tvncLoggingEnabled = NO;
 BOOL tvncVerboseLoggingEnabled = NO;
 int gOrientationFixQuad = 0;
 
+// 这几个入口在 .h 里没有，但 AKUN 的 vnc 服务就是直接这么调的（见 trollvncserver.mm ptrAddEvent）
+@interface STHIDEventGenerator (AkunPrivateTouch)
+- (void)touchDownAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
+- (void)liftUpAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
+- (void)_updateTouchPoints:(CGPoint *)points count:(NSUInteger)count;
+@end
+
 @implementation AkunInjector {
     double _startX;   // 0~1
     double _startY;
@@ -73,31 +80,34 @@ static double clamp01(double v) {
     if ([t isEqualToString:@"tap"]) {
         CGPoint p = [self pointFromNormX:x y:y];
         NSLog(@"[inject] tap 像素 (%f,%f)", p.x, p.y);
-        // 不能用 gen 的 tap: —— 它内部 _sendTaps 里断言 delay > 0，而 tap: 传的是 0，
-        // 带断言编译（我们这份）会直接 abort；改按下/抬起两段，节奏与 AKUN 一致
-        // （fingerLiftDelay = 50ms），且每段各自带 marker 事件。
-        [gen touchDown:p];
-        // 按住时长可调（默认 120ms）：几十毫秒的"闪电点"SpringBoard 未必认，真实手指点按约 100~150ms
+        // 不用 gen 的 tap: —— 它内部 _sendTaps 断言 delay>0 而自身传 0，带断言编译会 abort。
+        // 走 touchDown/touchUp 两段，等价 AKUN 的 tap 行为。
+        [gen touchDownAtPoints:&p touchCount:1];
         NSUInteger ms = cmd[@"ms"] ? [cmd[@"ms"] unsignedIntValue] : 120;
         if (ms < 30) { ms = 30; }
         if (ms > 800) { ms = 800; }
-        NSLog(@"[inject] 按住 %lu ms", (unsigned long)ms);
         usleep((useconds_t)(ms * 1000));
-        [gen liftUp:p];
-        NSLog(@"[inject] tap 调用返回");
+        [gen liftUpAtPoints:&p touchCount:1];
+        NSLog(@"[inject] tap 完成（按住 %lu ms）", (unsigned long)ms);
     } else if ([t isEqualToString:@"d"]) {
+        // 与 AKUN ptrAddEvent 一致：按下发 touchDown，移动发 _updateTouchPoints，抬起发 liftUp
         _dragging = YES;
         _startX = x; _startY = y; _lastX = x; _lastY = y;
+        CGPoint p = [self pointFromNormX:x y:y];
+        NSLog(@"[inject] down (%f,%f)", p.x, p.y);
+        [gen touchDownAtPoints:&p touchCount:1];
     } else if ([t isEqualToString:@"m"]) {
-        if (_dragging) { _lastX = x; _lastY = y; }
+        if (_dragging) {
+            _lastX = x; _lastY = y;
+            CGPoint p = [self pointFromNormX:x y:y];
+            [gen _updateTouchPoints:&p count:1];
+        }
     } else if ([t isEqualToString:@"u"]) {
         if (_dragging) {
             _dragging = NO;
-            CGPoint a = [self pointFromNormX:_startX y:_startY];
             CGPoint b = [self pointFromNormX:(x > 0 ? x : _lastX) y:(y > 0 ? y : _lastY)];
-            if (fabs(b.x - a.x) + fabs(b.y - a.y) > 2) {
-                [gen dragLinearWithStartPoint:a endPoint:b duration:0.25];
-            }
+            NSLog(@"[inject] up (%f,%f)", b.x, b.y);
+            [gen liftUpAtPoints:&b touchCount:1];
         }
     } else if ([t isEqualToString:@"swipe"]) {
         CGPoint a = [self pointFromNormX:x y:y];
