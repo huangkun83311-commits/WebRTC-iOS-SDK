@@ -47,6 +47,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     NSUInteger _perfFrames;      // 本窗口内的帧数
     double _renderMsSum;         // 渲染（GPU 抓屏）耗时合计
     double _scaleMsSum;          // vImage 缩图耗时合计
+    double _allocMsSum;          // 取池内目标缓冲的耗时合计（编码器占着池子时会卡这里）
+    double _lastAllocMs;         // 本帧取缓冲耗时
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
     // vImage 缩放要一块临时缓冲：以前每帧传 NULL 让它内部现申请，
@@ -224,7 +226,10 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     if (!_pool) { CVPixelBufferRetain(src); return src; }
 
     CVPixelBufferRef dst = NULL;
-    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst) != kCVReturnSuccess || !dst) {
+    NSTimeInterval ta = CACurrentMediaTime();
+    CVReturn crPool = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &dst);
+    _lastAllocMs = (CACurrentMediaTime() - ta) * 1000.0;
+    if (crPool != kCVReturnSuccess || !dst) {
         CVPixelBufferRetain(src);
         return src;
     }
@@ -248,7 +253,10 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         vImage_Error need = vImageScale_ARGB8888(&sb, &db, NULL, kvImageGetTempBufferSize);
         if (need > 0) {
             void *t = malloc((size_t)need);
-            if (t) { _vTemp = t; _vTempSize = (size_t)need; }
+            if (t) {
+                _vTemp = t; _vTempSize = (size_t)need;
+                NSLog(@"[capture] vImage 临时缓冲 %.2f MB（每帧复用，不再现申请）", need / 1048576.0);
+            }
         }
     }
     vImage_Error err = vImageScale_ARGB8888(&sb, &db, _vTemp, kvImageNoFlags);
@@ -302,6 +310,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     NSTimeInterval t3 = CACurrentMediaTime();
 
     _perfFrames++;
+    _allocMsSum += _lastAllocMs;
     _renderMsSum += (t1 - t0) * 1000.0;
     _scaleMsSum  += (t2 - t1) * 1000.0;
     _pushMsSum   += (t3 - t2) * 1000.0;
@@ -323,10 +332,11 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double realFps = n / span;
     double budgetMs = 1000.0 / (double)_activeFps;
 
-    NSLog(@"[perf] 实际 %.1ffps 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms",
-          realFps, renderMs, scaleMs, pushMs, costMs, budgetMs);
+    double allocMs = _allocMsSum / n;
+    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms",
+          realFps, allocMs, renderMs, scaleMs, pushMs, costMs, budgetMs);
 
-    _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0;
+    _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0;
     _perfWindowStart = now;
 
     if (costMs > budgetMs * 0.7) {
