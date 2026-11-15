@@ -57,6 +57,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double _lastAllocMs;         // 本帧取缓冲耗时
     NSTimeInterval _lastChangeMono; // 最近一次「画面确实变了」的时刻
     NSTimeInterval _lastPushMono; // 上次真正推帧的时刻（fps 闸门用）
+    double _prepMsAvg;            // 准备一帧（渲染+缩图+推帧）的滑窗平均耗时，闸门提前量用
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
     // GPU 缩图（Core Image + Metal）：拿不到 Metal 就退回 vImage
@@ -347,7 +348,11 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         if (now - _lastPushTime < 2.0) { return; }
     } else {
         double minGap = 1.0 / (double)MAX(1, _activeFps);
-        if (now - _lastPushMono < minGap - kPollSec) { return; }
+        // 关键：抓一帧本身要花 prep 毫秒，如果只在到点后才开始渲染，实际出帧周期会变成
+        // minGap + prep，帧率就被白吃掉一截（30fps 预算实测只剩 25.7fps）。
+        // 所以提前 prep 秒开工，让"推送完成"这一刻正好落在 minGap 边界上。
+        double prep = MIN(_prepMsAvg / 1000.0, minGap);
+        if (now - _lastPushMono < minGap - prep - kPollSec * 0.5) { return; }
     }
 
     int slot = _cur;
@@ -370,6 +375,9 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     if (out && self.frameHandler) { self.frameHandler(out); }
     if (out) { CVPixelBufferRelease(out); }
     NSTimeInterval t3 = CACurrentMediaTime();
+
+    double prepMs = (t3 - t0) * 1000.0;
+    _prepMsAvg = (_prepMsAvg <= 0.0) ? prepMs : (_prepMsAvg * 0.8 + prepMs * 0.2);
 
     _perfFrames++;
     _allocMsSum += _lastAllocMs;
