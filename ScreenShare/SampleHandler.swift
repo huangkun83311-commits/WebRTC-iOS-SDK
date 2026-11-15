@@ -16,7 +16,6 @@
 import ReplayKit
 import WebRTC
 import UIKit
-import os.log
 
 class SampleHandler: RPBroadcastSampleHandler {
 
@@ -44,8 +43,6 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     private var ws: URLSessionWebSocketTask?
     private var reconnectAttempt = 0
-
-    private let logger = OSLog(subsystem: "com.akun.bridge.screenshare", category: "screen")
 
     // MARK: - 配置读取
 
@@ -153,7 +150,7 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self = self else { return }
             switch result {
             case .failure(let error):
-                os_log("ws receive error: \(error.localizedDescription, privacy: .public)", log: self.logger, type: .error)
+                NSLog("ws receive error: \(error.localizedDescription)")
                 self.scheduleReconnect()
             case .success(let message):
                 switch message {
@@ -174,7 +171,7 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self = self, let task = task, let current = self.ws, current === task else { return }
             task.sendPing { error in
                 if let error = error {
-                    os_log("ws ping failed: \(error.localizedDescription, privacy: .public)", log: self.logger, type: .error)
+                    NSLog("ws ping failed: \(error.localizedDescription)")
                     self.scheduleReconnect()
                 } else {
                     self.reconnectAttempt = 0
@@ -198,7 +195,7 @@ class SampleHandler: RPBroadcastSampleHandler {
               let text = String(data: data, encoding: .utf8) else { return }
         ws?.send(.string(text)) { error in
             if let error = error {
-                os_log("ws send failed: \(error.localizedDescription, privacy: .public)", log: .default, type: .error)
+                NSLog("ws send failed: \(error.localizedDescription)")
             }
         }
     }
@@ -241,7 +238,7 @@ class SampleHandler: RPBroadcastSampleHandler {
             }
 
         case "_peerJoined":
-            os_log("viewer joined", log: logger, type: .info)
+            NSLog("viewer joined")
 
         default:
             break
@@ -291,7 +288,7 @@ extension SampleHandler: RTCPeerConnectionDelegate {
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
-        os_log("ice state: \(newState.rawValue, privacy: .public)", log: logger, type: .info)
+        NSLog("ice state: \(newState.rawValue)")
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
