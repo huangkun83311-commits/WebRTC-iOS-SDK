@@ -49,6 +49,10 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double _scaleMsSum;          // vImage 缩图耗时合计
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
+    // vImage 缩放要一块临时缓冲：以前每帧传 NULL 让它内部现申请，
+    // 2.7MP 源图下这笔开销就是 17ms/帧。这里按需申请一次，之后每帧复用。
+    void *_vTemp;
+    size_t _vTempSize;
     int _lowStreak;              // 连续「机器吃力」窗口数
     int _highStreak;             // 连续「机器轻松」窗口数
 }
@@ -213,6 +217,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
                                 (__bridge CFDictionaryRef)attrs, &_pool);
         _poolW = w; _poolH = h;
+        // 目标尺寸变了，vImage 临时缓冲的用量也会变：让 scaleFrame 重新算一次
+        if (_vTemp) { free(_vTemp); _vTemp = NULL; _vTempSize = 0; }
         NSLog(@"[capture] 缩图缓冲池 %zux%zu", w, h);
     }
     if (!_pool) { CVPixelBufferRetain(src); return src; }
@@ -237,7 +243,15 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         .width = CVPixelBufferGetWidth(dst),
         .rowBytes = CVPixelBufferGetBytesPerRow(dst),
     };
-    vImage_Error err = vImageScale_ARGB8888(&sb, &db, NULL, kvImageNoFlags);
+    // 目标尺寸不变时，临时缓冲大小也不变：算一次、申请一次、以后每帧复用
+    if (_vTempSize == 0) {
+        vImage_Error need = vImageScale_ARGB8888(&sb, &db, NULL, kvImageGetTempBufferSize);
+        if (need > 0) {
+            void *t = malloc((size_t)need);
+            if (t) { _vTemp = t; _vTempSize = (size_t)need; }
+        }
+    }
+    vImage_Error err = vImageScale_ARGB8888(&sb, &db, _vTemp, kvImageNoFlags);
     CVPixelBufferUnlockBaseAddress(dst, 0);
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
 
@@ -357,6 +371,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 - (void)stop {
     _running = NO;
     if (_timer) { dispatch_source_cancel(_timer); _timer = nil; }
+    if (_vTemp) { free(_vTemp); _vTemp = NULL; _vTempSize = 0; }
     for (int i = 0; i < 2; i++) {
         if (_pixelBuffers[i]) { CVPixelBufferRelease(_pixelBuffers[i]); _pixelBuffers[i] = NULL; }
         if (_surfaces[i]) { CFRelease(_surfaces[i]); _surfaces[i] = NULL; }
