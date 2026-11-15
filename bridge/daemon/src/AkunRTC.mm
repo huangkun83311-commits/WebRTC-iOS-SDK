@@ -28,6 +28,7 @@
 @property (nonatomic, assign) NSInteger sourceWidth;
 @property (nonatomic, assign) NSInteger sourceHeight;
 @property (nonatomic, assign) BOOL formatApplied;
+@property (nonatomic, assign) int appliedQuad;   // 上次套用输出格式时的象限
 @end
 
 @implementation AkunRTC
@@ -60,6 +61,12 @@
     if (self.sourceWidth > 0 && self.sourceHeight > 0) {
         int w = (int)lround((double)self.sourceWidth * self.scale);
         int h = (int)lround((double)self.sourceHeight * self.scale);
+        // 关键：抓屏图始终是「竖屏 framebuffer」，quad 为奇数时帧会在编码前被转 90°，
+        // 转完的尺寸是 h×w。这里请求的尺寸必须跟转向后的尺寸一致，
+        // 否则编码器会按错的尺寸裁切 —— 表现就是「画面只显示一半」。
+        if ([AkunOrientation quad] % 2 == 1) {
+            int t = w; w = h; h = t;
+        }
         // H.264 友好：宽高必须是偶数
         w -= (w % 2); h -= (h % 2);
         if (w < 64) { w = 64; }
@@ -68,6 +75,7 @@
         NSLog(@"[rtc] 输出 %dx%d @%dfps（源 %ldx%ld，scale=%.2f）",
               w, h, self.targetFps, (long)self.sourceWidth, (long)self.sourceHeight, self.scale);
         self.formatApplied = YES;
+        self.appliedQuad = [AkunOrientation quad];
     }
 
     if (self.maxBitrateBps > 0 && self.pc) {
@@ -298,6 +306,13 @@
         self.sourceHeight = ph;
         [self applyOutputFormat];
         NSLog(@"[rtc] 输入尺寸变成 %ldx%ld", (long)pw, (long)ph);
+    }
+
+    // 设备转身：输出宽高要跟着换（否则就是“只显示一半”），这里发现象限变了就重算
+    int q = [AkunOrientation quad];
+    if (q != self.appliedQuad) {
+        [self applyOutputFormat];
+        NSLog(@"[rtc] 象限 %d -> %d，重算输出尺寸", self.appliedQuad, q);
     }
 
     RTCCVPixelBuffer *buffer = [[RTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
