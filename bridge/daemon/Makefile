@@ -30,5 +30,8 @@ include $(THEOS_MAKE_PATH)/tool.mk
 before-package::
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/lib
 	@cp -R $(WEBRTC_DIR)/WebRTC.framework $(THEOS_STAGING_DIR)/usr/lib/
-	@$(THEOS)/bin/ldid -S"$(THEOS_STAGING_DIR)/usr/lib/WebRTC.framework/WebRTC" || true
+	@# 必须给框架做 ad-hoc 签名：roothide/rootless 内核拒绝加载「完全未签名」的 dylib
+	@# （真机报 mapped file has no cdhash, completely unsigned）。注意 -S 与路径之间要有空格，
+	@# 写成 -S"$$path" 会被当成「用该二进制自身当 entitlements」，ldid 报错但退出码被吞掉。
+	@$(THEOS)/bin/ldid -S "$(THEOS_STAGING_DIR)/usr/lib/WebRTC.framework/WebRTC"
 	@$(THEOS)/bin/ldid -S"$$(pwd)/src/akund.entitlements" "$(THEOS_STAGING_DIR)/usr/bin/akund"

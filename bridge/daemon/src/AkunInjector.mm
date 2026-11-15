@@ -1,81 +1,135 @@
+//  AkunInjector — 触摸事件注入
+//
+//  与 AKUN（TrollVNC 的 STHIDEventGenerator）同一套私有 API，但全部走 dlsym：
+//
+//  为什么不能直接 extern 声明：
+//    链接时用 -Wl,-undefined,dynamic_lookup，缺的符号会变成「陷阱桩」，
+//    一旦调用就 dyld: missing symbol called 直接崩，而且不给符号名。
+//    iOS 16 上 IOHIDEventSystemClientCreateSimpleClient 就已经不存在了，
+//    直接调用必然是这条路 —— 真机上表现为启动日志打完配置行就死。
+//
+//  正确的取法是 IOHIDEventSystemClientCreate（AKUN 用的就是它），依次回退。
+
 #import "AkunInjector.h"
 
 #import <CoreGraphics/CGGeometry.h>
 #import <QuartzCore/QuartzCore.h>
+#import <dlfcn.h>
 #import <mach/mach_time.h>
 
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 
-extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(
-    CFAllocatorRef allocator, uint64_t timestamp, int transducerType,
-    uint32_t index, uint32_t identity, uint32_t eventMask, uint32_t buttonMask,
-    double x, double y, double z, double tipPressure, double barrelPressure,
-    double tiltX, double tiltY, double twist, Boolean range, Boolean touch);
+typedef IOHIDEventRef (*CreateDigitizerEventFn)(CFAllocatorRef, uint64_t, int, uint32_t, uint32_t,
+                                                uint32_t, uint32_t, double, double, double, double,
+                                                double, double, double, double, Boolean, Boolean);
+typedef IOHIDEventRef (*CreateFingerEventFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t,
+                                             uint32_t, double, double, double, double, double,
+                                             Boolean, Boolean);
+typedef void (*AppendEventFn)(IOHIDEventRef, IOHIDEventRef, uint32_t);
+typedef void (*SetIntegerValueFn)(IOHIDEventRef, int32_t, int64_t);
+typedef void (*SetFloatValueFn)(IOHIDEventRef, int32_t, double);
+typedef void (*SetSenderIDFn)(IOHIDEventRef, uint64_t);
+typedef IOHIDEventSystemClientRef (*ClientCreateFn)(CFAllocatorRef);
+typedef IOHIDEventSystemClientRef (*ClientCreateWithTypeFn)(CFAllocatorRef, int, void *);
+typedef void (*DispatchEventFn)(IOHIDEventSystemClientRef, IOHIDEventRef);
 
-extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
-    CFAllocatorRef allocator, uint64_t timestamp, uint32_t index, uint32_t identity,
-    uint32_t eventMask, double x, double y, double z, double tipPressure,
-    double twist, Boolean range, Boolean touch);
+// IOHIDEventField 数值（对照 AKUN include-spi/IOKitSPI.h 的枚举）
+#define kHIDFieldIsBuiltIn 4                                  // kIOHIDEventTypeNULL 基址 + 4
+#define kHIDFieldDigitizerIsDisplayIntegrated 0x00030019      // 基址 0x30000 + 20 + 5
+#define kHIDFieldDigitizerMajorRadius 0x00030014              // 基址 0x30000 + 20
+#define kHIDFieldDigitizerMinorRadius 0x00030015
 
-extern void IOHIDEventAppendEvent(IOHIDEventRef parent, IOHIDEventRef child, uint32_t option);
-extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, int32_t field, int64_t value);
-extern void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
-extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreateSimpleClient(CFAllocatorRef allocator);
-extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
-
-// 不同 iOS 版本的 phase 位定义不同：常见 {1,2,4} 或 {1,2,3}。
-// 若注入无反应，只换这三行即可，不用动逻辑。
 #define HID_PHASE_BEGAN 1
 #define HID_PHASE_MOVED 2
 #define HID_PHASE_ENDED 4
 
 #define HID_TYPE_HAND 3
+#define HID_TYPE_FINGER 2
+
+// AKUN 用的发送者 ID；内置触摸屏修饰位不一致时它是关键一项
+static const uint64_t kSenderID = 0x8000000817319371ULL;
 static const double kMinEventInterval = 0.012;
 
 @implementation AkunInjector {
     IOHIDEventSystemClientRef _client;
     NSTimeInterval _lastDispatch;
+
+    CreateDigitizerEventFn _createHand;
+    CreateFingerEventFn _createFinger;
+    AppendEventFn _appendEvent;
+    SetIntegerValueFn _setInteger;
+    SetFloatValueFn _setFloat;
+    SetSenderIDFn _setSenderID;
+    DispatchEventFn _dispatch;
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _client = IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault);
-        NSLog(@"[inject] client=%p", _client);
+        _createHand = (CreateDigitizerEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventCreateDigitizerEvent");
+        _createFinger = (CreateFingerEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventCreateDigitizerFingerEvent");
+        _appendEvent = (AppendEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventAppendEvent");
+        _setInteger = (SetIntegerValueFn)dlsym(RTLD_DEFAULT, "IOHIDEventSetIntegerValue");
+        _setFloat = (SetFloatValueFn)dlsym(RTLD_DEFAULT, "IOHIDEventSetFloatValue");
+        _setSenderID = (SetSenderIDFn)dlsym(RTLD_DEFAULT, "IOHIDEventSetSenderID");
+        _dispatch = (DispatchEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientDispatchEvent");
+
+        ClientCreateFn simpleFn =
+            (ClientCreateFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCreateSimpleClient");
+        ClientCreateFn createFn = (ClientCreateFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCreate");
+        ClientCreateWithTypeFn createWithType =
+            (ClientCreateWithTypeFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCreateWithType");
+
+        if (createFn) {
+            _client = createFn(kCFAllocatorDefault);
+        } else if (simpleFn) {
+            _client = simpleFn(kCFAllocatorDefault);
+        } else if (createWithType) {
+            _client = createWithType(kCFAllocatorDefault, 3, NULL);   // 3 = digitizer
+        }
+
+        NSLog(@"[inject] client=%p (create=%p simple=%p withType=%p) symbols hand=%p finger=%p "
+              @"append=%p dispatch=%p senderID=%p",
+              _client, createFn, simpleFn, createWithType,
+              _createHand, _createFinger, _appendEvent, _dispatch, _setSenderID);
+
+        if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) {
+            NSLog(@"[inject] 私有符号不全，注入功能不可用（看上面指针哪个是 0）");
+        }
     }
     return self;
 }
 
 - (void)dispatchPhase:(uint32_t)phase x:(double)x y:(double)y {
-    if (!_client) { return; }
+    if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) { return; }
 
     NSTimeInterval now = CACurrentMediaTime();
     if (now - _lastDispatch < kMinEventInterval && phase == HID_PHASE_MOVED) { return; }
     _lastDispatch = now;
 
     uint64_t ts = mach_absolute_time();
-    BOOL touching = (phase != HID_PHASE_ENDED);
+    Boolean touching = (phase != HID_PHASE_ENDED);
 
-    IOHIDEventRef hand = IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault, ts, HID_TYPE_HAND,
-        0, 1, phase, 0,
-        x, y, 0,
-        0, 0, 0, 0, 0,
-        0, touching);
-
-    IOHIDEventRef finger = IOHIDEventCreateDigitizerFingerEvent(
-        kCFAllocatorDefault, ts,
-        0, 2, phase,
-        x, y, 0, 0, 0,
-        0, touching);
+    IOHIDEventRef hand = _createHand(kCFAllocatorDefault, ts, HID_TYPE_HAND,
+                                     0, 0, phase, 0,
+                                     x, y, 0, 0, 0, 0, 0, 0,
+                                     0, touching);
+    IOHIDEventRef finger = _createFinger(kCFAllocatorDefault, ts,
+                                         0, 1, phase,
+                                         x, y, 0, 0, 0,
+                                         0, touching);
 
     if (hand && finger) {
-        IOHIDEventAppendEvent(hand, finger, 0);
-        // 让系统认为事件来自内置触摸屏的修饰位，字段号跨版本不一致，默认不开。
-        // IOHIDEventSetIntegerValue(hand, 0x00030000, 1);
-        // IOHIDEventSetIntegerValue(hand, 0x00030001, 1);
-        IOHIDEventSetSenderID(hand, 0x8000000817319372ULL);
-        IOHIDEventSystemClientDispatchEvent(_client, hand);
+        // 这两项让系统认为事件来自内置触摸屏（AKUN 一样是必设的）
+        _setInteger(hand, kHIDFieldIsBuiltIn, 1);
+        _setInteger(hand, kHIDFieldDigitizerIsDisplayIntegrated, 1);
+        if (_setFloat) {
+            _setFloat(finger, kHIDFieldDigitizerMajorRadius, 5.0);
+            _setFloat(finger, kHIDFieldDigitizerMinorRadius, 5.0);
+        }
+        _appendEvent(hand, finger, 0);
+        if (_setSenderID) { _setSenderID(hand, kSenderID); }
+        _dispatch(_client, hand);
     }
     if (finger) { CFRelease(finger); }
     if (hand) { CFRelease(hand); }
@@ -109,16 +163,15 @@ static const double kMinEventInterval = 0.012;
         }
         [self dispatchPhase:HID_PHASE_ENDED x:x2 y:y2];
     } else if ([t isEqualToString:@"k"]) {
-        NSString *code = cmd[@"code"];
-        NSLog(@"[inject] key %@", code);
-        [self dispatchKey:code];
+        NSLog(@"[inject] key %@", cmd[@"code"]);
+        [self dispatchKey:cmd[@"code"]];
     }
 }
 
-/// Home / 锁屏这类硬按键：走 HID 键盘事件不通用，这里先用私有服务兜底。
+/// Home 手势：从下缘外往上滑，回桌面。
 - (void)dispatchKey:(NSString *)code {
+    if (![code isKindOfClass:[NSString class]]) { return; }
     if ([code isEqualToString:@"home"]) {
-        // SpringBoard 的 home 手势：从屏幕下缘外往上滑一段即可回桌面。
         [self dispatchPhase:HID_PHASE_BEGAN x:0.5 y:0.995];
         [self dispatchPhase:HID_PHASE_MOVED x:0.5 y:0.85];
         [self dispatchPhase:HID_PHASE_ENDED x:0.5 y:0.75];
