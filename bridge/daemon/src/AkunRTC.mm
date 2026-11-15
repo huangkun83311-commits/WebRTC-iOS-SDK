@@ -41,6 +41,8 @@
 @property (nonatomic, assign) NSUInteger goodStreak;    // 连续健康次数（升档需要）
 @property (nonatomic, assign) NSUInteger badStreak;     // 连续拥塞次数（降档需要）
 @property (nonatomic, assign) double lastFramesEncoded;
+@property (nonatomic, assign) double lastBytesSent;      // 上一窗口的累计发送字节
+@property (nonatomic, assign) double lastStatsTimestamp; // 上一窗口时间戳（微秒）
 @end
 
 @implementation AkunRTC
@@ -356,6 +358,8 @@
     double rttSeconds = -1.0;
     double framesEncoded = -1.0;
     double totalEncodeTime = -1.0;
+    double bytesSent = -1.0;
+    double statsTs = report.timestamp_us;
 
     for (NSString *key in report.statistics) {
         RTCStatistics *st = report.statistics[key];
@@ -372,6 +376,9 @@
         } else if ([st.type isEqualToString:@"outbound-rtp"]) {
             if ([v[@"framesEncoded"] isKindOfClass:[NSNumber class]]) {
                 framesEncoded = [v[@"framesEncoded"] doubleValue];
+            }
+            if ([v[@"bytesSent"] isKindOfClass:[NSNumber class]]) {
+                bytesSent = [v[@"bytesSent"] doubleValue];
             }
             if ([v[@"totalEncodeTime"] isKindOfClass:[NSNumber class]]) {
                 totalEncodeTime = [v[@"totalEncodeTime"] doubleValue];
@@ -403,7 +410,17 @@
         if (self.goodStreak >= 3) { [self stepUp]; }
     }
 
-    NSLog(@"[adapt] 丢包=%.1f%% rtt=%.0fms 编码=%.1fms scale=%.2f bitrate=%ld",
+    // 真实上行码率：用发送字节增量算，这才是「每台设备吃多少上行」的确数
+    double kbps = -1.0;
+    if (bytesSent >= 0 && self.lastBytesSent > 0 && self.lastStatsTimestamp > 0 && statsTs > self.lastStatsTimestamp) {
+        double dt = (statsTs - self.lastStatsTimestamp) / 1000000.0;
+        if (dt > 0.2) { kbps = (bytesSent - self.lastBytesSent) * 8.0 / 1000.0 / dt; }
+    }
+    if (bytesSent >= 0) { self.lastBytesSent = bytesSent; }
+    if (statsTs > 0) { self.lastStatsTimestamp = statsTs; }
+
+    NSLog(@"[adapt] 上行=%.0fkbps 丢包=%.1f%% rtt=%.0fms 编码=%.1fms scale=%.2f 上限=%ldbps",
+          kbps,
           fractionLost > 0 ? fractionLost * 100.0 : -1.0,
           rttSeconds > 0 ? rttSeconds * 1000.0 : -1.0,
           (framesEncoded > 0 && totalEncodeTime > 0) ? (totalEncodeTime / framesEncoded) * 1000.0 : -1.0,

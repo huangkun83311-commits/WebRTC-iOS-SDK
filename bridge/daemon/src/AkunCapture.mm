@@ -262,7 +262,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     // 画面没变就不推（AKUN 用 dirtyFrameCount 做同样的判断），但每秒至少补一帧保活
     if (_dirtyFrameCount) {
         CFIndex c = _dirtyFrameCount(NULL);
-        if (c == _lastDirtyCount && (CACurrentMediaTime() - _lastPushTime) < 1.0) { return; }
+        // 静止画面只留 2s 一次保活帧（以前是 1s）：静止时上行几乎归零，动一下立刻就有帧
+        if (c == _lastDirtyCount && (CACurrentMediaTime() - _lastPushTime) < 2.0) { return; }
         _lastDirtyCount = c;
     }
 
