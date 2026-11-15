@@ -333,19 +333,22 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     }
 
     NSTimeInterval now = CACurrentMediaTime();
-    // 画面没变就不推（AKUN 用 dirtyFrameCount 做同样的判断），但每 2s 至少补一帧保活
     BOOL changed = YES;
     if (_dirtyFrameCount) {
         CFIndex c = _dirtyFrameCount(NULL);
         changed = (c != _lastDirtyCount);
         if (changed) { _lastChangeMono = now; }
         _lastDirtyCount = c;
-        // 静止才停：最近 0.5s 动过就按 fps 满速推（视频/游戏期间宁可多耗一点也要顺），
-        // 完全静止则 2s 一帧保活。以前只要「这一 tick 恰好没变」就跳，视频也会被跳成 14fps。
-        if (!changed && (now - _lastChangeMono) > 0.5 && (now - _lastPushTime) < 2.0) { return; }
     }
-    // fps 闸门：画面在变时，按 fps 上限限流；不足一帧间隔的这次轮询直接跳过，让下一次尽早补上
-    if (changed && (now - _lastPushMono) < (1.0 / (double)MAX(1, _activeFps)) - kPollSec) { return; }
+    // 判定「正在动」还是「静止」：最近 0.5s 内变过就算在动（视频/游戏里某一 tick 恰好没变不算静止）。
+    // 在动 -> 按 fps 闸门满速推；静止 -> 只保留 2s 一帧保活，上行几乎归零。
+    BOOL idle = (!changed && (now - _lastChangeMono) > 0.5);
+    if (idle) {
+        if (now - _lastPushTime < 2.0) { return; }
+    } else {
+        double minGap = 1.0 / (double)MAX(1, _activeFps);
+        if (now - _lastPushMono < minGap - kPollSec) { return; }
+    }
 
     int slot = _cur;
     IOSurfaceRef surface = _surfaces[slot];
