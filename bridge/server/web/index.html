@@ -77,6 +77,7 @@
       videoRetry = setInterval(() => {
         if (!pc || !videoWs || videoWs.readyState !== 1) return;
         if (pc.remoteDescription && pc.remoteDescription.type) return;
+        if (pc.signalingState !== 'stable') return;   // 正在协商/已连上就别再插一脚
         log('offer 重发');
         negotiate();
       }, 3000);
@@ -85,8 +86,13 @@
     videoWs.onmessage = async (ev) => {
       const m = JSON.parse(ev.data);
       if (m.type === 'answer') {
-        await pc.setRemoteDescription(m);
-        await drainCandidates();
+        try {
+          if (pc.signalingState !== 'have-local-offer') { log('answer 忽略（状态 ' + pc.signalingState + '）'); return; }
+          await pc.setRemoteDescription(m);
+          await drainCandidates();
+        } catch (e) {
+          log('setRemoteDescription 失败：' + e.message);
+        }
       } else if (m.type === 'candidate' && m.candidate) {
         if (pc.remoteDescription && pc.remoteDescription.type) {
           try { await pc.addIceCandidate(m); } catch (e) { log('addIceCandidate', e.message); }
@@ -95,7 +101,7 @@
         }
       } else if (m.type === '_peerJoined') {
         log('publisher joined, renegotiating');
-        negotiate();
+        if (!pc.remoteDescription) negotiate();
       } else if (m.type === '_peerLeft') {
         log('publisher left');
       }
@@ -150,9 +156,12 @@
 
   async function negotiate() {
     if (!pc) return;
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    videoWs.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+    if (pc.signalingState !== 'stable') return;   // 已经有一个 offer 在飞
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      videoWs.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+    } catch (e) { log('offer 失败：' + e.message); }
   }
 
   function ICE_SERVERS() {

@@ -45,6 +45,13 @@ typedef void (*DispatchEventFn)(IOHIDEventSystemClientRef, IOHIDEventRef);
 #define HID_PHASE_MOVED 2
 #define HID_PHASE_ENDED 4
 
+// IOHIDDigitizerEventMask（AKUN 用的是这套位，不是 phase 值）
+#define HID_MASK_RANGE     0x00000001
+#define HID_MASK_TOUCH     0x00000002
+#define HID_MASK_POSITION  0x00000004
+#define HID_MASK_IDENTITY  0x00000008
+#define HID_MASK_ATTRIBUTE 0x00000010
+
 #define HID_TYPE_HAND 3
 #define HID_TYPE_FINGER 2
 
@@ -128,12 +135,17 @@ static double clamp01(double v) {
     uint64_t ts = mach_absolute_time();
     Boolean touching = (phase != HID_PHASE_ENDED);
 
+    // 掩码照 AKUN：按下/抬起 = Touch|Identity，移动 = Position|Attribute
+    uint32_t mask = (phase == HID_PHASE_MOVED)
+                        ? (HID_MASK_POSITION | HID_MASK_ATTRIBUTE)
+                        : (HID_MASK_TOUCH | HID_MASK_IDENTITY);
+
     IOHIDEventRef hand = _createHand(kCFAllocatorDefault, ts, HID_TYPE_HAND,
-                                     0, 0, phase, 0,
+                                     0, 0, mask, 0,
                                      x, y, 0, 0, 0, 0, 0, 0,
                                      0, touching);
     IOHIDEventRef finger = _createFinger(kCFAllocatorDefault, ts,
-                                         0, 1, phase,
+                                         0, 1, mask,
                                          x, y, 0, 0, 0,
                                          touching, touching);   // range / touch 同 AKUN：按住在 in-range
 
