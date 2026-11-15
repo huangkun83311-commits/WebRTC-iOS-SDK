@@ -103,14 +103,14 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     self.serverBase = prefs[@"ServerBase"] ?: @"";
     self.deviceId = prefs[@"DeviceId"] ?: @"dev001";
 
-    // 输出参数默认对齐 AKUN 出厂值：scale 0.35 / 12fps / 1.5Mbps。
-    // 这三个值决定了 30M 上行能带多少台还不卡，改之前先看 README。
+    // 输出参数：scale 0.35（AKUN 出厂值）、fps 24（12fps 只有 VNC 脏块能忍，WebRTC 全帧
+    // 编码必须靠帧率才有"视频流"的手感，24fps×434×772 的 H264 只占 ~1.5Mbps）、2.0Mbps 上限。
     double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
-    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 12;
-    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 1500000;
+    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 24;
+    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 2000000;
     if (scale <= 0.0) { scale = 0.35; }
-    if (fps <= 0) { fps = 12; }
-    if (maxBitrate <= 0) { maxBitrate = 1500000; }
+    if (fps <= 0) { fps = 24; }
+    if (maxBitrate <= 0) { maxBitrate = 2000000; }
 
     NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
           self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId,

@@ -128,6 +128,7 @@
 
     pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
+    window.__dbgPc = pc;   // 调试：控制台可查 receiver 编码/抖动缓冲/码率
 
     // 优先 H.264：设备端走 VideoToolbox 硬编（AKUN 也是硬编 H.264），比 VP8 软编延迟低一大截。
     try {
@@ -271,22 +272,19 @@
     if (ev.key === 'ArrowDown') { ctrl({ t: 'k', code: 'volumeDown' }); }
   });
 
-  /* ---------------- FPS 统计 ---------------- */
+  /* ---------------- FPS 统计（按真实解码帧计数，不是屏幕刷新率） ---------------- */
   let frames = 0, lastTs = performance.now();
-  function tickFps() {
+  function onVF() {
     frames++;
     const now = performance.now();
     if (now - lastTs >= 1000) {
       $('fps').textContent = frames + ' fps';
       frames = 0; lastTs = now;
     }
-    if (pc) requestVideoFrameCallbackOnce();
-    requestAnimationFrame(tickFps);
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVF);
   }
-  function requestVideoFrameCallbackOnce() {
-    try { if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(() => {}); } catch (e) {}
-  }
-  requestAnimationFrame(tickFps);
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVF);
+  else setInterval(() => { $('fps').textContent = '--'; }, 2000);
 
   /* ---------------- 按钮 ---------------- */
   $('connect').onclick = () => {
