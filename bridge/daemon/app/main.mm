@@ -46,9 +46,14 @@ static NSString *const kPrefsLegacy   = @"/var/mobile/Library/Preferences/com.ak
 }
 
 - (void)savePrefs {
+    NSString *server = [(self.serverField.text ?: @"") stringByTrimmingCharactersInSet:
+                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *dev = [(self.deviceField.text ?: @"") stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // 地址留空就写 auto，守护进程会自己广播找电脑
     NSDictionary *d = @{
-        @"ServerBase": self.serverField.text ?: @"",
-        @"DeviceId": self.deviceField.text ?: @"dev001",
+        @"ServerBase": server.length ? server : @"auto",
+        @"DeviceId": dev.length ? dev : @"dev001",
     };
     NSString *p = [self prefsPath];
     BOOL ok = [d writeToFile:p atomically:YES];
@@ -116,7 +121,7 @@ static NSString *const kPrefsLegacy   = @"/var/mobile/Library/Preferences/com.ak
     y += 44;
 
     self.serverField = [[UITextField alloc] initWithFrame:CGRectMake(20, y, w - 40, 40)];
-    self.serverField.placeholder = @"信令地址 如 http://192.168.1.100:8080";
+    self.serverField.placeholder = @"信令地址（留空=局域网自动发现）";
     self.serverField.text = prefs[@"ServerBase"] ?: @"";
     self.serverField.borderStyle = UITextBorderStyleRoundedRect;
     self.serverField.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -143,7 +148,7 @@ static NSString *const kPrefsLegacy   = @"/var/mobile/Library/Preferences/com.ak
     self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, y, w - 40, 80)];
     self.statusLabel.numberOfLines = 0;
     self.statusLabel.font = [UIFont systemFontOfSize:13];
-    self.statusLabel.text = @"未启动";
+    self.statusLabel.text = @"未启动（地址留空则自动发现）";
     [vc.view addSubview:self.statusLabel];
 
     self.window.rootViewController = vc;

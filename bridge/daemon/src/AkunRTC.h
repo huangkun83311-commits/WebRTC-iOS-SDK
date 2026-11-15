@@ -16,4 +16,7 @@
 - (void)start;
 - (void)stop;
 
+/// 自动发现拿到新地址后切换信令端点（不重建 PeerConnection，只重连 WS）。
+- (void)reconnectWithServerBase:(NSString *)base;
+
 @end

@@ -5,11 +5,15 @@
 //    2. 抓屏走 IOMobileFramebuffer/IOSurface，不需要用户手动开「屏幕录制」；
 //    3. 能注入 HID 事件（依赖 entitlements 里的 hid.client.event-dispatch），
 //       所以电脑端点击、滑动、回桌面都能作用到整个系统，而不只是自己这个 App。
+//
+//  服务地址默认不用手填：配置里 ServerBase 留空（或写 auto）就走局域网自动发现，
+//  先 UDP 19941 广播、失败再扫 /24 网段的 8080，和 AKUN 那套的发现习惯一致。
 
 #import <Foundation/Foundation.h>
 #import "AkunCapture.h"
 #import "AkunInjector.h"
 #import "AkunRTC.h"
+#import "AkunDiscovery.h"
 
 static NSString *kPrefsPathLegacy = @"/var/mobile/Library/Preferences/com.akun.bridge.plist";
 static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/com.akun.bridge.plist";
@@ -22,6 +26,8 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 @property (nonatomic, strong) NSURLSessionWebSocketTask *ctrlTask;
 @property (nonatomic, copy) NSString *serverBase;
 @property (nonatomic, copy) NSString *deviceId;
+@property (nonatomic, assign) BOOL autoDiscover;
+@property (nonatomic, assign) BOOL discovering;
 @property (nonatomic, assign) NSInteger reconnectAttempt;
 @property (nonatomic, assign) uint64_t frameCount;
 @end
@@ -37,8 +43,42 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
             return d;
         }
     }
-    NSLog(@"[daemon] 没读到任何配置文件，检查 com.akun.bridge.plist");
+    NSLog(@"[daemon] 没读到配置文件，走全默认（自动发现）");
     return @{};
+}
+
+#pragma mark - 地址解析（自动发现）
+
+- (void)resolveServerIfNeeded {
+    NSString *configured = self.serverBase ?: @"";
+    BOOL needDiscover = (configured.length == 0 ||
+                         [configured.lowercaseString isEqualToString:@"auto"]);
+    self.autoDiscover = needDiscover;
+
+    if (!needDiscover) {
+        NSLog(@"[daemon] 使用配置里的固定地址 %@", configured);
+        return;
+    }
+    if (self.discovering) {
+        NSLog(@"[daemon] 正在发现中，跳过重复探测");
+        return;
+    }
+
+    self.discovering = YES;
+    NSLog(@"[daemon] 开始局域网自动发现");
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *found = [AkunDiscovery discoverServerWithTimeout:3.0];
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) { return; }
+        self.discovering = NO;
+        if (found.length) {
+            self.serverBase = found;
+            NSLog(@"[daemon] 自动发现成功：%@", found);
+        } else {
+            NSLog(@"[daemon] 自动发现失败，等下一轮重试");
+        }
+    });
 }
 
 - (NSString *)ctrlURLString {
@@ -54,11 +94,13 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     return [NSString stringWithFormat:@"%@/ws?room=ctrl-%@&role=subscriber", base, self.deviceId];
 }
 
+#pragma mark - 启动
+
 - (void)start {
     NSDictionary *prefs = [self loadPrefs];
     self.serverBase = prefs[@"ServerBase"] ?: @"";
     self.deviceId = prefs[@"DeviceId"] ?: @"dev001";
-    NSLog(@"[daemon] server=%@ device=%@", self.serverBase, self.deviceId);
+    NSLog(@"[daemon] server=%@ device=%@", self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId);
 
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
@@ -73,18 +115,40 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
         [weakSelf.rtc pushPixelBuffer:pixelBuffer];
     };
 
-    self.rtc = [[AkunRTC alloc] initWithServerBase:self.serverBase deviceId:self.deviceId];
+    [self resolveServerIfNeeded];
+
+    // 发现是异步的（广播+扫描要几秒），推流端先用占位地址起来，拿到地址后再切
+    self.rtc = [[AkunRTC alloc] initWithServerBase:self.serverBase ?: @"" deviceId:self.deviceId];
     [self.rtc start];
 
     if (![self.capture start]) {
         NSLog(@"[daemon] 抓屏启动失败");
     }
     [self connectCtrl];
+
+    // 定时器：还没拿到地址就继续找；拿到之后把 rtc / 控制通道切过去
+    [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES block:^(NSTimer *t) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) { [t invalidate]; return; }
+        if (self.autoDiscover && self.serverBase.length == 0) {
+            [self resolveServerIfNeeded];
+            return;
+        }
+        if (self.autoDiscover && self.serverBase.length) {
+            [self.rtc reconnectWithServerBase:self.serverBase];
+            [self connectCtrl];
+            self.autoDiscover = NO;   // 只在首次发现后切一次
+        }
+    }];
 }
 
 #pragma mark - 控制通道
 
 - (void)connectCtrl {
+    if (self.serverBase.length == 0) {
+        NSLog(@"[daemon] 还没有服务地址，控制通道暂不连接");
+        return;
+    }
     NSString *urlString = [self ctrlURLString];
     NSLog(@"[daemon] 连接控制通道 %@", urlString);
     NSURL *url = [NSURL URLWithString:urlString];
@@ -95,6 +159,7 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
         self.session = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
     }
 
+    [self.ctrlTask cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
     self.ctrlTask = [self.session webSocketTaskWithURL:url];
     [self.ctrlTask resume];
     [self receiveLoopOn:self.ctrlTask];
@@ -135,9 +200,24 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) { return; }
-        [self.ctrlTask cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
-        [self connectCtrl];
+        [self reconnectNow];
     });
+}
+
+/// 断线重连：如果本来就是自动发现模式，先重新找地址（换了网络/电脑换了 IP 也能自愈）。
+- (void)reconnectNow {
+    NSString *configured = self.serverBase ?: @"";
+    BOOL autoMode = (configured.length == 0 ||
+                     [configured.lowercaseString isEqualToString:@"auto"]);
+    if (autoMode) {
+        NSLog(@"[daemon] 重连前重新发现服务");
+        NSString *found = [AkunDiscovery discoverServerWithTimeout:2.0];
+        if (found.length) {
+            self.serverBase = found;
+            [self.rtc reconnectWithServerBase:found];
+        }
+    }
+    [self connectCtrl];
 }
 
 #pragma mark - NSURLSessionWebSocketDelegate

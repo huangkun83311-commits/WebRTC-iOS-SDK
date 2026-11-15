@@ -79,6 +79,11 @@
         [self setupPeerConnection];
     }
 
+    if (self.serverBase.length == 0) {
+        NSLog(@"[rtc] 还没有服务地址（自动发现中），信令暂不连接");
+        return;
+    }
+
     if (!self.session) {
         NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
         self.session = [NSURLSession sessionWithConfiguration:cfg];
@@ -224,6 +229,17 @@
     self.ws = nil;
     [self.pc close];
     self.pc = nil;
+}
+
+- (void)reconnectWithServerBase:(NSString *)base {
+    if (base.length == 0) { return; }
+    if (self.ws && [self.serverBase isEqualToString:base]) { return; }
+    self.serverBase = [base copy];
+    NSLog(@"[rtc] 信令端点切到 %@", base);
+    [self.ws cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
+    self.ws = nil;
+    self.reconnectAttempt = 0;
+    [self start];
 }
 
 #pragma mark - RTCPeerConnectionDelegate（这个 SDK 版本前 9 个方法非 optional，必须实现）

@@ -10,12 +10,17 @@
 package main
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -187,8 +192,85 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// ---- 局域网自动发现：手机端不用手填 IP ----
+//
+// 手机广播一个探测包到 UDP 19941（沿用 AKUN 那套的端口习惯），本程序回自己的 http 地址。
+// 回包里的 IP 用「朝对端 dial 一次取本地地址」的方式算出来，多网卡（有线/Wi-Fi/虚拟网卡）
+// 时也能给出对的那一个。
+
+func localIPToward(addr *net.UDPAddr) string {
+	c, err := net.DialUDP("udp4", nil, addr)
+	if err == nil {
+		defer c.Close()
+		if la, ok := c.LocalAddr().(*net.UDPAddr); ok && la.IP != nil && !la.IP.IsUnspecified() {
+			return la.IP.String()
+		}
+	}
+	return firstNonLoopbackIPv4()
+}
+
+func firstNonLoopbackIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ip4 := ipnet.IP.To4(); ip4 != nil {
+				return ip4.String()
+			}
+		}
+	}
+	return "127.0.0.1"
+}
+
+func startDiscovery(discoveryPort, httpPort int) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: discoveryPort})
+	if err != nil {
+		log.Printf("自动发现未启用（udp :%d 绑定失败）：%v", discoveryPort, err)
+		return
+	}
+	log.Printf("自动发现监听 udp :%d，回包地址 http://<本机IP>:%d", discoveryPort, httpPort)
+
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				log.Printf("discovery read: %v", err)
+				return
+			}
+			if !bytes.Contains(buf[:n], []byte("AKUNBRIDGE")) {
+				continue
+			}
+			localIP := localIPToward(addr)
+			payload := fmt.Sprintf(`{"akun":true,"http":"http://%s:%d","port":%d}`,
+				localIP, httpPort, httpPort)
+			if _, err := conn.WriteToUDP([]byte(payload), addr); err != nil {
+				log.Printf("discovery reply: %v", err)
+				continue
+			}
+			log.Printf("自动发现：%s 探测，回 %s", addr, localIP)
+		}
+	}()
+}
+
+// httpPortFromAddr 把 ":8080" / "0.0.0.0:8080" 解析成 8080。
+func httpPortFromAddr(addr string) int {
+	idx := strings.LastIndex(addr, ":")
+	if idx < 0 {
+		return 8080
+	}
+	p, err := strconv.Atoi(addr[idx+1:])
+	if err != nil {
+		return 8080
+	}
+	return p
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "监听地址，例如 :8080")
+	discPort := flag.Int("disc", 19941, "UDP 自动发现端口，0 表示关闭")
 	flag.Parse()
 
 	h := newHub()
@@ -213,7 +295,10 @@ func main() {
 	}
 
 	log.Printf("AKUN Device Bridge signaling listening on %s", *addr)
-	log.Printf("控制台: http://<服务器IP>%s/", *addr)
+	log.Printf("控制台: http://%s:%d/", firstNonLoopbackIPv4(), httpPortFromAddr(*addr))
+	if *discPort > 0 {
+		startDiscovery(*discPort, httpPortFromAddr(*addr))
+	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
