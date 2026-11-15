@@ -86,7 +86,8 @@
             RTCRtpEncodingParameters *enc = params.encodings.firstObject;
             enc.maxFramerate = @(self.targetFps);
             enc.maxBitrateBps = @(self.maxBitrateBps);
-            enc.minBitrateBps = @(MIN(self.maxBitrateBps, MAX(300000, (NSInteger)(self.maxBitrateBps * 0.5)));
+            NSInteger minRate = MIN(self.maxBitrateBps, MAX(300000, (NSInteger)(self.maxBitrateBps * 0.5)));
+            enc.minBitrateBps = @(minRate);
             enc.bitratePriority = 1.0;
             enc.networkPriority = RTCPriorityHigh;
             params.degradationPreference = @(RTCDegradationPreferenceMaintainFramerate);
