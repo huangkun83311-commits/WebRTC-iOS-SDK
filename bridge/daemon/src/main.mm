@@ -127,10 +127,8 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
     self.capture.fps = fps;
-    // 缩放交给抓屏层（渲染服务器按目标尺寸直接出图），编码器输入就是小图，
-    // 不再让 libwebrtc 每帧 CPU 缩放一遍——这是延迟和 CPU 的大头。
-    self.capture.outputScale = scale;
-
+    // 抓屏必须按「整屏原始像素」渲染：surface 小于屏幕时 CARenderServer 是裁切而不是缩放，
+    // 表现就是「只看到屏幕的一个小角落」。缩放统一交给编码器（VideoAdapter），scale 只影响输出。
     __weak typeof(self) weakSelf = self;
     self.capture.frameHandler = ^(CVPixelBufferRef pixelBuffer) {
         weakSelf.frameCount++;
@@ -148,8 +146,8 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 
     // 发现是异步的（广播+扫描要几秒），推流端先用占位地址起来，拿到地址后再切
     self.rtc = [[AkunRTC alloc] initWithServerBase:self.serverBase ?: @"" deviceId:self.deviceId];
-    // 抓屏已经缩到目标尺寸，这里 scale 传 1.0，别让 libwebrtc 再缩一次（二次缩会糊、还费 CPU）
-    [self.rtc configureWithScale:1.0 fps:fps maxBitrateBps:maxBitrate];
+    // 缩放交给编码器（libwebrtc VideoAdapter），这样是缩放不是裁切
+    [self.rtc configureWithScale:scale fps:fps maxBitrateBps:maxBitrate];
     [self.rtc start];
 
     if (![self.capture start]) {
@@ -238,8 +236,8 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
                     if (fps > 30) { fps = 30; }
                     NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld", scale, fps, (long)br);
                     // 缩放由抓屏层做（GPU 出小图），编码器侧不再缩放
-                    [self.capture setOutputScale:scale];
-                    [self.rtc configureWithScale:1.0 fps:fps maxBitrateBps:br];
+                    [self.capture setOutputScale:1.0];
+                    [self.rtc configureWithScale:scale fps:fps maxBitrateBps:br];
                     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br;
                     [self.capture setFps:fps];
                 } else {
