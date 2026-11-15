@@ -102,7 +102,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         let decoder = RTCDefaultVideoDecoderFactory()
         factory = RTCPeerConnectionFactory(encoderFactory: encoder, decoderFactory: decoder)
 
-        videoSource = factory.videoSource()
+        videoSource = factory.videoSource(forScreenCast: true)
         videoSource.adaptOutputFormat(toWidth: 720, height: 1280, fps: 30)
 
         videoCapturer = RTCVideoCapturer()
@@ -150,7 +150,7 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self = self else { return }
             switch result {
             case .failure(let error):
-                os_log("ws receive error: %{public}@", log: self.logger, type: .error, error.localizedDescription)
+                os_log("ws receive error: \(error.localizedDescription, privacy: .public)", log: self.logger, type: .error)
                 self.scheduleReconnect()
             case .success(let message):
                 switch message {
@@ -171,7 +171,7 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self = self, let task = task, self.ws === task else { return }
             task.sendPing { error in
                 if let error = error {
-                    os_log("ws ping failed: %{public}@", log: self.logger, type: .error, error.localizedDescription)
+                    os_log("ws ping failed: \(error.localizedDescription, privacy: .public)", log: self.logger, type: .error)
                     self.scheduleReconnect()
                 } else {
                     self.reconnectAttempt = 0
@@ -195,7 +195,7 @@ class SampleHandler: RPBroadcastSampleHandler {
               let text = String(data: data, encoding: .utf8) else { return }
         ws?.send(.string(text)) { error in
             if let error = error {
-                os_log("ws send failed: %{public}@", log: .default, type: .error, error.localizedDescription)
+                os_log("ws send failed: \(error.localizedDescription, privacy: .public)", log: .default, type: .error)
             }
         }
     }
@@ -288,7 +288,7 @@ extension SampleHandler: RTCPeerConnectionDelegate {
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
-        os_log("ice state: %d", log: logger, type: .info, newState.rawValue)
+        os_log("ice state: \(newState.rawValue, privacy: .public)", log: logger, type: .info)
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
