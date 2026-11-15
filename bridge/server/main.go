@@ -347,6 +347,33 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
+	// 在线调画质：/api/config?room=dev001&scale=0.35&fps=24&bitrate=3000000
+	// 直接广播给控制通道，设备端即时生效，不用重装 deb（调延迟/清晰度用这个最快）。
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		room := r.URL.Query().Get("room")
+		if room == "" {
+			room = "dev001"
+		}
+		msg := map[string]interface{}{"t": "cfg"}
+		for _, k := range []string{"scale", "fps", "bitrate"} {
+			if v := r.URL.Query().Get(k); v != "" {
+				msg[k] = v
+			}
+		}
+		payload, _ := json.Marshal(msg)
+		target := "ctrl-" + room
+		h.mu.RLock()
+		set := h.rooms[target]
+		h.mu.RUnlock()
+		n := 0
+		for c := range set {
+			if err := c.send(payload); err == nil {
+				n++
+			}
+		}
+		log.Printf("config room=%s sent=%d %s", room, n, payload)
+		writeJSON(w, map[string]interface{}{"sent": n, "payload": string(payload)})
+	})
 
 	static, err := fs.Sub(webFS, "web")
 	if err != nil {

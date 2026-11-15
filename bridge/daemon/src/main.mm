@@ -200,8 +200,22 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
         if (data) {
             NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             if ([cmd isKindOfClass:[NSDictionary class]]) {
-                NSLog(@"[ctrl] 收到 %@", message.string ?: @"<bin>");
-                [self.injector handleCommand:cmd];
+                NSString *type = cmd[@"t"];
+                if ([type isEqualToString:@"cfg"]) {
+                    // 中控/网页在线改画质，不用重装包
+                    double scale = self.rtc.scale;
+                    int fps = self.rtc.targetFps;
+                    NSInteger br = self.rtc.maxBitrateBps;
+                    if (cmd[@"scale"]) { scale = [cmd[@"scale"] doubleValue]; }
+                    if (cmd[@"fps"]) { fps = [cmd[@"fps"] intValue]; }
+                    if (cmd[@"bitrate"]) { br = [cmd[@"bitrate"] integerValue]; }
+                    NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld", scale, fps, (long)br);
+                    [self.rtc configureWithScale:scale fps:fps maxBitrateBps:br];
+                    [self.capture setFps:fps];
+                } else {
+                    NSLog(@"[ctrl] 收到 %@", message.string ?: @"<bin>");
+                    [self.injector handleCommand:cmd];
+                }
             }
         }
         [self receiveLoopOn:task];
