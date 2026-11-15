@@ -73,7 +73,12 @@ static double clamp01(double v) {
     if ([t isEqualToString:@"tap"]) {
         CGPoint p = [self pointFromNormX:x y:y];
         NSLog(@"[inject] tap 像素 (%f,%f)", p.x, p.y);
-        [gen tap:p];
+        // 不能用 gen 的 tap: —— 它内部 _sendTaps 里断言 delay > 0，而 tap: 传的是 0，
+        // 带断言编译（我们这份）会直接 abort；改按下/抬起两段，节奏与 AKUN 一致
+        // （fingerLiftDelay = 50ms），且每段各自带 marker 事件。
+        [gen touchDown:p];
+        usleep(60000);
+        [gen liftUp:p];
         NSLog(@"[inject] tap 调用返回");
     } else if ([t isEqualToString:@"d"]) {
         _dragging = YES;

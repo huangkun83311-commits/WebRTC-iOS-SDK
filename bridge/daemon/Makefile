@@ -22,6 +22,9 @@ akund_CFLAGS  += -fobjc-arc -stdlib=libc++ -F$(WEBRTC_DIR) -Wno-arc-retain-cycle
 # AKUN 源码里有新版 clang 才认识的 #pragma clang diagnostic ignored 分组名，
 # 老 clang 会把它当 error；忽略「未知警告名」即可，不影响行为。
 akund_CFLAGS  += -Wno-unknown-warning-option
+# AKUN 正式包关了断言；它源码里 tap: 会传 delay=0 触发自身断言，
+# 我们保持断言关闭，行为才和它一致（否则一点击就 abort）。
+akund_CFLAGS  += -DNS_BLOCK_ASSERTIONS=1
 akund_CCFLAGS += -stdlib=libc++ $(LINKER_FLAGS)
 akund_LDFLAGS += $(LINKER_FLAGS)
 akund_LDFLAGS += -F$(WEBRTC_DIR) -framework WebRTC
