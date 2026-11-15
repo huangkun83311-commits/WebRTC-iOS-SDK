@@ -25,6 +25,11 @@ jobs:
           brew install ldid dpkg xz || brew install ldid dpkg
           echo "ldid: $(command -v ldid)"
 
+      - name: Set up Go (服务端交叉编译)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
       - name: Install Theos + SDK
         run: |
           set -e
