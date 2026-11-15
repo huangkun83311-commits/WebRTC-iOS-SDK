@@ -89,9 +89,13 @@ static NSString *const kProbePacket = @"AKUNBRIDGE_DISCOVER";
             http = [NSString stringWithFormat:@"http://%@:%@", host, obj[@"port"]];
         }
         if (http.length) {
-            found = [http copy];
-            NSLog(@"[discover] 广播命中：%@（对端 %s）", found, inet_ntoa(from.sin_addr));
-            break;
+            // 广播回包也要验一下是不是我们的服务（同网段可能有别的 8080 服务）
+            if ([self isOurServerAt:http timeout:1.0]) {
+                found = [http copy];
+                NSLog(@"[discover] 广播命中：%@（对端 %s）", found, inet_ntoa(from.sin_addr));
+                break;
+            }
+            NSLog(@"[discover] 广播回包 %@ 不是我们的服务，忽略", http);
         }
     }
 
@@ -126,6 +130,39 @@ static NSString *const kProbePacket = @"AKUNBRIDGE_DISCOVER";
 
 #pragma mark - 网段扫描兜底
 
+/// 只有回 /api/hello 且 app=akun-bridge 的才算我们的服务。
+/// 之前只探 TCP 8080，会命中路由器管理页（真机上就扫到了 http://192.168.1.1:8080）。
++ (BOOL)isOurServerAt:(NSString *)base timeout:(NSTimeInterval)timeout {
+    if (base.length == 0) { return NO; }
+    NSString *urlString = [base hasSuffix:@"/"] ? base : [base stringByAppendingString:@"/"];
+    NSURL *url = [NSURL URLWithString:[urlString stringByAppendingString:@"api/hello"]];
+    if (!url) { return NO; }
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                        cachePolicy:NSURLRequestReloadIgnoringCacheData
+                                                    timeoutInterval:timeout];
+    __block NSData *payload = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    NSURLSession *session = [NSURLSession sharedSession];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:req
+                                           completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (data.length) { payload = data; }
+        dispatch_semaphore_signal(sem);
+    }];
+    [task resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
+
+    if (!payload.length) { return NO; }
+    NSDictionary *obj = [NSJSONSerialization JSONObjectWithData:payload options:0 error:nil];
+    BOOL ok = [obj isKindOfClass:[NSDictionary class]] &&
+              [obj[@"app"] isEqualToString:@"akun-bridge"];
+    if (!ok) {
+        NSLog(@"[discover] %@ 的 /api/hello 不匹配：%@", base, obj);
+    }
+    return ok;
+}
+
 + (NSString *)scanSubnetForHttp {
     NSString *localIP = [self primaryIPv4];
     if (!localIP) { return nil; }
@@ -140,11 +177,13 @@ static NSString *const kProbePacket = @"AKUNBRIDGE_DISCOVER";
     for (int i = 1; i <= 254; i++) {
         if (i == selfHost.intValue) { continue; }
         NSString *ip = [prefix stringByAppendingFormat:@"%d", i];
-        if ([self tcpProbe:ip port:kHttpPort timeoutMs:60]) {
-            NSString *http = [NSString stringWithFormat:@"http://%@:%u", ip, kHttpPort];
+        if (![self tcpProbe:ip port:kHttpPort timeoutMs:60]) { continue; }
+        NSString *http = [NSString stringWithFormat:@"http://%@:%u", ip, kHttpPort];
+        if ([self isOurServerAt:http timeout:0.8]) {
             NSLog(@"[discover] 网段扫描命中：%@", http);
             return http;
         }
+        NSLog(@"[discover] %@ 端口开着但不是我们的服务，继续扫", http);
     }
     NSLog(@"[discover] 网段扫描也没找到");
     return nil;

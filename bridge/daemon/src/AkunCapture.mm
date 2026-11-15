@@ -1,28 +1,39 @@
+//  AkunCapture — 屏幕抓取
+//
+//  为什么不用 IOMobileFramebufferOpen：
+//    真机（iOS 16.7.16）上 IOMobileFramebufferOpen 返回 kr=0xE00002E2（无权限），
+//    守护进程拿不到 framebuffer 层。AKUN 的做法完全绕开它：
+//      自建一块 IOSurface → CARenderServerRenderDisplay(0, "LCD", surface, 0, 0)
+//      渲染服务器直接把主屏画进这块 surface，不需要 framebuffer 权限。
+//
+//  顺带解决了 CPU 问题：用 CVPixelBufferCreateWithIOSurface 把 surface 直接包成
+//  CVPixelBuffer，零拷贝交给 WebRTC，不再每帧 memcpy 11.8MB。
+//
+//  双缓冲：渲染到 A 的同时推 B，避免 WebRTC 还在编码时被下一帧覆盖（撕裂）。
+
 #import "AkunCapture.h"
 
 #import <IOSurface/IOSurfaceRef.h>
-#import <IOKit/IOKitLib.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UIKit/UIKit.h>
 #import <dlfcn.h>
-#import <mach/mach.h>
 
-// IOMobileFramebuffer 是私有框架，不链它，运行时 dlsym，避免编译期依赖。
-typedef struct __IOMobileFramebuffer *IOMobileFramebufferRef;
-typedef int (*OpenFn)(uint32_t service, uint32_t owningTask, uint32_t type, IOMobileFramebufferRef *out);
-typedef int (*GetSurfaceFn)(IOMobileFramebufferRef fb, int layer, IOSurfaceRef *out);
 typedef void (*RenderDisplayFn)(uint32_t ctx, CFStringRef display, IOSurfaceRef surface, int x, int y);
+typedef CFIndex (*GetDirtyFrameCountFn)(void *);
 
 static const int kDefaultFPS = 12;
+static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
 @implementation AkunCapture {
-    IOMobileFramebufferRef _fb;
-    IOSurfaceRef _surface;
-    CVPixelBufferRef _pbuf;
     dispatch_queue_t _queue;
     dispatch_source_t _timer;
-    OpenFn _open;
-    GetSurfaceFn _getSurface;
     RenderDisplayFn _renderDisplay;
+    GetDirtyFrameCountFn _dirtyFrameCount;
+    CFIndex _lastDirtyCount;
+    NSTimeInterval _lastPushTime;
+    IOSurfaceRef _surfaces[2];
+    CVPixelBufferRef _pixelBuffers[2];
+    int _cur;
     BOOL _running;
 }
 
@@ -30,103 +41,112 @@ static const int kDefaultFPS = 12;
     if ((self = [super init])) {
         _queue = dispatch_queue_create("com.akun.capture", DISPATCH_QUEUE_SERIAL);
         _fps = kDefaultFPS;
-        _open = (OpenFn)dlsym(RTLD_DEFAULT, "IOMobileFramebufferOpen");
-        _getSurface = (GetSurfaceFn)dlsym(RTLD_DEFAULT, "IOMobileFramebufferGetLayerDefaultSurface");
         _renderDisplay = (RenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-        NSLog(@"[capture] symbols: open=%p surface=%p render=%p", _open, _getSurface, _renderDisplay);
+        _dirtyFrameCount = (GetDirtyFrameCountFn)dlsym(RTLD_DEFAULT, "CARenderServerGetDirtyFrameCount");
+        NSLog(@"[capture] symbols: render=%p dirtyCount=%p", _renderDisplay, _dirtyFrameCount);
     }
     return self;
 }
 
-- (BOOL)openFramebuffer {
-    if (_fb) { return YES; }
-    if (!_open) { return NO; }
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                       IOServiceMatching("IOMobileFramebuffer"));
-    if (!service) {
-        NSLog(@"[capture] 找不到 IOMobileFramebuffer 服务");
-        return NO;
+#pragma mark - 屏幕尺寸
+
+/// 像素尺寸：优先 UIScreen nativeBounds（daemon 里也能取到），失败再退常用值。
+- (CGSize)screenPixelSize {
+    @try {
+        UIScreen *screen = [UIScreen mainScreen];
+        CGSize s = screen.nativeBounds.size;
+        if (s.width > 0 && s.height > 0) { return s; }
+    } @catch (NSException *e) {
+        NSLog(@"[capture] UIScreen 取尺寸异常: %@", e.reason);
     }
-    int kr = _open(service, mach_task_self(), 0, &_fb);
-    IOObjectRelease(service);
-    if (kr != 0 || !_fb) {
-        NSLog(@"[capture] IOMobileFramebufferOpen 失败 kr=%d", kr);
-        return NO;
+    return CGSizeMake(1170, 2532);
+}
+
+#pragma mark - 建 surface
+
+- (BOOL)buildSurfacesIfNeeded {
+    if (_surfaces[0]) { return YES; }
+
+    CGSize sz = [self screenPixelSize];
+    size_t w = (size_t)lround(sz.width);
+    size_t h = (size_t)lround(sz.height);
+    if (w == 0 || h == 0) { return NO; }
+    w &= ~1UL; h &= ~1UL;                     // 宽高取偶数
+
+    size_t bytesPerRow = ((w * 4) + 63) & ~63UL;   // 64 字节对齐
+
+    NSDictionary *props = @{
+        (__bridge NSString *)kIOSurfaceBytesPerElement : @(4),
+        (__bridge NSString *)kIOSurfaceBytesPerRow : @(bytesPerRow),
+        (__bridge NSString *)kIOSurfaceWidth : @(w),
+        (__bridge NSString *)kIOSurfaceHeight : @(h),
+        (__bridge NSString *)kIOSurfacePixelFormat : @(kPixelFormatBGRA),
+        (__bridge NSString *)kIOSurfaceAllocSize : @(bytesPerRow * h),
+    };
+
+    NSDictionary *cvAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+    };
+
+    for (int i = 0; i < 2; i++) {
+        _surfaces[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        if (!_surfaces[i]) {
+            NSLog(@"[capture] IOSurfaceCreate 失败 slot=%d", i);
+            return NO;
+        }
+        // 零拷贝：直接把 IOSurface 包成 CVPixelBuffer
+        CVReturn cr = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, _surfaces[i],
+                                                       (__bridge CFDictionaryRef)cvAttrs,
+                                                       &_pixelBuffers[i]);
+        if (cr != kCVReturnSuccess || !_pixelBuffers[i]) {
+            NSLog(@"[capture] CVPixelBufferCreateWithIOSurface 失败 slot=%d cr=%d", i, cr);
+            return NO;
+        }
     }
+
+    _width = w;
+    _height = h;
+    NSLog(@"[capture] surface %zux%zu stride=%zu（零拷贝，双缓冲）", w, h, bytesPerRow);
     return YES;
 }
 
-/// 取当前显示层 surface；尺寸变了就重建 pixel buffer。
-- (IOSurfaceRef)currentSurface {
-    if (_getSurface && [self openFramebuffer]) {
-        IOSurfaceRef s = NULL;
-        if (_getSurface(_fb, 0, &s) == 0 && s) { return s; }
-    }
-    if (_renderDisplay) {
-        // 兜底：自己开一块 surface，让渲染服务器把主屏画进去。
-        if (!_surface) {
-            NSDictionary *props = @{
-                (id)kIOSurfaceWidth : @(1170),
-                (id)kIOSurfaceHeight : @(2532),
-                (id)kIOSurfaceBytesPerElement : @(4),
-                (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
-            };
-            _surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-        }
-        if (_surface) {
-            _renderDisplay(0, CFSTR("LCD"), _surface, 0, 0);
-            return _surface;
-        }
-    }
-    return NULL;
-}
+#pragma mark - 抓帧
 
 - (void)grabOneFrame {
-    IOSurfaceRef surface = [self currentSurface];
-    if (!surface) { return; }
-
-    size_t w = IOSurfaceGetWidth(surface);
-    size_t h = IOSurfaceGetHeight(surface);
-    size_t stride = IOSurfaceGetBytesPerRow(surface);
-    if (w == 0 || h == 0) { return; }
-
-    if (!_pbuf || CVPixelBufferGetWidth(_pbuf) != w || CVPixelBufferGetHeight(_pbuf) != h) {
-        if (_pbuf) { CVPixelBufferRelease(_pbuf); _pbuf = NULL; }
-        NSDictionary *attrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-            (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-            (id)kCVPixelBufferWidthKey : @(w),
-            (id)kCVPixelBufferHeightKey : @(h),
-        };
-        CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
-                            (__bridge CFDictionaryRef)attrs, &_pbuf);
-        _width = w;
-        _height = h;
-        NSLog(@"[capture] surface %zux%zu stride=%zu", w, h, stride);
+    if (![self buildSurfacesIfNeeded]) { return; }
+    if (!_renderDisplay) {
+        static BOOL warned = NO;
+        if (!warned) { NSLog(@"[capture] 找不到 CARenderServerRenderDisplay"); warned = YES; }
+        return;
     }
-    if (!_pbuf) { return; }
 
-    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
-    CVPixelBufferLockBaseAddress(_pbuf, 0);
-    void *src = IOSurfaceGetBaseAddress(surface);
-    void *dst = CVPixelBufferGetBaseAddress(_pbuf);
-    size_t dstStride = CVPixelBufferGetBytesPerRow(_pbuf);
-    if (src && dst) {
-        size_t copyStride = MIN(stride, dstStride);
-        for (size_t y = 0; y < h; y++) {
-            memcpy((uint8_t *)dst + y * dstStride, (uint8_t *)src + y * stride, copyStride);
-        }
+    // 画面没变就不推（AKUN 用 dirtyFrameCount 做同样的判断），但每秒至少补一帧保活
+    if (_dirtyFrameCount) {
+        CFIndex c = _dirtyFrameCount(NULL);
+        if (c == _lastDirtyCount && (CACurrentMediaTime() - _lastPushTime) < 1.0) { return; }
+        _lastDirtyCount = c;
     }
-    CVPixelBufferUnlockBaseAddress(_pbuf, 0);
-    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 
-    if (self.frameHandler) { self.frameHandler(_pbuf); }
+    int slot = _cur;
+    IOSurfaceRef surface = _surfaces[slot];
+    CVPixelBufferRef pbuf = _pixelBuffers[slot];
+    if (!surface || !pbuf) { return; }
+
+    // 渲染服务器把主屏画进这块 surface。kIOSurfaceLock 不需要：渲染是同步完成的。
+    _renderDisplay(0, CFSTR("LCD"), surface, 0, 0);
+
+    // 推上一帧的槽位（双缓冲，交替）
+    _cur = 1 - _cur;
+    _lastPushTime = CACurrentMediaTime();
+
+    if (self.frameHandler) { self.frameHandler(pbuf); }
 }
 
 - (BOOL)start {
     if (_running) { return YES; }
-    if (![self currentSurface]) {
-        NSLog(@"[capture] 起不来：没有任何可取帧的 surface");
+    if (![self buildSurfacesIfNeeded]) {
+        NSLog(@"[capture] 起不来：surface 建失败");
         return NO;
     }
     _running = YES;
@@ -144,9 +164,10 @@ static const int kDefaultFPS = 12;
 - (void)stop {
     _running = NO;
     if (_timer) { dispatch_source_cancel(_timer); _timer = nil; }
-    if (_pbuf) { CVPixelBufferRelease(_pbuf); _pbuf = NULL; }
-    if (_surface) { CFRelease(_surface); _surface = NULL; }
-    if (_fb) { CFRelease(_fb); _fb = NULL; }
+    for (int i = 0; i < 2; i++) {
+        if (_pixelBuffers[i]) { CVPixelBufferRelease(_pixelBuffers[i]); _pixelBuffers[i] = NULL; }
+        if (_surfaces[i]) { CFRelease(_surfaces[i]); _surfaces[i] = NULL; }
+    }
 }
 
 @end

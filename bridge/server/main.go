@@ -244,7 +244,7 @@ func startDiscovery(discoveryPort, httpPort int) {
 				continue
 			}
 			localIP := localIPToward(addr)
-			payload := fmt.Sprintf(`{"akun":true,"http":"http://%s:%d","port":%d}`,
+			payload := fmt.Sprintf(`{"app":"akun-bridge","akun":true,"http":"http://%s:%d","port":%d}`,
 				localIP, httpPort, httpPort)
 			if _, err := conn.WriteToUDP([]byte(payload), addr); err != nil {
 				log.Printf("discovery reply: %v", err)
@@ -278,6 +278,16 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
 	mux.HandleFunc("/api/rooms", h.handleRooms)
+	// 设备端自动发现的身份校验：只有回出 app=akun-bridge 的地址才算我们的服务，
+	// 避免把路由器管理页 / 别的 8080 服务当成信令端。
+	mux.HandleFunc("/api/hello", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{
+			"app":     "akun-bridge",
+			"http":    "http://" + r.Host,
+			"disc":    *discPort,
+			"version": "1.0.0",
+		})
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
