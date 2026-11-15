@@ -281,7 +281,11 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 			_ = old.conn.Close()
 		}
 		rm.pub = p
+		waiting := len(rm.readers)
 		rm.mu.Unlock()
+		if waiting > 0 {
+			log.Printf("sfu room=%s 手机接入时已有 %d 个观看端在等，稍后按需索帧", room, waiting)
+		}
 		// 手机端是"应答方"：它不会自己发 offer，必须由服务器主动发起收流协商。
 		go func() {
 			if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo,

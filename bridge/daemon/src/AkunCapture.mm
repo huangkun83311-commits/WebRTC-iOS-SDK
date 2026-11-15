@@ -58,6 +58,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     NSTimeInterval _lastChangeMono; // 最近一次「画面确实变了」的时刻
     NSTimeInterval _lastPushMono; // 上次真正推帧的时刻（fps 闸门用）
     double _prepMsAvg;            // 准备一帧（渲染+缩图+推帧）的滑窗平均耗时，闸门提前量用
+    double _pacePadSec;           // 节拍闭环：上一帧实际间隔与目标的差距，逐个微调
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
     // GPU 缩图（Core Image + Metal）：拿不到 Metal 就退回 vImage
@@ -352,7 +353,18 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         // minGap + prep，帧率就被白吃掉一截（30fps 预算实测只剩 25.7fps）。
         // 所以提前 prep 秒开工，让"推送完成"这一刻正好落在 minGap 边界上。
         double prep = MIN(_prepMsAvg / 1000.0, minGap);
-        if (now - _lastPushMono < minGap - prep - kPollSec * 0.5) { return; }
+        // 闭环：prep 只是估算，真实间隔靠上一帧实测来修，保证长期严格锁在 1/fps。
+        if (now - _lastPushMono < minGap - prep + _pacePadSec) { return; }
+    }
+
+    // 节拍闭环修正（在真正出帧前算，用的是上一帧的真实间隔）
+    {
+        double gap = now - _lastPushMono; // 上一帧到本帧的间隔
+        double target = 1.0 / (double)MAX(1, _activeFps);
+        if (gap > 0 && gap < 1.0) {
+            if (gap < target - 0.001) { _pacePadSec = MIN(_pacePadSec + (target - gap) * 0.5, target * 0.7); }
+            else if (gap > target + 0.002) { _pacePadSec = MAX(_pacePadSec - 0.001, 0.0); }
+        }
     }
 
     int slot = _cur;
