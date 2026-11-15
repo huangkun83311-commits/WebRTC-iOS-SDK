@@ -47,6 +47,7 @@ typedef void (*ActivateClientFn)(IOHIDEventSystemClientRef);
 typedef uint32_t (*GetTypeFn)(IOHIDEventRef);
 typedef uint64_t (*GetSenderIDFn)(IOHIDEventRef);
 typedef double (*GetFloatFn)(IOHIDEventRef, int32_t);
+typedef IOHIDEventRef (*CreateKeyboardEventFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, Boolean, uint32_t);
 
 // IOHIDEventField 数值（对照 AKUN include-spi/IOKitSPI.h 的枚举）
 #define kHIDFieldIsBuiltIn 4                                  // kIOHIDEventTypeNULL 基址 + 4
@@ -120,8 +121,6 @@ static const double kMinEventInterval = 0.012;
         if (!_client || !_createHand || !_createFinger || !_appendEvent || !_dispatch) {
             NSLog(@"[inject] 私有符号不全，注入功能不可用（看上面指针哪个是 0）");
         }
-
-        [self startEventMonitor:createWithType];
     }
     return self;
 }
@@ -277,10 +276,42 @@ static double clamp01(double v) {
     }
 }
 
+/// 对照实验：发一个硬件键盘事件（Consumer 页 Home 键）。
+/// 键盘事件走的也是 IOHIDEventSystemClientDispatchEvent，但构造简单得多：
+/// 如果键盘能生效、触摸不行，说明分发通道是通的，问题只在 digitizer 事件的构造。
+- (void)sendKeyboardHome {
+    CreateKeyboardEventFn createKey =
+        (CreateKeyboardEventFn)dlsym(RTLD_DEFAULT, "IOHIDEventCreateKeyboardEvent");
+    if (!createKey || !_dispatch || !_client) {
+        NSLog(@"[inject] 键盘事件不可用");
+        return;
+    }
+    for (int down = 1; down >= 0; down--) {
+        IOHIDEventRef key = createKey(kCFAllocatorDefault, mach_absolute_time(),
+                                      0x0C,      // kHIDPage_Consumer
+                                      0x223,     // kHIDUsage_Csmr_ACHome
+                                      down, 0);
+        if (!key) { continue; }
+        if (_setSenderID) { _setSenderID(key, kSenderID); }
+        IOHIDEventRef strong = (IOHIDEventRef)CFRetain(key);
+        IOHIDEventSystemClientRef client = _client;
+        DispatchEventFn send = _dispatch;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            send(client, strong);
+            CFRelease(strong);
+        });
+        CFRelease(key);
+        usleep(50000);
+    }
+    NSLog(@"[inject] 已发键盘 Home");
+}
+
 /// Home 手势：从下缘外往上滑，回桌面（坐标同样是 0~1）。
 - (void)dispatchKey:(NSString *)code {
     if (![code isKindOfClass:[NSString class]]) { return; }
     if ([code isEqualToString:@"home"]) {
+        [self sendKeyboardHome];          // 先走键盘 Home：用来判定分发通道是否可用
+    } else if ([code isEqualToString:@"home-swipe"]) {
         [self dispatchPhase:HID_PHASE_BEGAN x:0.5 y:0.995];
         [self dispatchPhase:HID_PHASE_MOVED x:0.5 y:0.85];
         [self dispatchPhase:HID_PHASE_ENDED x:0.5 y:0.75];
