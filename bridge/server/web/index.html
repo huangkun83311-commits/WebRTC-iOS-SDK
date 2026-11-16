@@ -478,6 +478,25 @@
   // 对标 AKUN 的 200~300ms；这里直接上报到 /api/client，不用靠肉眼猜。
   const tPage0 = performance.now();
   let firstFrameMs = -1;
+  let lastFrameAt = 0, gapMax = 0, gapMaxAt = 0;
+  // 每个页面一个短 id：日志里两个窗口同时上报时不会再互相污染（之前就踩过这个坑）
+  const TABID = Math.random().toString(36).slice(2, 6);
+  const IN_APP = /Doubao|MicroMessenger|aweme|ByteDance/i.test(navigator.userAgent);
+  // 卡屏自救：画面可见却 1.5 秒没新帧 → 自己跟服务端要一次关键帧，
+  // 服务端再喊手机立刻抓一帧。这样偶发的解码断链能自己爬起来，不用等人切窗口。
+  let kfAt = 0;
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') { return; }
+    const now = performance.now();
+    if (lastFrameAt > 0 && now - lastFrameAt > 1500 && now - kfAt > 1500) {
+      kfAt = now;
+      try {
+        if (videoWs && videoWs.readyState === 1) {
+          videoWs.send(JSON.stringify({ type: 'keyframe' }));
+        }
+      } catch (e) {}
+    }
+  }, 500);
   function onVF() {
     frames++; framesTotal++;
     if (firstFrameMs < 0) {
@@ -496,6 +515,13 @@
       $('hTapLog').textContent = '近 ' + tapHits.length + ' 次：' + tapHits.join(' / ') + ' ms';
     }
     const now = performance.now();
+    // 「突然卡屏」的量化：相邻两帧呈现的间隔。静止画面本来就 1 帧/2 秒，
+    // 所以判卡不能只看间隔，要配合「页面可见 + 之前 1 秒内有连续帧」。
+    if (lastFrameAt > 0) {
+      const gap = now - lastFrameAt;
+      if (gap > gapMax) { gapMax = gap; }
+    }
+    lastFrameAt = now;
     if (now - lastTs >= 1000) {
       $('fps').textContent = frames + ' fps';
       frames = 0; lastTs = now;
@@ -569,7 +595,8 @@
             lost: lost, lostPct: +lostPct.toFixed(2), jitter: jit, buf: bufMs, dec: decMs,
             drop: inb.framesDropped || 0, freeze: inb.freezeCount || 0,
             nack: inb.nackCount || 0, pli: inb.pliCount || 0, rtt: rtt,
-            tapMs: tapHits.length ? tapHits[tapHits.length - 1] : null, ff: firstFrameMs
+            tapMs: tapHits.length ? tapHits[tapHits.length - 1] : null, ff: firstFrameMs,
+            gapMax: Math.round(gapMax), tab: TABID, vis: document.visibilityState, inapp: IN_APP
           }) });
       } catch (e) {}
     } catch (e) {}

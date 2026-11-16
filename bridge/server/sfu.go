@@ -486,6 +486,10 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 					log.Printf("sfu room=%s 手机已接受收流协商", room)
 				}
 			}
+		case "keyframe":
+			// 观看端自己发现卡住了（或刚唤醒）→ 要一次关键帧，同时喊手机立刻抓一帧。
+			s.requestKeyframe(rm)
+			kickFrame(room)
 		case "candidate":
 			idx := uint16(msg.SdpMLineIndex)
 			_ = pc.AddICECandidate(webrtc.ICECandidateInit{
