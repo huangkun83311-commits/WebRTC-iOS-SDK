@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/ice/v4"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -83,6 +85,38 @@ type sfuPeer struct {
 	pc   *webrtc.PeerConnection
 
 	outMu sync.Mutex // 保护 conn 写
+
+	// 候选缓存：ICE 的 trickle 候选往往在 answer 之前就产生，此时对端还没
+	// SetRemoteDescription，直接发过去会被对端丢弃（pion/浏览器都报
+	// remote description is not set），于是公网候选永远进不去、画面黑屏。
+	// 做法：answer 之前先攒着，answer 发出去之后再按顺序补发。
+	candMu   sync.Mutex
+	candSent bool
+	candBuf  []map[string]interface{}
+}
+
+// sendCand 发送一条 ICE 候选；answer 发出前先缓存，避免对端还没 remote description。
+func (p *sfuPeer) sendCand(m map[string]interface{}) {
+	p.candMu.Lock()
+	if !p.candSent {
+		p.candBuf = append(p.candBuf, m)
+		p.candMu.Unlock()
+		return
+	}
+	p.candMu.Unlock()
+	_ = p.sendJSON(m)
+}
+
+// flushCand 在 answer 之后调用：把攒下的候选一次性补发，并切成直发模式。
+func (p *sfuPeer) flushCand() {
+	p.candMu.Lock()
+	p.candSent = true
+	buf := p.candBuf
+	p.candBuf = nil
+	p.candMu.Unlock()
+	for _, m := range buf {
+		_ = p.sendJSON(m)
+	}
 }
 
 func (p *sfuPeer) sendJSON(v interface{}) error {
@@ -197,10 +231,40 @@ func newMediaEngine() *webrtc.MediaEngine {
 	return me
 }
 
+var (
+	// iceUDPMux 把服务器所有 peer 的 ICE UDP 收发包固定到一个端口，
+	// 这样外网可以用一条 frp udp 映射（106.52.43.129:6900 -> 本机 6900）承载媒体。
+	iceUDPMux  ice.UDPMux
+	iceUDPPort int
+	// icePublicIP 是那条映射在公网上的地址，会作为额外 host candidate 播给浏览器。
+	icePublicIP string
+)
+
+// initICE 在启动时调用：固定 ICE UDP 端口（0=不固定，保持原来随机端口的局域网行为）。
+func initICE(udpPort int, publicIP string) {
+	icePublicIP = publicIP
+	if udpPort <= 0 {
+		return
+	}
+	// 绑 0.0.0.0 而不是 127.0.0.1：局域网观看端仍要能用 192.168.x.x:6900 直连，
+	// 绑回环会把局域网这条路掐死。
+	conn, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", udpPort))
+	if err != nil {
+		log.Printf("[ice] 绑定 UDP %d 失败: %v", udpPort, err)
+		return
+	}
+	iceUDPMux = ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: conn})
+	iceUDPPort = udpPort
+	log.Printf("[ice] ICE UDP 固定端口 %d，公网播报 %s", udpPort, publicIP)
+}
+
 func newPeer() (*webrtc.PeerConnection, error) {
 	se := webrtc.SettingEngine{}
 	// 局域网场景：host candidate 直连即可，账号不发 mDNS，避免某些端解析不到 .local。
 	se.SetICEMulticastDNSMode(0) // 0 = disabled
+	if iceUDPMux != nil {
+		se.SetICEUDPMux(iceUDPMux)
+	}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(newMediaEngine()), webrtc.WithSettingEngine(se))
 	return api.NewPeerConnection(webrtc.Configuration{})
 }
@@ -223,17 +287,30 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 	}
 	p.pc = pc
 
+	publicCandSent := false
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
 		j := c.ToJSON()
-		_ = p.sendJSON(map[string]interface{}{
+		p.sendCand(map[string]interface{}{
 			"type":          "candidate",
 			"candidate":     j.Candidate,
 			"sdpMid":        j.SDPMid,
 			"sdpMLineIndex": j.SDPMLineIndex,
 		})
+		// 额外补一条"公网映射"候选：只有当 ICE UDP 固定端口 + 公网 IP 都配了才发。
+		// 浏览器同时拿到内网 192.168.x.x:6900 和公网 106.52.43.129:6900，谁通走谁。
+		if icePublicIP != "" && iceUDPPort > 0 && !publicCandSent {
+			publicCandSent = true
+			p.sendCand(map[string]interface{}{
+				"type":          "candidate",
+				"candidate":     fmt.Sprintf("candidate:99 1 udp 2130706431 %s %d typ host", icePublicIP, iceUDPPort),
+				"sdpMid":        j.SDPMid,
+				"sdpMLineIndex": j.SDPMLineIndex,
+			})
+			log.Printf("[ice] 已补发公网候选 %s:%d", icePublicIP, iceUDPPort)
+		}
 	})
 
 	var vw *viewer
@@ -461,6 +538,8 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 			}
 			<-gather
 			_ = p.sendJSON(map[string]interface{}{"type": "answer", "sdp": pc.LocalDescription().SDP})
+			// answer 已发，对端可以 SetRemoteDescription 了，这时候补发攒下的候选。
+			p.flushCand()
 			log.Printf("sfu room=%s role=%s 已回 answer", room, role)
 			// 新观看端进来后：① RTCP PLI 要一个关键帧；② 直接喊手机抓一帧 ——
 			// 只发 PLI 是不够的，编码器要等「下一帧输入」才吐 IDR，静止画面下那帧要等 2 秒保活。

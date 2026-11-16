@@ -381,8 +381,13 @@ func main() {
 	discPort := flag.Int("disc", 19951, "UDP 自动发现端口，0 表示关闭")
 	// -key：授权密钥。不给就是局域网免验证（现在的用法）；给了以后所有连接必须带 ?k=
 	key := flag.String("key", "", "授权密钥；设置后 WS 必须带 ?k=（/api/auth 可生成一房一码的临时链接）")
+	// -iceudp / -publicip：外网授权时把媒体固定到一个可映射的 UDP 端口，
+	// 并把这个 UDP 端口在公网上的地址作为额外候选播给浏览器（frp udp 映射）。
+	iceUDP := flag.Int("iceudp", 0, "固定 ICE UDP 端口（0=随机，局域网用法保持不变）")
+	pubIP := flag.String("publicip", "", "ICE 公网播报地址，例如 106.52.43.129；留空不播")
 	flag.Parse()
 	authSecret = *key
+	initICE(*iceUDP, *pubIP)
 
 	h := newHub()
 	h.profiles = map[string]map[string]interface{}{}
