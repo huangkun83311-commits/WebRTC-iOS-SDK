@@ -204,7 +204,7 @@
 
   /* ---------------- 视频：WebSocket 信令 + WebRTC ---------------- */
   function startVideo(room) {
-    videoWs = new WebSocket(WS_BASE + '/ws?room=video-' + encodeURIComponent(room) + '&role=viewer');
+    videoWs = new WebSocket(WS_BASE + '/ws?room=video-' + encodeURIComponent(room) + '&role=viewer' + (AUTH_K ? '&k=' + encodeURIComponent(AUTH_K) : ''));
 
     videoWs.onopen = () => {
       log('video signaling open');
@@ -337,7 +337,7 @@
   let rttMs = null;   // 控制链路往返时延（网页↔中继↔设备），用来判断「点击迟钝」是不是链路问题
 
   function startControl(room) {
-    ctrlWs = new WebSocket(WS_BASE + '/ws?room=ctrl-' + encodeURIComponent(room) + '&role=pc');
+    ctrlWs = new WebSocket(WS_BASE + '/ws?room=ctrl-' + encodeURIComponent(room) + '&role=pc' + (AUTH_K ? '&k=' + encodeURIComponent(AUTH_K) : ''));
 
     ctrlWs.onopen = () => {
       setDot($('ctrlDot'), true);
@@ -722,6 +722,8 @@
 
   /* ---------------- 按钮 ---------------- */
   $('connect').onclick = () => {
+  // 授权码：URL 里的 ?k= 原样透传给两条 WS，服务端校验
+  const AUTH_K = new URLSearchParams(location.search).get('k') || '';
     const room = ($('room').value || 'dev001').trim();
     stopAll();
     startVideo(room);

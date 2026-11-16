@@ -55,6 +55,7 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     IOSurfaceRef _surfaces[2];
     CVPixelBufferRef _pixelBuffers[2];
     int _cur;
+    CVPixelBufferRef _lastScaled;      // 上一帧缩放后的图（静态心跳复用，省掉抓屏+缩图）
     BOOL _running;
     // 缩图用：目标尺寸 + 缓冲池（每帧复用，不反复 malloc）
     CVPixelBufferPoolRef _pool;
@@ -402,7 +403,12 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     double minGapClamp = 1.0 / (double)(fpsNow + 2);
     double gapNeed = MAX(minGap - prep, minGapClamp);
     BOOL timeOk = (now - _lastPushMono >= gapNeed + _pacePadSec);
-    BOOL keepaliveDue = (now - _lastPushTime >= 2.0);
+    // 心跳帧：原来静止 2 秒才保活一帧，接收端浏览器会把"帧不来了"记成 freeze
+    // （freezeCount + totalFreezesDuration），jitter buffer 也会被养到 50ms+；
+    // 而且静止时画面最多滞后 2 秒。改成 0.15s 一帧"重复上一帧"的极小 P 帧：
+    // 接收端永远有帧、缓冲收窄、画面永远新鲜，代价只有编码器空跑（无抓屏无缩图）。
+    const double kHeartbeatSec = 0.150;
+    BOOL keepaliveDue = (now - _lastPushTime >= kHeartbeatSec);
     // 「唤醒即发」：长时间静止后画面第一次变化（= 用户点了、开了应用），
     // 不排队等下一拍，只要流水线已经空出来就立刻出帧 —— 这一帧省掉最多半个帧间隔。
     // 注意：静止期间允许按「流水线空闲」的节奏去查脏图（约 cost 一次，16ms），
@@ -454,8 +460,9 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     // 判定「正在动」还是「静止」：最近 0.5s 内变过就算在动（视频/游戏里某一 tick 恰好没变不算静止）。
     // 在动 -> 按 fps 闸门满速推；静止 -> 只保留 2s 一帧保活，上行几乎归零。
     BOOL idle = (!changed && (now - _lastChangeMono) > 0.5);
+    BOOL heartbeat = idle;
     if (idle) {
-        if (now - _lastPushTime < 2.0) { return; }
+        if (now - _lastPushTime < kHeartbeatSec) { return; }
     } else {
         if (!timeOk) {
             // 只有「从静止被唤醒并且真的变了」的那一帧才允许插队，持续动画仍受 fps 闸门管。
@@ -483,6 +490,21 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
         }
     }
 
+    // 心跳帧：画面没变，直接把上一帧缩放结果再送一次编码器。
+    // 抓屏(surface 渲染) + 缩图 一帧要 20ms，静止期每秒 6 次就是 120ms CPU；
+    // 复用同一张图只剩编码器开销（实测一帧空 P 帧 2~4ms）。
+    if (heartbeat && _lastScaled) {
+        CVPixelBufferRef again = (CVPixelBufferRef)CVPixelBufferRetain(_lastScaled);
+        if (again && self.frameHandler) { self.frameHandler(again); }
+        if (again) { CVPixelBufferRelease(again); }
+        _lastPushTime = CACurrentMediaTime();
+        _lastPushMono = _lastPushTime;
+        _perfFrames++;              // 心跳也计一次，但下面只累加推帧耗时（其它列保持原值）
+        _pushMsSum += (CACurrentMediaTime() - _lastPushTime) * 1000.0;
+        [self finishPerfWindowIfNeeded:_lastPushTime];
+        return;
+    }
+
     int slot = _cur;
     IOSurfaceRef surface = _surfaces[slot];
     CVPixelBufferRef pbuf = _pixelBuffers[slot];
@@ -507,6 +529,10 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
 
     CVPixelBufferRef out = [self scaleFrame:pbuf];
     NSTimeInterval t2 = CACurrentMediaTime();
+    if (out) {
+        if (_lastScaled) { CVPixelBufferRelease(_lastScaled); }
+        _lastScaled = (CVPixelBufferRef)CVPixelBufferRetain(out);
+    }
     if (out && self.frameHandler) { self.frameHandler(out); }
     if (out) { CVPixelBufferRelease(out); }
     NSTimeInterval t3 = CACurrentMediaTime();

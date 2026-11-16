@@ -137,6 +137,12 @@ func (h *hub) notify(c *client, typ string) {
 }
 
 func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
+	// 对外授权：开了 -key 就必须带有效令牌，看画面、控件、推流三条通道一起管。
+	if !authOK(r) {
+		log.Printf("拒绝未授权连接 room=%s ip=%s", r.URL.Query().Get("room"), r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusForbidden)
+		return
+	}
 	room := r.URL.Query().Get("room")
 	role := r.URL.Query().Get("role")
 	if room == "" {
@@ -373,13 +379,17 @@ func roundKbps(v float64) int { return int(v/10) * 10 }
 func main() {
 	addr := flag.String("addr", ":8080", "监听地址，例如 :8080")
 	discPort := flag.Int("disc", 19951, "UDP 自动发现端口，0 表示关闭")
+	// -key：授权密钥。不给就是局域网免验证（现在的用法）；给了以后所有连接必须带 ?k=
+	key := flag.String("key", "", "授权密钥；设置后 WS 必须带 ?k=（/api/auth 可生成一房一码的临时链接）")
 	flag.Parse()
+	authSecret = *key
 
 	h := newHub()
 	h.profiles = map[string]map[string]interface{}{}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
+	mux.HandleFunc("/api/auth", handleAuth)
 	mux.HandleFunc("/api/rooms", h.handleRooms)
 	// 设备端自动发现的身份校验：只有回出 app=akun-bridge 的地址才算我们的服务，
 	// 避免把路由器管理页 / 别的 8080 服务当成信令端。
