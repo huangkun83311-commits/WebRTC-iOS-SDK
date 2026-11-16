@@ -197,6 +197,9 @@
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return proto + '//' + location.host;
   })();
+  // 授权码：URL 里的 ?k= 原样透传给两条 WS（服务端 -key 模式校验）；必须定义在顶层，
+  // 否则 startVideo/startControl 引用不到（之前插进 connect 回调里，点了连接直接 ReferenceError）
+  const AUTH_K = new URLSearchParams(location.search).get('k') || '';
 
   function setDot(el, on) { el.classList.toggle('on', !!on); }
 
@@ -722,8 +725,6 @@
 
   /* ---------------- 按钮 ---------------- */
   $('connect').onclick = () => {
-  // 授权码：URL 里的 ?k= 原样透传给两条 WS，服务端校验
-  const AUTH_K = new URLSearchParams(location.search).get('k') || '';
     const room = ($('room').value || 'dev001').trim();
     stopAll();
     startVideo(room);
