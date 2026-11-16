@@ -145,22 +145,9 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	log.Printf("join room=%s role=%s peers=%d", room, role, n)
 	h.notify(c, "_peerJoined")
 
-	// 设备控制通道（ctrl-xxx）一连上就把它所在房间的档位套一遍：
-	// 这样「授权档 / 中控档」在设备重连、换机、重启后都自动恢复，
-	// 不需要人工再点一次参数，正是用户要的"授权时按档次下发、平常用插件默认"。
-	if strings.HasPrefix(room, "ctrl-") {
-		dev := strings.TrimPrefix(room, "ctrl-")
-		h.mu.RLock()
-		prof := h.profiles[dev]
-		h.mu.RUnlock()
-		if prof != nil {
-			if payload, err := json.Marshal(prof); err == nil {
-				if err := c.send(payload); err == nil {
-					log.Printf("应用存档档位 room=%s %s", dev, payload)
-				}
-			}
-		}
-	}
+	// 档位只在"有人主动下发"时生效，连上不自动重发。
+	// 理由：中控台打开一台机时不能悄悄改掉它在用的参数（云控授权刚设的低清档
+	// 要一直保持到人工改回）。参数本身存在设备端，重连不会丢。
 
 	defer func() {
 		h.leave(c)
