@@ -335,6 +335,15 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     }
 
     NSTimeInterval now = CACurrentMediaTime();
+
+    // 先做「该不该出帧」的时间判断，再查脏图：_dirtyFrameCount 是系统调用，
+    // 2ms 轮询下每秒 500 次会把渲染拖慢（实测 6ms → 19ms）。时间没到就绝不查脏。
+    double minGap = 1.0 / (double)MAX(1, _activeFps);
+    double prep = MIN(_prepMsAvg / 1000.0, minGap * 0.9);
+    BOOL timeOk = (now - _lastPushMono >= minGap - prep + _pacePadSec);
+    BOOL keepaliveDue = (now - _lastPushTime >= 2.0);
+    if (!timeOk && !keepaliveDue) { return; }
+
     BOOL changed = YES;
     if (_dirtyFrameCount) {
         CFIndex c = _dirtyFrameCount(NULL);
@@ -348,13 +357,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     if (idle) {
         if (now - _lastPushTime < 2.0) { return; }
     } else {
-        double minGap = 1.0 / (double)MAX(1, _activeFps);
-        // 关键：抓一帧本身要花 prep 毫秒，如果只在到点后才开始渲染，实际出帧周期会变成
-        // minGap + prep，帧率就被白吃掉一截（30fps 预算实测只剩 25.7fps）。
-        // 所以提前 prep 秒开工，让"推送完成"这一刻正好落在 minGap 边界上。
-        double prep = MIN(_prepMsAvg / 1000.0, minGap);
-        // 闭环：prep 只是估算，真实间隔靠上一帧实测来修，保证长期严格锁在 1/fps。
-        if (now - _lastPushMono < minGap - prep + _pacePadSec) { return; }
+        // 时间闸门（含 prep 提前量与闭环修正）已在函数开头判过，这里只保留语义分支。
+        if (!timeOk) { return; }
     }
 
     // 节拍闭环修正（在真正出帧前算，用的是上一帧的真实间隔）
@@ -421,7 +425,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0;
     _perfWindowStart = now;
 
-    if (costMs > budgetMs * 0.7) {
+    if (costMs > budgetMs * 0.85) {
         _lowStreak++; _highStreak = 0;
         if (_lowStreak >= 2 && _activeFps > 8) {
             int v = MAX(8, _activeFps - 3);
@@ -429,7 +433,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
             [self applyTimerFps:v];
             NSLog(@"[perf] 单帧耗时超预算，抓屏降到 %d fps（稳帧优先）", v);
         }
-    } else if (costMs < budgetMs * 0.45) {
+    } else if (costMs < budgetMs * 0.55) {
         _highStreak++; _lowStreak = 0;
         if (_highStreak >= 3 && _activeFps < _fps) {
             int v = MIN(_fps, _activeFps + 2);
