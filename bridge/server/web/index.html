@@ -25,6 +25,21 @@
   .hint { color: #6e7681; font-size: 12px; }
   #peers { color: #8b949e; font-size: 12px; }
   .ver{font-size:11px;color:#889;margin-left:8px}
+  /* 数据面板：排障时要一眼看出卡在哪一段（网络？解码？缓冲？还是链路本身） */
+  #hud{position:fixed;right:14px;top:58px;width:268px;background:rgba(13,17,23,.94);border:1px solid #2b333f;
+       border-radius:10px;padding:10px 12px;font:12px/1.7 ui-monospace,Consolas,monospace;z-index:20;
+       box-shadow:0 6px 24px rgba(0,0,0,.5)}
+  #hud.hide{display:none}
+  #hud h4{margin:0 0 6px;font:600 12px/1.4 -apple-system,"Microsoft Yahei",sans-serif;color:#8b949e;letter-spacing:.5px}
+  #hud .row{display:flex;justify-content:space-between;gap:8px}
+  #hud .row span:first-child{color:#7d8590}
+  #hud .v{color:#e6e9ef;font-weight:600}
+  #hud .bad{color:#f85149}
+  #hud .ok{color:#3fb950}
+  #hud .warn{color:#d29922}
+  #hud hr{border:0;border-top:1px solid #21262d;margin:7px 0}
+  #hud .tap{color:#8b949e}
+  #hud .tap b{color:#58a6ff}
 </style>
 </head>
 <body>
@@ -42,7 +57,8 @@
     <option value="0.30,24,400000">极省 · 多机并发 0.30 / 24fps / 0.4M</option>
     <option value="0.45,25,1200000">看字优先 0.45 / 25fps / 1.2M</option>
   </select>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v3 · 默认30fps/0.7M</span>
+  <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v4 · 全量数据</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -50,6 +66,24 @@
     <span id="fps">--</span>
     <span id="stat"></span>
   </span>
+</div>
+
+<div id="hud" class="hide">
+  <h4>链路数据</h4>
+  <div class="row"><span>分辨率</span><span class="v" id="hRes">--</span></div>
+  <div class="row"><span>收到帧率</span><span class="v" id="hFps">--</span></div>
+  <div class="row"><span>码率</span><span class="v" id="hKbps">--</span></div>
+  <div class="row"><span>丢包</span><span class="v" id="hLost">--</span></div>
+  <div class="row"><span>抖动 jitter</span><span class="v" id="hJit">--</span></div>
+  <div class="row"><span>缓冲深度</span><span class="v" id="hBuf">--</span></div>
+  <div class="row"><span>解码耗时</span><span class="v" id="hDec">--</span></div>
+  <div class="row"><span>丢帧/冻结</span><span class="v" id="hFreeze">--</span></div>
+  <div class="row"><span>重传 NACK</span><span class="v" id="hNack">--</span></div>
+  <div class="row"><span>链路 RTT</span><span class="v" id="hRtt">--</span></div>
+  <hr />
+  <h4>跟手实测（本机）</h4>
+  <div class="row"><span>点击→画面变化</span><span class="v" id="hTap">--</span></div>
+  <div class="tap" id="hTapLog">按下游画面里点击一次即可测</div>
 </div>
 
 <div class="stage is-idle" id="stage">
@@ -259,6 +293,7 @@
     dragging = false;
     const p = norm(ev);
     pressStart = { x: p.x, y: p.y, t: performance.now() };
+    startTapProbe();   // 记录此刻画面，等它真的变了就把差值算成「跟手延迟」
     // 按下就立刻把 touchDown 发下去：点按的起手延迟不再依赖松手时刻（AKUN 的 ptrAddEvent 也是这样）
     ctrl({ t: 'd', x: p.x, y: p.y });
   });
@@ -318,26 +353,114 @@
   if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVF);
   else setInterval(() => { $('fps').textContent = '--'; }, 2000);
 
-  /* ---------------- 链路指标（分辨率/码率/丢包），排障时一眼看出是带宽被限还是编码在缩 ---------------- */
-  let lastBytes = 0, lastStatTs = 0;
+  /* ---------------- 链路指标全量采集 ---------------- */
+  let lastBytes = 0, lastStatTs = 0, rttFromPair = null;
+  function setV(id, text, cls) {
+    const el = $(id); if (!el) return;
+    el.textContent = text;
+    el.className = 'v' + (cls ? ' ' + cls : '');
+  }
   setInterval(async () => {
     if (!pc || !pc.getStats) return;
     try {
       const stats = await pc.getStats();
-      let line = '';
+      let inb = null, pair = null;
       stats.forEach(r => {
-        if (r.type === 'inbound-rtp' && r.kind === 'video') {
-          const now = r.timestamp || performance.now();
-          const dt = lastStatTs ? (now - lastStatTs) / 1000 : 0;
-          const kbps = dt > 0 ? ((r.bytesReceived - lastBytes) * 8 / 1000 / dt) : 0;
-          lastBytes = r.bytesReceived; lastStatTs = now;
-          line = `${r.frameWidth || 0}x${r.frameHeight || 0} ${Math.round(kbps)}kbps 丢${r.packetsLost || 0}`
-               + (rttMs !== null ? ` 延迟${Math.round(rttMs)}ms` : '');
+        if (r.type === 'inbound-rtp' && r.kind === 'video') inb = r;
+        if (r.type === 'candidate-pair' && (r.selected || r.state === 'succeeded')) {
+          if (r.currentRoundTripTime != null) pair = r;
         }
       });
-      if (line) $('stat').textContent = line;
+      if (pair && pair.currentRoundTripTime != null) rttFromPair = Math.round(pair.currentRoundTripTime * 1000);
+      if (!inb) return;
+
+      const now = inb.timestamp || performance.now();
+      const dt = lastStatTs ? (now - lastStatTs) / 1000 : 0;
+      const kbps = dt > 0 ? ((inb.bytesReceived - lastBytes) * 8 / 1000 / dt) : 0;
+      lastBytes = inb.bytesReceived; lastStatTs = now;
+
+      const w = inb.frameWidth || 0, h = inb.frameHeight || 0;
+      const lost = inb.packetsLost || 0;
+      const recv = inb.packetsReceived || 0;
+      const lostPct = (lost + recv) > 0 ? (lost / (lost + recv) * 100) : 0;
+      const jit = inb.jitter != null ? Math.round(inb.jitter * 1000) : null;
+      const bufMs = (inb.jitterBufferDelay != null && inb.jitterBufferEmittedCount)
+        ? Math.round(inb.jitterBufferDelay / inb.jitterBufferEmittedCount * 1000) : null;
+      const decMs = (inb.totalDecodeTime != null && inb.framesDecoded)
+        ? (inb.totalDecodeTime / inb.framesDecoded * 1000) : null;
+      const rtt = rttFromPair != null ? rttFromPair : rttMs;
+
+      setV('hRes', w && h ? (w + 'x' + h) : '--');
+      setV('hFps', inb.framesPerSecond != null ? (inb.framesPerSecond + ' fps') : '--',
+           inb.framesPerSecond >= 25 ? 'ok' : (inb.framesPerSecond >= 15 ? 'warn' : 'bad'));
+      setV('hKbps', Math.round(kbps) + ' kbps');
+      setV('hLost', lost + (lostPct > 0.001 ? '（' + lostPct.toFixed(1) + '%）' : '') + ' pkt',
+           lostPct > 3 ? 'bad' : (lostPct > 1 ? 'warn' : 'ok'));
+      setV('hJit', jit != null ? jit + ' ms' : '--', jit > 60 ? 'warn' : '');
+      setV('hBuf', bufMs != null ? bufMs + ' ms' : '--', bufMs > 100 ? 'warn' : 'ok');
+      setV('hDec', decMs != null ? decMs.toFixed(1) + ' ms/帧' : '--', decMs > 20 ? 'warn' : '');
+      setV('hFreeze', (inb.framesDropped || 0) + ' 丢 / ' + (inb.freezeCount || 0) + ' 冻'
+           + ((inb.totalFreezesDuration || 0) > 0.5 ? '（冻 ' + (inb.totalFreezesDuration).toFixed(1) + 's）' : ''),
+           (inb.freezeCount || 0) > 0 ? 'warn' : 'ok');
+      setV('hNack', (inb.nackCount || 0) + ' / PLI ' + (inb.pliCount || 0));
+      setV('hRtt', rtt != null ? rtt + ' ms' : '--', rtt > 150 ? 'bad' : (rtt > 60 ? 'warn' : 'ok'));
+
+      const line = `${w}x${h} ${Math.round(kbps)}kbps 丢${lost}${rtt != null ? ' 延迟' + rtt + 'ms' : ''}`;
+      $('stat').textContent = line;
     } catch (e) {}
-  }, 2000);
+  }, 1000);
+
+  /* ---------------- 跟手实测：点击那一刻 → 画面真的变了 ---------------- */
+  const probe = document.createElement('canvas');
+  probe.width = 16; probe.height = 16;
+  const pctx = probe.getContext('2d', { willReadFrequently: true });
+  let tapT0 = 0, tapSig0 = null, tapMeasuring = false, tapHits = [];
+
+  function sampleSig() {
+    if (!video.videoWidth) return null;
+    try {
+      pctx.drawImage(video, 0, 0, 16, 16);
+      return pctx.getImageData(0, 0, 16, 16).data;
+    } catch (e) { return null; }
+  }
+  function sigDiff(a, b) {
+    if (!a || !b) return 0;
+    let s = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+    }
+    return s;
+  }
+  function startTapProbe() {
+    tapSig0 = sampleSig();
+    if (!tapSig0) return;
+    tapT0 = performance.now();
+    tapMeasuring = true;
+  }
+  (function tapLoop() {
+    requestAnimationFrame(tapLoop);
+    if (!tapMeasuring) return;
+    const cur = sampleSig();
+    const now = performance.now();
+    if (cur && sigDiff(cur, tapSig0) > 500) {
+      tapMeasuring = false;
+      const ms = Math.round(now - tapT0);
+      tapHits.push(ms); if (tapHits.length > 10) tapHits.shift();
+      const avg = Math.round(tapHits.reduce((a, b) => a + b, 0) / tapHits.length);
+      setV('hTap', ms + ' ms（均 ' + avg + '）', ms > 250 ? 'bad' : (ms > 150 ? 'warn' : 'ok'));
+      $('hTapLog').textContent = '近 ' + tapHits.length + ' 次：' + tapHits.join(' / ') + ' ms';
+    } else if (now - tapT0 > 2000) {
+      tapMeasuring = false;
+      $('hTapLog').textContent = '这一次画面没变（点的地方可能本来就没变化）';
+    }
+  })();
+
+  /* ---------------- 面板开关 ---------------- */
+  function toggleHud() { $('hud').classList.toggle('hide'); }
+  $('hudBtn').onclick = toggleHud;
+  window.addEventListener('keydown', (ev) => {
+    if (ev.key === 'd' || ev.key === 'D') toggleHud();
+  });
 
   /* ---------------- 按钮 ---------------- */
   $('connect').onclick = () => {
