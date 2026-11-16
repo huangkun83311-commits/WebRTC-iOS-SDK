@@ -9,6 +9,7 @@
 //  _unjailedReferenceBoundsInPixels（1080x1920）再喂 HID，所以网页来的 0~1 要先乘回来。
 
 #import "AkunInjector.h"
+#import "AkunCapture.h"
 
 // 全局：最后一次触摸注入的时刻（给抓屏侧算「点击→出帧」用）
 double gLastInputMono = 0.0;
@@ -442,7 +443,21 @@ static double clamp01(double v) {
         return @{ @"success" : @YES, @"key" : k };
     }
     if ([a isEqualToString:@"screenshot"]) {
-        return @{ @"success" : @NO, @"error" : @"screenshot 暂未接入（画面走 WebRTC，不重复截屏）" };
+        // 与 AKUN 19940 对齐：{"action":"screenshot","quality":75}，回 base64 图片
+        double q = 0.6;
+        if (cmd[@"quality"]) {
+            q = [cmd[@"quality"] doubleValue];
+            if (q > 1.0) { q = q / 100.0; }   // AKUN 传 0~100，这里也认 0~1
+        }
+        double sc = 0.5;
+        if (cmd[@"scale"]) { sc = [cmd[@"scale"] doubleValue]; }
+        AkunCapture *cap = self.capture;
+        if (!cap) { return @{ @"success" : @NO, @"error" : @"screenshot: 采集未就绪" }; }
+        NSData *jpeg = [cap snapshotJPEGWithScale:sc quality:q];
+        if (!jpeg) { return @{ @"success" : @NO, @"error" : @"screenshot: 渲染失败" }; }
+        NSString *b64 = [jpeg base64EncodedStringWithOptions:0];
+        return @{ @"success" : @YES, @"format" : @"jpeg", @"data" : b64,
+                  @"bytes" : @(jpeg.length), @"scale" : @(sc) };
     }
     return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"unhandled action: %@", a] };
 }

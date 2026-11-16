@@ -137,6 +137,7 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
 
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
+    self.injector.capture = self.capture;   // 截图指令用采集层渲染，弱引用
     self.capture.fps = fps;
     // 抓屏按「整屏原始像素」渲染（surface 小于屏幕时 CARenderServer 是裁切不是缩放），
     // 缩图由抓屏层用 vImage 一次做完，编码器只管编码 → 省下每帧一次 2.7MP 的缩放+转码，卡顿的主要来源。

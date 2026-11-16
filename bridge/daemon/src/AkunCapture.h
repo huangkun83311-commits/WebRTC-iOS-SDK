@@ -33,6 +33,10 @@
 - (BOOL)start;
 - (void)stop;
 
+/// 抓一张当前屏幕的静帧（JPEG）。scale=1 是屏幕原生像素，quality 0~1。
+/// 中控的截图指令走这里：独立建一块临时 surface 渲染，不干扰推流那条双缓冲。
+- (NSData *)snapshotJPEGWithScale:(double)scale quality:(double)quality;
+
 @end
 
 #endif

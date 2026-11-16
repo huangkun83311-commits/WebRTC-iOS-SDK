@@ -617,4 +617,53 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     }
 }
 
+
+#pragma mark - 静帧截图（中控 screenshot 指令）
+
+- (NSData *)snapshotJPEGWithScale:(double)scale quality:(double)quality {
+    if (!_renderDisplay) { return nil; }
+    CGSize sp = [self screenPixelSize];
+    NSUInteger w = (NSUInteger)sp.width, h = (NSUInteger)sp.height;
+    if (w == 0 || h == 0) { return nil; }
+    if (scale <= 0.0) { scale = 0.5; }
+    if (scale > 1.0) { scale = 1.0; }
+    if (quality <= 0.0 || quality > 1.0) { quality = 0.6; }
+
+    // 渲染服务器只认「屏幕原生尺寸」，缩放在后面走 Core Image，直接给小块尺寸会被裁掉一角。
+    CVPixelBufferRef pb = NULL;
+    NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+                            (id)kCVPixelBufferWidthKey : @(w),
+                            (id)kCVPixelBufferHeightKey : @(h),
+                            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)};
+    CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                                      (__bridge CFDictionaryRef)attrs, &pb);
+    if (cr != kCVReturnSuccess || !pb) {
+        NSLog(@"[capture] 截图 CVPixelBufferCreate 失败 cr=%d", (int)cr);
+        return nil;
+    }
+    IOSurfaceRef sf = CVPixelBufferGetIOSurface(pb);
+    if (!sf) { CVPixelBufferRelease(pb); return nil; }
+    _renderDisplay(0, CFSTR("LCD"), sf, 0, 0);
+
+    CIImage *img = [CIImage imageWithCVPixelBuffer:pb];
+    if (scale < 0.999) {
+        img = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+    }
+    CIContext *ctx = [self ciContext];
+    CGImageRef cg = nil;
+    if (ctx) { cg = [ctx createCGImage:img fromRect:img.extent]; }
+    if (!cg) {
+        // 没 Metal 就退回软件渲染，慢一点但截图是低频操作
+        cg = [[CIContext contextWithOptions:nil] createCGImage:img fromRect:img.extent];
+    }
+    CVPixelBufferRelease(pb);
+    if (!cg) { return nil; }
+    UIImage *ui = [UIImage imageWithCGImage:cg];
+    NSData *jpeg = UIImageJPEGRepresentation(ui, quality);
+    CGImageRelease(cg);
+    NSLog(@"[capture] 截图 %.0fx%.0f scale=%.2f q=%.2f %luB", ui.size.width, ui.size.height,
+          scale, quality, (unsigned long)jpeg.length);
+    return jpeg;
+}
+
 @end
