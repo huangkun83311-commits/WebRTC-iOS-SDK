@@ -419,8 +419,9 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double budgetMs = 1000.0 / (double)_activeFps;
 
     double allocMs = _allocMsSum / n;
-    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms",
-          realFps, allocMs, renderMs, scaleMs, pushMs, costMs, budgetMs);
+    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms | 闸门 pad=%.1fms prep=%.1fms 帧距=%.1fms",
+          realFps, allocMs, renderMs, scaleMs, pushMs, costMs, budgetMs,
+          _pacePadSec * 1000.0, _prepMsAvg, (n > 0 ? span / n * 1000.0 : 0));
 
     _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0;
     _perfWindowStart = now;
