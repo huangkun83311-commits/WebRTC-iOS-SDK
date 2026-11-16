@@ -41,6 +41,8 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
 @property (nonatomic, assign) double cfgScale;
 @property (nonatomic, assign) int cfgFps;
 @property (nonatomic, assign) NSInteger cfgBitrate;
+// 单台硬上限（含突发窗口）：0 表示不限。用户要求"单台最高 1.2M/1.5M"时由中控下发 cap=…
+@property (nonatomic, assign) NSInteger cfgHardCap;
 @end
 
 @implementation AkunDaemon
@@ -131,6 +133,7 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
           scale, fps, (long)maxBitrate);
 
     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = maxBitrate;
+    self.cfgHardCap = 0;
 
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
@@ -149,7 +152,8 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
         m[@"t"] = @"metrics";
         m[@"cap"] = cap;
         m[@"rtc"] = rtc;
-        m[@"cfg"] = @{@"fps" : @(self.cfgFps), @"scale" : @(self.cfgScale), @"bitrate" : @(self.cfgBitrate)};
+        m[@"cfg"] = @{@"fps" : @(self.cfgFps), @"scale" : @(self.cfgScale),
+                         @"bitrate" : @(self.cfgBitrate), @"cap" : @(self.cfgHardCap)};
         NSData *d = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
         if (!d) { return; }
         NSString *js = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
@@ -232,16 +236,22 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
 }
 
 /// 用户一动手就放开码率上限：整屏变化的那一帧有几万字节，
-/// 700kbps 要发半秒，抬到 4 倍后只要 100 多毫秒；停手 1.5 秒自动收回。
+/// 700kbps 要发半秒，抬到 4 倍后只要 100 多毫秒；停手 0.8 秒自动收回。
+/// 窗口只留 0.8s 是因为大帧通常 1~2 帧就发完了，抬久了纯属白烧流量：
+/// 原来 1.5s 窗口在"连点"场景下几乎常驻高位（用户看到 3.4Mbps），
+/// 收到 0.8s 后单次交互的平均计入流量少一半，跟手一点没变。
 - (void)kickBurstForInteraction {
     NSInteger base = self.cfgBitrate > 0 ? self.cfgBitrate : 700000;
     NSInteger burst = base * 4;
     if (burst < 3000000) { burst = 3000000; }
     if (burst > 8000000) { burst = 8000000; }
+    // 单台硬上限：中控要求"每台最多 1.2M/1.5M"时，突发也不许越过它，
+    // 这样 20~30 台叠加才压得住 30M 上行；cap=0 表示不限（单台局域网看最跟手）。
+    if (self.cfgHardCap > 0 && burst > self.cfgHardCap) { burst = self.cfgHardCap; }
     [self.rtc setBurstBitrateBps:burst];
     self.burstGen += 1;
     NSInteger gen = self.burstGen;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (gen == self.burstGen) { [self.rtc endBurstBitrate]; }
     });
@@ -279,20 +289,23 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
                     double scale = self.cfgScale;
                     int fps = self.cfgFps;
                     NSInteger br = self.cfgBitrate;
+                    NSInteger cap = self.cfgHardCap;
                     if (cmd[@"scale"]) { scale = [cmd[@"scale"] doubleValue]; }
                     if (cmd[@"fps"]) { fps = [cmd[@"fps"] intValue]; }
                     if (cmd[@"bitrate"]) { br = [cmd[@"bitrate"] integerValue]; }
+                    if (cmd[@"cap"]) { cap = [cmd[@"cap"] integerValue]; }
+                    if (cap > 0 && cap < br) { br = cap; }   // 硬上限低于基线时，基线也跟着降
                     // 下限保护：scale 再低字就糊了（0.30 ≈ 372x662），宁可降帧也不降到这里以下
                     if (scale < 0.30) { scale = 0.30; }
                     if (scale > 1.0) { scale = 1.0; }
                     if (fps < 8) { fps = 8; }
                     if (fps > 60) { fps = 60; }
-                    NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld", scale, fps, (long)br);
+                    NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld cap=%ld", scale, fps, (long)br, (long)cap);
                     // 缩图在抓屏层（vImage，整屏渲染 + 一次性缩到目标尺寸），编码器不再缩放
                     [self.capture setOutputScale:scale];
                     [self.rtc configureWithScale:1.0 fps:fps maxBitrateBps:br];
                     [self.rtc setAdaptiveBaseScale:scale bitrate:br];
-                    self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br;
+                    self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br; self.cfgHardCap = cap;
                     [self.capture setFps:fps];
                 } else {
                     NSString *ct = cmd[@"t"];
