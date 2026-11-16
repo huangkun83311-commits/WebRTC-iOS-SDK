@@ -140,6 +140,7 @@ static double clamp01(double v) {
         // 不用 gen 的 tap: —— 它内部 _sendTaps 断言 delay>0 而自身传 0，带断言编译会 abort。
         // 走 touchDown/touchUp 两段，等价 AKUN 的 tap 行为。
         gLastInputMono = CACurrentMediaTime();
+        AkunBridgeNoteInteraction();   // 进交互窗口：抓屏强制出帧 + 抬码率
         [gen touchDownAtPoints:&p touchCount:1];
         // 对齐 AKUN：STHIDEventGenerator 里 fingerLiftDelay = 0.05，即「按下→50ms→抬起」
         NSUInteger ms = cmd[@"ms"] ? [cmd[@"ms"] unsignedIntValue] : 50;

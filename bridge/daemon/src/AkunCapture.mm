@@ -68,7 +68,8 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     double _allocMsSum;          // 取池内目标缓冲的耗时合计（编码器占着池子时会卡这里）
     double _lastAllocMs;         // 本帧取缓冲耗时
     NSTimeInterval _lastChangeMono; // 最近一次「画面确实变了」的时刻
-    NSTimeInterval _lastPushMono; // 上次真正推帧的时刻（fps 闸门用）
+    NSTimeInterval _lastPushMono;
+    NSTimeInterval _lastProbeMono;    // 上一次「查脏图」的时刻（静止期节流用） // 上次真正推帧的时刻（fps 闸门用）
     double _prepMsAvg;            // 准备一帧（渲染+缩图+推帧）的滑窗平均耗时，闸门提前量用
     double _costMsAvg;            // 单帧总耗时的跨窗口平均，「唤醒即发」用它判断流水线是否已空出来
     int _burstCount;              // 本窗口内「唤醒即发」的次数（用于验证这一帧真的没排队）
@@ -408,13 +409,22 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     // 但只有真的变了才插队出帧；没变就继续等，否则会变成静止画面也狂渲染（烧 CPU）。
     // 探测间隔必须省着用：实测 _dirtyFrameCount(NULL) 单次 3~7ms（perf 里的「脏图」列），
     // 按 2~8ms 节奏查一次等于每秒烧掉 400~800ms CPU，渲染会从 10ms 掉到 19ms 且把机器烧热。
-    // 所以：静止期 20ms 一查（50 次/秒 ≈ 250ms/s），既能把「点了以后被发现」压在 ~20ms，
-    // 又不至于把 CPU 占满。
-    const double kIdleProbeSec = 0.020;
-    BOOL pipelineFree = (now - _lastPushMono >= kIdleProbeSec);
-    BOOL wasIdle = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) > 0.35);
-    BOOL mayProbe = timeOk || keepaliveDue || (wasIdle && pipelineFree);
+    // 所以：静止期 100ms 一查（10 次/秒 ≈ 90ms/s，约 5% 一个核）；点下去那一刻走
+    // forceNow 强制出帧，不再依赖探测频率。
+    // 用户正在操作（1.5s 内有过点击/滑动）：不再等脏图，直接出帧。
+    // 触摸必然改变画面，等探测只是白等；交互期强制出帧后，
+    // 静止期的脏图探测就可以放心放慢，CPU 从半个核降到 5% 以下。
+    BOOL forceNow = (gInteractMono > 0.0) && ((now - gInteractMono) < 1.5) && (gInteractMono > 0.0);
+    // 关键：静止时不能再走 timeOk。timeOk 在静止期永远成立（距上次推帧已经 2 秒），
+    // 结果每个 2ms 轮询都去查一次脏图 —— 实测 2 秒烧掉 900ms CPU（半个核），
+    // 机器持续发热，十几分钟后热降频，正是"越用越卡"的来源。
+    // 静止时按 100ms 节奏探测；用户一动手 forceNow 直接出帧，不依赖探测频率。
+    const double kIdleProbeSec = 0.100;
+    BOOL idleish = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) > 0.35);
+    BOOL mayProbe = forceNow || keepaliveDue ||
+                    (idleish ? ((now - _lastProbeMono) >= kIdleProbeSec) : timeOk);
     if (!mayProbe) { return; }
+    _lastProbeMono = now;
 
     BOOL changed = YES;
     // 画面显然在动的时候（0.45s 内刚变过）不必每帧都去查脏图 —— 那是在白烧 CPU。
@@ -425,7 +435,8 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
         _dirtySkipTick++;
         if ((_dirtySkipTick & 3) != 0) { skipDirty = YES; }
     }
-    if (_dirtyFrameCount && !skipDirty) {
+    if (forceNow) { changed = YES; _lastChangeMono = now; }
+    if (!forceNow && _dirtyFrameCount && !skipDirty) {
         NSTimeInterval d0 = CACurrentMediaTime();
         CFIndex c = _dirtyFrameCount(NULL);
         _dirtyMsSum += (CACurrentMediaTime() - d0) * 1000.0;   // 脏图检测自身开销，算进 perf
@@ -448,7 +459,8 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     } else {
         if (!timeOk) {
             // 只有「从静止被唤醒并且真的变了」的那一帧才允许插队，持续动画仍受 fps 闸门管。
-            if (!(wasIdle && pipelineFree && changed)) { return; }
+            // 交互期（forceNow）允许插队；其余只有「刚刚真的变了」这一帧可以插队。
+            if (!(changed && (forceNow || (idleish && (now - _lastProbeMono) < kIdleProbeSec * 1.5)))) { return; }
             _burstCount++;
         }
     }

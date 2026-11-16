@@ -58,7 +58,7 @@
     <option value="0.45,25,1200000">看字优先 0.45 / 25fps / 1.2M</option>
   </select>
   <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v6 · 双端数据+落盘</span>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v7 · 零开销跟手探针</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -380,9 +380,20 @@
   });
 
   /* ---------------- FPS 统计（按真实解码帧计数，不是屏幕刷新率） ---------------- */
-  let frames = 0, lastTs = performance.now();
+  let frames = 0, framesTotal = 0, lastTs = performance.now();
   function onVF() {
-    frames++;
+    frames++; framesTotal++;
+    // 跟手探针：新的一帧真的呈现出来了 → 记下这一帧的延迟。
+    // 这里用「已呈现帧数」判断，不再对 video 做 drawImage —— 软件解码的浏览器里
+    // 每次 drawImage+getImageData 要几十毫秒，它自己就会把画面和延迟一起拖垮。
+    if (tapMeasuring && framesTotal !== tapFrames0) {
+      tapMeasuring = false;
+      const ms = Math.round(performance.now() - tapT0);
+      tapHits.push(ms); if (tapHits.length > 10) tapHits.shift();
+      const avg = Math.round(tapHits.reduce((a, b) => a + b, 0) / tapHits.length);
+      setV('hTap', ms + ' ms（均 ' + avg + '）', ms > 250 ? 'bad' : (ms > 150 ? 'warn' : 'ok'));
+      $('hTapLog').textContent = '近 ' + tapHits.length + ' 次：' + tapHits.join(' / ') + ' ms';
+    }
     const now = performance.now();
     if (now - lastTs >= 1000) {
       $('fps').textContent = frames + ' fps';
@@ -464,49 +475,23 @@
   }, 1000);
 
   /* ---------------- 跟手实测：点击那一刻 → 画面真的变了 ---------------- */
-  const probe = document.createElement('canvas');
-  probe.width = 16; probe.height = 16;
-  const pctx = probe.getContext('2d', { willReadFrequently: true });
-  let tapT0 = 0, tapSig0 = null, tapMeasuring = false, tapHits = [];
+  // 跟手实测：只记「点击那一刻已呈现多少帧」，之后等 onVF 报来新帧即可。
+  // 全程零 canvas 采样 → 测量本身不占 CPU、不干扰画面。
+  let tapT0 = 0, tapFrames0 = 0, tapMeasuring = false, tapHits = [];
+  let tapTimeout = 0;
 
-  function sampleSig() {
-    if (!video.videoWidth) return null;
-    try {
-      pctx.drawImage(video, 0, 0, 16, 16);
-      return pctx.getImageData(0, 0, 16, 16).data;
-    } catch (e) { return null; }
-  }
-  function sigDiff(a, b) {
-    if (!a || !b) return 0;
-    let s = 0;
-    for (let i = 0; i < a.length; i += 4) {
-      s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
-    }
-    return s;
-  }
   function startTapProbe() {
-    tapSig0 = sampleSig();
-    if (!tapSig0) return;
+    tapFrames0 = framesTotal;
     tapT0 = performance.now();
     tapMeasuring = true;
-  }
-  (function tapLoop() {
-    requestAnimationFrame(tapLoop);
-    if (!tapMeasuring) return;
-    const cur = sampleSig();
-    const now = performance.now();
-    if (cur && sigDiff(cur, tapSig0) > 500) {
-      tapMeasuring = false;
-      const ms = Math.round(now - tapT0);
-      tapHits.push(ms); if (tapHits.length > 10) tapHits.shift();
-      const avg = Math.round(tapHits.reduce((a, b) => a + b, 0) / tapHits.length);
-      setV('hTap', ms + ' ms（均 ' + avg + '）', ms > 250 ? 'bad' : (ms > 150 ? 'warn' : 'ok'));
-      $('hTapLog').textContent = '近 ' + tapHits.length + ' 次：' + tapHits.join(' / ') + ' ms';
-    } else if (now - tapT0 > 2000) {
+    clearTimeout(tapTimeout);
+    tapTimeout = setTimeout(() => {
+      if (!tapMeasuring) return;
       tapMeasuring = false;
       $('hTapLog').textContent = '这一次画面没变（点的地方可能本来就没变化）';
-    }
-  })();
+    }, 2000);
+  }
+
 
   /* ---------------- 面板开关 ---------------- */
   function toggleHud() { $('hud').classList.toggle('hide'); }
