@@ -23,6 +23,8 @@ extern void AkunBridgeNoteInteraction(void);
 #import <dlfcn.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <stdio.h>
+#import <unistd.h>
 
 // ---- 私有 API 的轻量调用助手（辅助功能用）----
 static id akun_msg0(id obj, NSString *sel) {
@@ -87,6 +89,50 @@ int gOrientationFixQuad = 0;
     double _lastY;
     BOOL _dragging;
     double _downTime;
+}
+
+/// 跑一个外部命令并收集输出（root 下的 dpkg / unzip 用）。返回退出码，输出带回。
+/// 只在 handleAux 里被安装/卸载类动作调用，调用期间会阻塞控制通道，和 AKUN 的语义一致。
+static int akun_spawn_capture(NSArray<NSString *> *argv, NSString **outText) {
+    if (argv.count == 0) { return -1; }
+    int fds[2];
+    if (pipe(fds) != 0) { return -1; }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+
+    char **cargv = (char **)calloc(argv.count + 1, sizeof(char *));
+    for (NSUInteger i = 0; i < argv.count; i++) {
+        cargv[i] = strdup([argv[i] fileSystemRepresentation]);
+    }
+    const char *cpath = [argv[0] fileSystemRepresentation];
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, cpath, &fa, NULL, cargv, NULL);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    for (NSUInteger i = 0; i < argv.count; i++) { free(cargv[i]); }
+    free(cargv);
+    if (rc != 0) {
+        close(fds[0]);
+        NSLog(@"[aux] 启动 %@ 失败 rc=%d", argv[0], rc);
+        return -1;
+    }
+    NSMutableData *buf = [NSMutableData data];
+    char tmp[4096];
+    ssize_t n = 0;
+    while ((n = read(fds[0], tmp, sizeof(tmp))) > 0) {
+        if (buf.length + (NSUInteger)n > 16384) { n = (ssize_t)(16384 - buf.length); }
+        if (n > 0) { [buf appendBytes:tmp length:(NSUInteger)n]; }
+        if (buf.length >= 16384) { break; }
+    }
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (outText) { *outText = [[NSString alloc] initWithData:buf encoding:NSUTF8StringEncoding] ?: @""; }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 - (instancetype)init {
@@ -441,6 +487,93 @@ static double clamp01(double v) {
         [gen _sendIOHIDKeyboardEvent:0x07 usage:n.unsignedIntValue isKeyDown:false];
         if (gui) { usleep(20000); [gen _sendIOHIDKeyboardEvent:0x07 usage:0xE3 isKeyDown:false]; }
         return @{ @"success" : @YES, @"key" : k };
+    }
+    if ([a isEqualToString:@"upload_file"]) {
+        // 与 AKUN 一致：分块上传，path/offset/size/data(base64)，一块一回
+        NSString *path = cmd[@"path"];
+        if (![path isKindOfClass:[NSString class]] || path.length == 0) {
+            return @{ @"success" : @NO, @"error" : @"missing path" };
+        }
+        NSString *b64 = cmd[@"data"];
+        NSData *chunk = b64.length ? [[NSData alloc] initWithBase64EncodedString:b64 options:0] : nil;
+        if (!chunk.length) {
+            return @{ @"success" : @NO, @"error" : @"missing data (base64)" };
+        }
+        NSInteger off = [cmd[@"offset"] integerValue];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *dir = [path stringByDeletingLastPathComponent];
+        if (dir.length) { [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil]; }
+        NSError *err = nil;
+        if (off <= 0 || ![fm fileExistsAtPath:path]) {
+            [chunk writeToFile:path options:NSDataWritingAtomic error:&err];
+        } else {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (!fh) {
+                [chunk writeToFile:path options:NSDataWritingAtomic error:&err];
+            } else {
+                @try {
+                    [fh seekToEndOfFile];
+                    [fh writeData:chunk];
+                    [fh closeFile];
+                } @catch (NSException *e) { err = [NSError errorWithDomain:@"akun" code:1 userInfo:nil]; }
+            }
+        }
+        if (err) { return @{ @"success" : @NO, @"error" : err.localizedDescription ?: @"write failed" }; }
+        unsigned long long total = [[[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize] unsignedLongLongValue];
+        unsigned long long want = [cmd[@"size"] unsignedLongLongValue];
+        BOOL complete = (want > 0) ? (total >= want) : YES;
+        NSLog(@"[aux] upload_file %@ 收到 %llu/%llu", path.lastPathComponent, total, want);
+        return @{ @"success" : @YES, @"path" : path, @"bytes" : @(total), @"complete" : @(complete) };
+    }
+    if ([a isEqualToString:@"install_deb"]) {
+        NSString *path = cmd[@"path"];
+        if (![path isKindOfClass:[NSString class]] || path.length == 0) {
+            return @{ @"success" : @NO, @"error" : @"missing path" };
+        }
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"文件不存在: %@", path] };
+        }
+        // 我们本身就是 root 的 LaunchDaemon，直接 dpkg -i，不需要 AKUN 那套独立 rootd
+        NSString *dpkg = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/usr/bin/dpkg"]
+                       ? @"/var/jb/usr/bin/dpkg" : @"/usr/bin/dpkg";
+        NSString *out = nil;
+        int rc = akun_spawn_capture(@[ dpkg, @"-i", path ], &out);
+        NSLog(@"[aux] install_deb rc=%d out=%@", rc, [out substringToIndex:MIN(out.length, (NSUInteger)400)]);
+        return @{ @"success" : @(rc == 0), @"code" : @(rc),
+                  @"output" : (out ?: @""), @"path" : path };
+    }
+    if ([a isEqualToString:@"uninstall_deb"]) {
+        NSString *pkg = cmd[@"package"];
+        if (![pkg isKindOfClass:[NSString class]] || pkg.length == 0) {
+            return @{ @"success" : @NO, @"error" : @"missing package" };
+        }
+        NSString *dpkg = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/usr/bin/dpkg"]
+                       ? @"/var/jb/usr/bin/dpkg" : @"/usr/bin/dpkg";
+        NSString *out = nil;
+        int rc = akun_spawn_capture(@[ dpkg, @"-r", pkg ], &out);
+        NSLog(@"[aux] uninstall_deb %@ rc=%d", pkg, rc);
+        return @{ @"success" : @(rc == 0), @"code" : @(rc), @"output" : (out ?: @""), @"package" : pkg };
+    }
+    if ([a isEqualToString:@"install_tipa"]) {
+        NSString *path = cmd[@"path"];
+        if (![path isKindOfClass:[NSString class]] || path.length == 0) {
+            return @{ @"success" : @NO, @"error" : @"missing path" };
+        }
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"文件不存在: %@", path] };
+        }
+        // tipa 是 zip 包（内含 Payload/xxx.app）：解到 /Applications 再 uicache 刷图标
+        NSString *out = nil;
+        int rc = akun_spawn_capture(@[ @"/var/jb/usr/bin/unzip", @"-o", path, @"-d", @"/Applications" ], &out);
+        if (rc != 0) {
+            rc = akun_spawn_capture(@[ @"/usr/bin/unzip", @"-o", path, @"-d", @"/Applications" ], &out);
+        }
+        if (rc == 0) {
+            akun_spawn_capture(@[ @"/var/jb/usr/bin/uicache", @"-a" ], NULL);
+        }
+        NSLog(@"[aux] install_tipa rc=%d", rc);
+        return @{ @"success" : @(rc == 0), @"code" : @(rc), @"output" : (out ?: @""),
+                  @"note" : @"tipa 走 /Applications 解包 + uicache；未签名应用需设备本身允许（TrollStore/已签名）" };
     }
     if ([a isEqualToString:@"screenshot"]) {
         // 与 AKUN 19940 对齐：{"action":"screenshot","quality":75}，回 base64 图片

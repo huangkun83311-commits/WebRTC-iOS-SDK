@@ -477,7 +477,18 @@ func main() {
 		var scale float64
 		fps := 30
 		cap := int(perDevKbps * 1000) // bps
-		if mode == "auth" {
+		// 局域网档：流量不出局域网，不吃外网上行，所以 cap 不按 uplink/台数算，
+		// 只受 Wi-Fi 总带宽与电脑转发能力约束。几百台的瓶颈在 AP 与 CPU，不在 50M。
+		if mode == "lan" {
+			scale = 0.40
+			fps = 30
+			cap = 4000000
+		} else if mode == "grid" {
+			// 巡检缩略档：几百台同屏、每台只出一点点，点开的那台再切 lan
+			scale = 0.20
+			fps = 8
+			cap = 400000
+		} else if mode == "auth" {
 			// 授权档：只看得到在做什么，字还得认得出，其他一律让路
 			scale = 0.30
 			fps = 20
@@ -514,6 +525,10 @@ func main() {
 			"fps":     fps,
 			"cap":     cap,
 			"bitrate": base,
+		}
+		if mode == "lan" || mode == "grid" {
+			p["note"] = "局域网档：不占外网上行，只受 Wi-Fi 带宽与电脑转发能力约束"
+			p["perDev"] = 0
 		}
 		if q.Get("apply") != "" && q.Get("apply") != "0" {
 			msg := map[string]interface{}{"t": "cfg", "scale": strconv.FormatFloat(scale, 'f', 2, 64),

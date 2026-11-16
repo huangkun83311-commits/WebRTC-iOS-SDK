@@ -79,8 +79,10 @@
   </select>
   <!-- 档位自动换算：选"中控/授权"再填台数和上行总带宽，服务端按每台可用带宽算出
        cap(单台上限) / scale(分辨率) / fps，一键下发；设备重连会自动套用上次的档。 -->
-  <select id="mode" title="中控=插件默认档；授权=低清档（只看操作，字仍可读）">
-    <option value="console" selected>中控 · 默认档</option>
+  <select id="mode" title="局域网=不占外网上行的高档；巡检=几百台缩略；授权=低清档">
+    <option value="lan" selected>局域网 · 高档</option>
+    <option value="console">中控 · 默认档</option>
+    <option value="grid">巡检 · 缩略档</option>
     <option value="auth">授权 · 低清档</option>
   </select>
   <select id="devs" title="同时连接的台数">
