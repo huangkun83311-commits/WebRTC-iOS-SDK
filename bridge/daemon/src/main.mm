@@ -47,6 +47,37 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
 
 @implementation AkunDaemon
 
+- (NSArray<NSString *> *)statePaths {
+    return @[ @"/var/mobile/Library/Caches/akun-bridge-state.plist",
+              @"/var/jb/var/mobile/Library/Caches/akun-bridge-state.plist",
+              @"/var/mobile/Documents/akun-bridge-state.plist",
+              @"/tmp/akun-bridge-state.plist" ];
+}
+
+- (NSDictionary *)loadState {
+    for (NSString *p in [self statePaths]) {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (d.count) { NSLog(@"[cfg] 读到上次保存的参数 %@", p); return d; }
+    }
+    return @{};
+}
+
+- (void)saveState {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"scale"] = @(self.cfgScale);
+    d[@"fps"] = @(self.cfgFps);
+    d[@"bitrate"] = @(self.cfgBitrate);
+    d[@"cap"] = @(self.cfgHardCap);
+    for (NSString *p in [self statePaths]) {
+        if (![d writeToFile:p atomically:YES]) { continue; }
+        if (![[NSFileManager defaultManager] fileExistsAtPath:p]) { continue; }
+        NSLog(@"[cfg] 参数已落盘 %@ scale=%.2f fps=%d bitrate=%ld cap=%ld", p,
+              self.cfgScale, self.cfgFps, (long)self.cfgBitrate, (long)self.cfgHardCap);
+        return;
+    }
+    NSLog(@"[cfg] 参数落盘失败（下次重启会回到默认值）");
+}
+
 - (NSDictionary *)loadPrefs {
     NSArray *paths = @[kPrefsPathRootless, kPrefsPathLegacy];
     for (NSString *p in paths) {
@@ -123,6 +154,16 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
     double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
     int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 30;
     NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 700000;
+    // 上一次"主动下发"的参数存在 /var/mobile/Library/Caches/akun-bridge-state.plist，
+    // 重启/重装插件后优先用它，这样你设一次就一直生效，不需要每次再发。
+    NSDictionary *state = [self loadState];
+    NSInteger savedCap = 0;
+    if (state[@"scale"]) { scale = [state[@"scale"] doubleValue]; }
+    if (state[@"fps"]) { fps = [state[@"fps"] intValue]; }
+    if (state[@"bitrate"]) { maxBitrate = [state[@"bitrate"] integerValue]; }
+    if (state[@"cap"]) { savedCap = [state[@"cap"] integerValue]; }
+    if (state.count) { NSLog(@"[daemon] 用上次保存的参数 scale=%.2f fps=%d bitrate=%ld cap=%ld", scale, fps, (long)maxBitrate, (long)savedCap); }
+
     if (scale <= 0.0) { scale = 0.35; }
     if (fps <= 0) { fps = 30; }
     if (fps > 60) { fps = 60; }
@@ -133,7 +174,7 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
           scale, fps, (long)maxBitrate);
 
     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = maxBitrate;
-    self.cfgHardCap = 0;
+    self.cfgHardCap = savedCap;
 
     self.injector = [[AkunInjector alloc] init];
     self.capture = [[AkunCapture alloc] init];
@@ -322,6 +363,7 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
                     [self.rtc setAdaptiveBaseScale:scale bitrate:br];
                     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br; self.cfgHardCap = cap;
                     [self.capture setFps:fps];
+                    [self saveState];
                 } else if ([cmd[@"t"] isEqualToString:@"aux"]) {
                     // 辅助功能：与 AKUN 的 19940 动作一一对应，但走我们自己的控制通道
                     NSDictionary *res = [self.injector handleAux:cmd] ?: @{ @"success" : @NO };
