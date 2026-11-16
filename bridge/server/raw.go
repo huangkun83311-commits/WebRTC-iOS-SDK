@@ -143,7 +143,10 @@ func jsonString(s string) string {
 	return string(b)
 }
 
-// dispatchRaw 供 main.go 分流用
+// dispatchRaw 供 main.go 分流用。
+// 注意：SFU 的房间名是 "video-<id>"（手机推流建的就是这个房间），直绘端必须落到同一个房间，
+// 否则拿到的永远是空房间（第一次接线时踩过：日志里 codec= 空、一帧不下发）。
 func (s *sfu) dispatchRaw(w http.ResponseWriter, r *http.Request, roomWithPrefix string) {
-	s.handleRaw(w, r, strings.TrimPrefix(roomWithPrefix, "rtp-"))
+	id := strings.TrimPrefix(roomWithPrefix, "rtp-")
+	s.handleRaw(w, r, "video-"+id)
 }
