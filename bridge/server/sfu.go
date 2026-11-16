@@ -111,6 +111,8 @@ type sfuRoom struct {
 	pub     *sfuPeer
 	pubSSRC uint32
 	readers []*viewer
+	raws    []*rawSub     // 直绘（WebCodecs）订阅者
+	h264Info string       // 手机的 H264 fmtp，给直绘端 configure 用
 	lastLog time.Time
 	sent    atomic.Uint64
 }
@@ -230,9 +232,10 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 		if role != "publisher" {
 			return
 		}
-		log.Printf("sfu room=%s 收到手机视频流 codec=%s pt=%d ssrc=%d", room, track.Codec().MimeType, track.PayloadType(), track.SSRC())
+		log.Printf("sfu room=%s 收到手机视频流 codec=%s pt=%d ssrc=%d fmtp=%s", room, track.Codec().MimeType, track.PayloadType(), track.SSRC(), track.Codec().SDPFmtpLine)
 		rm.mu.Lock()
 		rm.pubSSRC = uint32(track.SSRC())
+		rm.h264Info = track.Codec().SDPFmtpLine
 		rm.mu.Unlock()
 		var last *rtp.Packet
 		for {
@@ -245,12 +248,21 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 			}
 			rm.mu.RLock()
 			targets := rm.readers
+			raws := rm.raws
 			nowT := time.Now()
-			doLog := len(targets) > 0 && nowT.Sub(rm.lastLog) > 2*time.Second
+			doLog := (len(targets) > 0 || len(raws) > 0) && nowT.Sub(rm.lastLog) > 2*time.Second
 			if doLog {
 				rm.lastLog = nowT
 			}
 			rm.mu.RUnlock()
+			// 直绘端：H264 RTP 原样下发，由浏览器 WebCodecs 解码直绘（跳过 jitter buffer）
+			if len(raws) > 0 {
+				if raw, err := pkt.Marshal(); err == nil {
+					for _, rs := range raws {
+						rs.push(raw)
+					}
+				}
+			}
 			for _, v := range targets {
 				out := *pkt
 				// 每个观看端协商出的 payload type 可能不同，逐端改写。

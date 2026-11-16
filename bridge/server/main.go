@@ -123,6 +123,11 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		h.sfu.handleSFU(w, r, room, role)
 		return
 	}
+	// 直绘通道：rtp-<id>，H264 RTP 原样下发，页面用 WebCodecs 解码丢到 canvas
+	if strings.HasPrefix(room, "rtp-") {
+		h.sfu.dispatchRaw(w, r, room)
+		return
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {

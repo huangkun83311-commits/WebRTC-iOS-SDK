@@ -63,7 +63,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double _costMsAvg;            // 单帧总耗时的跨窗口平均，「唤醒即发」用它判断流水线是否已空出来
     int _burstCount;              // 本窗口内「唤醒即发」的次数（用于验证这一帧真的没排队）
     double _pacePadSec;
-    double _dirtyMsSum;           // 节拍闭环：上一帧实际间隔与目标的差距，逐个微调
+    double _dirtyMsSum;
+    unsigned _dirtySkipTick;           // 节拍闭环：上一帧实际间隔与目标的差距，逐个微调
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
     // GPU 缩图（Core Image + Metal）：拿不到 Metal 就退回 vImage
@@ -351,16 +352,26 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     // 不排队等下一拍，只要流水线已经空出来就立刻出帧 —— 这一帧省掉最多半个帧间隔。
     // 注意：静止期间允许按「流水线空闲」的节奏去查脏图（约 cost 一次，16ms），
     // 但只有真的变了才插队出帧；没变就继续等，否则会变成静止画面也狂渲染（烧 CPU）。
-    // 静止期：探测间隔压到 8ms（125 次/秒），把「点了以后被发现」的等待从 ~17ms 降到 ~8ms。
-    // 但不能更激进：_dirtyFrameCount 是系统调用，2ms 轮询（500 次/秒）会拖慢渲染（实测 6ms→19ms）。
-    const double kIdleProbeSec = 0.008;
+    // 探测间隔必须省着用：实测 _dirtyFrameCount(NULL) 单次 3~7ms（perf 里的「脏图」列），
+    // 按 2~8ms 节奏查一次等于每秒烧掉 400~800ms CPU，渲染会从 10ms 掉到 19ms 且把机器烧热。
+    // 所以：静止期 20ms 一查（50 次/秒 ≈ 250ms/s），既能把「点了以后被发现」压在 ~20ms，
+    // 又不至于把 CPU 占满。
+    const double kIdleProbeSec = 0.020;
     BOOL pipelineFree = (now - _lastPushMono >= kIdleProbeSec);
     BOOL wasIdle = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) > 0.35);
     BOOL mayProbe = timeOk || keepaliveDue || (wasIdle && pipelineFree);
     if (!mayProbe) { return; }
 
     BOOL changed = YES;
-    if (_dirtyFrameCount) {
+    // 画面显然在动的时候（0.45s 内刚变过）不必每帧都去查脏图 —— 那是在白烧 CPU。
+    // 每 4 帧校准一次足够把「动→静」判出来，实测省掉约 75% 的脏图调用。
+    BOOL recentlyActive = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) < 0.45);
+    BOOL skipDirty = NO;
+    if (_dirtyFrameCount && recentlyActive) {
+        _dirtySkipTick++;
+        if ((_dirtySkipTick & 3) != 0) { skipDirty = YES; }
+    }
+    if (_dirtyFrameCount && !skipDirty) {
         NSTimeInterval d0 = CACurrentMediaTime();
         CFIndex c = _dirtyFrameCount(NULL);
         _dirtyMsSum += (CACurrentMediaTime() - d0) * 1000.0;   // 脏图检测自身开销，算进 perf
