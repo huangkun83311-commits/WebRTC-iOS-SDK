@@ -110,13 +110,14 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 
     // 输出参数默认值：scale 跟 AKUN 出厂一致（0.35，字体清晰度等同 AKUN），
     // 需要更清晰或更省流量时，不改包、走 /api/config 在线下发档位即可。
-    // fps 直接决定操作手感（帧间隔就是最低延迟）：25fps=40ms，20fps=50ms。
-    // 抓屏吃力时会由 AkunCapture 的帧率自适应往下退，所以这里可以给到 25。
+    // fps 直接决定操作手感（等节拍的时间就是纯延迟）：实测 30fps 平均 149ms、
+    // 45fps 50ms、60fps 34ms（同一台机器同一条链路）。所以默认给 45，
+    // 机器真跑不动时由 AkunCapture 的帧率自适应退回（保底 24fps，不会再掉到 12）。
     double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
-    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 30;
+    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 45;
     NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 900000;
     if (scale <= 0.0) { scale = 0.35; }
-    if (fps <= 0) { fps = 30; }
+    if (fps <= 0) { fps = 45; }
     if (fps > 60) { fps = 60; }
     if (maxBitrate <= 0) { maxBitrate = 900000; }
 

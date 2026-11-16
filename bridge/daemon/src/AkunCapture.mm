@@ -26,7 +26,7 @@
 typedef void (*RenderDisplayFn)(uint32_t ctx, CFStringRef display, IOSurfaceRef surface, int x, int y);
 typedef CFIndex (*GetDirtyFrameCountFn)(void *);
 
-static const int kDefaultFPS = 12;
+static const int kDefaultFPS = 30;
 /// 抓屏轮询间隔：8ms 一次「画面变了吗」。
 /// 以前是 1/fps（20fps=50ms）当节拍，最坏要等 50ms 才抓一次，这就是「点了之后慢半拍」的来源；
 /// 改成 8ms 轮询 + fps 闸门：变化一出现最迟 8ms 就被抓走，帧率仍被 fps 上限压住，不额外花 CPU。
@@ -178,7 +178,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 /// 帧率热更新：以前这个属性是自动合成的，改了 _fps 但定时器还是启动时的间隔，
 /// 等于「在线改 fps 不生效」。这里改成重建定时器（并清零自适应窗口）。
 - (void)setFps:(int)fps {
-    int v = (fps >= 8 && fps <= 30) ? fps : kDefaultFPS;
+    int v = (fps >= 8 && fps <= 60) ? fps : kDefaultFPS;
     _fps = v;
     if (v != _activeFps) {
         _activeFps = v;
@@ -434,18 +434,22 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0;
     _perfWindowStart = now;
 
-    if (costMs > budgetMs * 0.85) {
+    // 降档只用于「真的跑不动」：单帧耗时明显超过帧预算才会持续掉帧。
+    // 以前用 cost>budget*0.85 判，导致 45fps 下每窗口都判超，一路砍到 12fps（延迟暴涨到 149ms）。
+    // 抓屏帧率本身就是延迟的主要来源，所以保底 24fps，宁可轻微掉帧也不牺牲手感。
+    int fpsFloor = MIN(24, _fps);
+    if (costMs > budgetMs * 1.15) {
         _lowStreak++; _highStreak = 0;
-        if (_lowStreak >= 2 && _activeFps > 8) {
-            int v = MAX(8, _activeFps - 3);
+        if (_lowStreak >= 3 && _activeFps > fpsFloor) {
+            int v = MAX(fpsFloor, _activeFps - 4);
             _activeFps = v; _lowStreak = 0;
             [self applyTimerFps:v];
-            NSLog(@"[perf] 单帧耗时超预算，抓屏降到 %d fps（稳帧优先）", v);
+            NSLog(@"[perf] 单帧耗时 %.1fms 超预算 %.1fms，抓屏降到 %d fps（防掉帧）", costMs, budgetMs, v);
         }
-    } else if (costMs < budgetMs * 0.55) {
+    } else if (costMs < budgetMs * 0.75) {
         _highStreak++; _lowStreak = 0;
-        if (_highStreak >= 3 && _activeFps < _fps) {
-            int v = MIN(_fps, _activeFps + 2);
+        if (_highStreak >= 2 && _activeFps < _fps) {
+            int v = MIN(_fps, _activeFps + 3);
             _activeFps = v; _highStreak = 0;
             [self applyTimerFps:v];
             NSLog(@"[perf] 余量充足，抓屏升回 %d fps", v);
