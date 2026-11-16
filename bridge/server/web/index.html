@@ -35,11 +35,11 @@
   <!-- 画质档位：默认「标准」= AKUN 出厂值 0.35 / 12fps / 1.5Mbps；
        授权给别人看用「省流」，自己中控看用「高清/超清」，切换即时生效不用重装 -->
   <select id="quality" title="画质档位（改的是设备端的 scale/fps/码率，即时生效）">
-    <option value="0.35,20,1500000" selected>流畅·默认 0.35 / 20fps / 1.5M（=AKUN清晰度）</option>
-    <option value="0.30,15,700000">省流·授权用 0.30 / 15fps / 0.7M（字仍可读）</option>
-    <option value="0.45,12,2000000">看字优先 0.45 / 12fps / 2M</option>
-    <option value="0.60,20,3000000">高清 0.60 / 20fps / 3M</option>
-    <option value="0.75,24,4000000">超清 0.75 / 24fps / 4M</option>
+    <option value="0.35,45,900000" selected>流畅·默认 0.35 / 45fps / 0.9M（=AKUN清晰度，延迟优先）</option>
+    <option value="0.30,45,600000">省流·授权用 0.30 / 45fps / 0.6M（字仍可读）</option>
+    <option value="0.30,30,450000">极省 · 多机并发 0.30 / 30fps / 0.45M</option>
+    <option value="0.45,30,1500000">看字优先 0.45 / 30fps / 1.5M</option>
+    <option value="0.60,25,2500000">高清 0.60 / 25fps / 2.5M</option>
   </select>
   <span id="peers"></span>
   <span class="status">
