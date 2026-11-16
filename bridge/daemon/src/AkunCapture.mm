@@ -64,6 +64,9 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     int _burstCount;              // 本窗口内「唤醒即发」的次数（用于验证这一帧真的没排队）
     double _pacePadSec;
     double _dirtyMsSum;
+    double _scaleGpuMsSum;       // 缩图里「GPU 那一段」的耗时合计
+    int    _scaleGpuFrames;      // 走 GPU 成功的帧数
+    int    _scaleCpuFrames;      // 回退 vImage 的帧数
     unsigned _dirtySkipTick;           // 节拍闭环：上一帧实际间隔与目标的差距，逐个微调
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
@@ -282,9 +285,11 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
             CIImage *scaled = [[si imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)]
                                imageByCroppingToRect:CGRectMake(0, 0, w, h)];
             @try {
+                NSTimeInterval g0 = CACurrentMediaTime();
                 [ci render:scaled toCVPixelBuffer:dst
                       bounds:CGRectMake(0, 0, w, h) colorSpace:NULL];
-                return dst;
+                _scaleGpuMsSum += (CACurrentMediaTime() - g0) * 1000.0;
+                _scaleGpuFrames++;
             } @catch (NSException *e) {
                 static BOOL w1 = NO;
                 if (!w1) { NSLog(@"[capture] GPU 缩图异常 %@，回退 vImage", e.reason); w1 = YES; }
@@ -293,6 +298,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         }
     }
 
+    _scaleCpuFrames++;
     CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferLockBaseAddress(dst, 0);
     vImage_Buffer sb = {
@@ -475,11 +481,16 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
     double allocMs = _allocMsSum / n;
     double dirtyMs = (_perfFrames > 0) ? _dirtyMsSum / n : 0.0;
-    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 脏图 %.1fms 合计 %.1fms / 预算 %.1fms | 闸门 pad=%.1fms prep=%.1fms 帧距=%.1fms 唤醒=%d",
-          realFps, allocMs, renderMs, scaleMs, pushMs, dirtyMs, costMs, budgetMs,
+    NSString *scaleSplit = [NSString stringWithFormat:@"GPU%d帧/%.1fms CPU%d帧",
+                            _scaleGpuFrames,
+                            (_scaleGpuFrames > 0 ? _scaleGpuMsSum / _scaleGpuFrames : 0.0),
+                            _scaleCpuFrames];
+    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 脏图 %.1fms 合计 %.1fms / 预算 %.1fms | 缩图后端 %@ | 闸门 pad=%.1fms prep=%.1fms 帧距=%.1fms 唤醒=%d",
+          realFps, allocMs, renderMs, scaleMs, pushMs, dirtyMs, costMs, budgetMs, scaleSplit,
           _pacePadSec * 1000.0, _prepMsAvg, (n > 0 ? span / n * 1000.0 : 0), _burstCount);
 
     _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0; _burstCount = 0; _dirtyMsSum = 0;
+    _scaleGpuMsSum = 0; _scaleGpuFrames = 0; _scaleCpuFrames = 0;
     _perfWindowStart = now;
 
     // 降档只用于「真的跑不动」：单帧耗时明显超过帧预算才会持续掉帧。
