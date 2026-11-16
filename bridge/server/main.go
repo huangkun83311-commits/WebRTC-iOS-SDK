@@ -57,6 +57,9 @@ type hub struct {
 	mu    sync.RWMutex
 	rooms map[string]map[*client]struct{}
 	sfu   *sfu
+	// 每个房间最近一次生效的画质档（授权档 / 中控档）：设备重连或换机时自动套用，
+	// 不用每次人工重下参数。key 是设备房间名（dev001），value 是 cfg 报文。
+	profiles map[string]map[string]interface{}
 }
 
 func newHub() *hub { return &hub{rooms: make(map[string]map[*client]struct{}), sfu: newSFU()} }
@@ -141,6 +144,23 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	n := h.join(c)
 	log.Printf("join room=%s role=%s peers=%d", room, role, n)
 	h.notify(c, "_peerJoined")
+
+	// 设备控制通道（ctrl-xxx）一连上就把它所在房间的档位套一遍：
+	// 这样「授权档 / 中控档」在设备重连、换机、重启后都自动恢复，
+	// 不需要人工再点一次参数，正是用户要的"授权时按档次下发、平常用插件默认"。
+	if strings.HasPrefix(room, "ctrl-") {
+		dev := strings.TrimPrefix(room, "ctrl-")
+		h.mu.RLock()
+		prof := h.profiles[dev]
+		h.mu.RUnlock()
+		if prof != nil {
+			if payload, err := json.Marshal(prof); err == nil {
+				if err := c.send(payload); err == nil {
+					log.Printf("应用存档档位 room=%s %s", dev, payload)
+				}
+			}
+		}
+	}
 
 	defer func() {
 		h.leave(c)
@@ -337,12 +357,16 @@ func httpPortFromAddr(addr string) int {
 	return p
 }
 
+// roundKbps 只保留 10kbps 精度，避免把 1234.5678 这种数塞给前端
+func roundKbps(v float64) int { return int(v/10) * 10 }
+
 func main() {
 	addr := flag.String("addr", ":8080", "监听地址，例如 :8080")
 	discPort := flag.Int("disc", 19951, "UDP 自动发现端口，0 表示关闭")
 	flag.Parse()
 
 	h := newHub()
+	h.profiles = map[string]map[string]interface{}{}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
@@ -397,7 +421,7 @@ func main() {
 			room = "dev001"
 		}
 		msg := map[string]interface{}{"t": "cfg"}
-		for _, k := range []string{"scale", "fps", "bitrate"} {
+		for _, k := range []string{"scale", "fps", "bitrate", "cap"} {
 			if v := r.URL.Query().Get(k); v != "" {
 				msg[k] = v
 			}
@@ -413,8 +437,111 @@ func main() {
 				n++
 			}
 		}
+		// 记住这次生效的档位（合并而不是覆盖，方便分别改清晰度和上限）
+		h.mu.Lock()
+		if h.profiles[room] == nil {
+			h.profiles[room] = map[string]interface{}{"t": "cfg"}
+		}
+		for k, v := range msg {
+			h.profiles[room][k] = v
+		}
+		h.mu.Unlock()
 		log.Printf("config room=%s sent=%d %s", room, n, payload)
 		writeJSON(w, map[string]interface{}{"sent": n, "payload": string(payload)})
+	})
+
+	// 档次推荐：/api/preset?room=dev001&devices=20&uplink=50&mode=console|auth&apply=1
+	// 按"上行总带宽 / 台数"算出每台可用峰值，再换成 cap / scale / fps。
+	// 目的：授权时按档次一键下发低清档，中控回到插件默认档，安全又不用记参数。
+	mux.HandleFunc("/api/preset", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		room := q.Get("room")
+		if room == "" {
+			room = "dev001"
+		}
+		devices := 1
+		if v, err := strconv.Atoi(q.Get("devices")); err == nil && v > 0 {
+			devices = v
+		}
+		uplink := 50.0
+		if v, err := strconv.ParseFloat(q.Get("uplink"), 64); err == nil && v > 0 {
+			uplink = v
+		}
+		mode := q.Get("mode")
+		if mode == "" {
+			mode = "console"
+		}
+		// 留 10% 余量：TCP/信令/重传都要占，满载跑满上行必然排队 → 反而卡
+		// perDevKbps 是"每台可用峰值"，单位 kbps：上行 50M 走 10% 余量后按台数摊
+		perDevKbps := uplink * 1000 * 0.9 / float64(devices)
+		var scale float64
+		fps := 30
+		cap := int(perDevKbps * 1000) // bps
+		if mode == "auth" {
+			// 授权档：只看得到在做什么，字还得认得出，其他一律让路
+			scale = 0.30
+			fps = 20
+			if cap > 800000 {
+				cap = 800000
+			}
+			if cap < 250000 {
+				cap = 250000
+			}
+		} else {
+			switch {
+			case perDevKbps >= 2500:
+				scale = 0.40
+			case perDevKbps >= 1200:
+				scale = 0.35
+			default:
+				scale = 0.30
+				fps = 24
+			}
+			if cap > 4000000 {
+				cap = 4000000
+			}
+			if cap < 600000 {
+				cap = 600000
+			}
+		}
+		base := cap * 3 / 5 // 稳态基线上限 = 峰值的 60%，余下留给突发，静态时不占
+		p := map[string]interface{}{
+			"mode":    mode,
+			"devices": devices,
+			"uplink":  uplink,
+			"perDev":  roundKbps(perDevKbps),
+			"scale":   scale,
+			"fps":     fps,
+			"cap":     cap,
+			"bitrate": base,
+		}
+		if q.Get("apply") != "" && q.Get("apply") != "0" {
+			msg := map[string]interface{}{"t": "cfg", "scale": strconv.FormatFloat(scale, 'f', 2, 64),
+				"fps": fps, "bitrate": base, "cap": cap}
+			payload, _ := json.Marshal(msg)
+			h.mu.RLock()
+			set := h.rooms["ctrl-"+room]
+			h.mu.RUnlock()
+			n := 0
+			for c := range set {
+				if err := c.send(payload); err == nil {
+					n++
+				}
+			}
+			h.mu.Lock()
+			if h.profiles[room] == nil {
+				h.profiles[room] = map[string]interface{}{"t": "cfg"}
+			}
+			for k, v := range msg {
+				h.profiles[room][k] = v
+			}
+			h.mu.Unlock()
+			p["sent"] = n
+			p["payload"] = string(payload)
+			log.Printf("preset room=%s mode=%s devices=%d perDev=%.0fkbps cap=%d scale=%.2f sent=%d",
+				room, mode, devices, perDevKbps, cap, scale, n)
+		}
+		writeJSON(w, p)
 	})
 
 	static, err := fs.Sub(webFS, "web")

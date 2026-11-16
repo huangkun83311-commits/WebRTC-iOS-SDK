@@ -51,14 +51,30 @@
   <!-- 画质档位：默认「标准」= AKUN 出厂值 0.35 / 12fps / 1.5Mbps；
        授权给别人看用「省流」，自己中控看用「高清/超清」，切换即时生效不用重装 -->
   <select id="quality" title="画质档位（改的是设备端的 scale/fps/码率，即时生效）">
-    <option value="0.35,30,700000" selected>流畅·默认 0.35 / 30fps / 0.7M（=AKUN清晰度，长跑不烫）</option>
-    <option value="0.35,45,900000">更跟手（局域网）0.35 / 45fps / 0.9M</option>
-    <option value="0.30,30,500000">省流·授权用 0.30 / 30fps / 0.5M（字仍可读）</option>
-    <option value="0.30,24,400000">极省 · 多机并发 0.30 / 24fps / 0.4M</option>
-    <option value="0.45,25,1200000">看字优先 0.45 / 25fps / 1.2M</option>
+    <option value="0.35,30,700000,1200000" selected>流畅·默认 0.35 / 30fps / 0.7M（=AKUN清晰度，长跑不烫）</option>
+    <option value="0.35,45,900000,1500000">更跟手（局域网）0.35 / 45fps / 0.9M</option>
+    <option value="0.30,30,500000,800000">省流·授权用 0.30 / 30fps / 0.5M（字仍可读）</option>
+    <option value="0.30,24,400000,600000">极省 · 多机并发 0.30 / 24fps / 0.4M</option>
+    <option value="0.45,25,1200000,1800000">看字优先 0.45 / 25fps / 1.2M</option>
   </select>
+  <!-- 档位自动换算：选"中控/授权"再填台数和上行总带宽，服务端按每台可用带宽算出
+       cap(单台上限) / scale(分辨率) / fps，一键下发；设备重连会自动套用上次的档。 -->
+  <select id="mode" title="中控=插件默认档；授权=低清档（只看操作，字仍可读）">
+    <option value="console" selected>中控 · 默认档</option>
+    <option value="auth">授权 · 低清档</option>
+  </select>
+  <select id="devs" title="同时连接的台数">
+    <option value="1" selected>1 台</option>
+    <option value="5">5 台</option>
+    <option value="10">10 台</option>
+    <option value="20">20 台</option>
+    <option value="30">30 台</option>
+  </select>
+  <label title="上行总带宽（Mbps）">上行</label><input id="uplink" value="50" size="3" style="width:52px" />
+  <button id="applyPreset" title="按 台数/上行 自动算出并下发档位">按档次下发</button>
+  <span id="presetInfo" style="color:#8b949e;font-size:12px"></span>
   <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v7 · 零开销跟手探针</span>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v8 · 档位自动换算</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -513,13 +529,31 @@
   // 画质档位：直接打设备端配置接口，设备收到后立即重建编码参数，不重装、不断流
   $('quality').onchange = async (ev) => {
     const room = ($('room').value || 'dev001').trim();
-    const [scale, fps, bitrate] = ev.target.value.split(',');
+    const [scale, fps, bitrate, cap] = ev.target.value.split(',');
     try {
-      const r = await fetch(`/api/config?room=${encodeURIComponent(room)}&scale=${scale}&fps=${fps}&bitrate=${bitrate}`);
+      const r = await fetch(`/api/config?room=${encodeURIComponent(room)}&scale=${scale}&fps=${fps}&bitrate=${bitrate}`
+        + (cap ? `&cap=${cap}` : ''));
       const j = await r.json();
       log('画质下发', j.payload, '设备数', j.sent);
       if (!j.sent) $('stat').textContent = '设备未连控制通道，档位没下发';
     } catch (e) { log('画质下发失败', e.message); }
+  };
+
+  // 按「模式 + 台数 + 上行」自动换算档位并下发（授权时用低清档，中控回默认档）
+  $('applyPreset').onclick = async () => {
+    const room = ($('room').value || 'dev001').trim();
+    const mode = $('mode').value;
+    const devs = $('devs').value;
+    const up = $('uplink').value || '50';
+    try {
+      const r = await fetch(`/api/preset?room=${encodeURIComponent(room)}&mode=${mode}`
+        + `&devices=${devs}&uplink=${up}&apply=1`);
+      const j = await r.json();
+      $('presetInfo').textContent = `每台 ${j.perDev}kbps · 上限 ${Math.round(j.cap/1000)}k`
+        + ` · ${j.scale} / ${j.fps}fps · 已下发 ${j.sent} 台`;
+      log('档位下发', j.payload);
+      if (!j.sent) $('stat').textContent = '设备未连控制通道，档位没下发';
+    } catch (e) { log('档位换算失败', e.message); }
   };
 
   function stopAll() {
