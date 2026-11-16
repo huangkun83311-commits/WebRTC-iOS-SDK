@@ -138,7 +138,7 @@ static double clamp01(double v) {
         // 走 touchDown/touchUp 两段，等价 AKUN 的 tap 行为。
         gLastInputMono = CACurrentMediaTime();
         [gen touchDownAtPoints:&p touchCount:1];
-        NSUInteger ms = cmd[@"ms"] ? [cmd[@"ms"] unsignedIntValue] : 120;
+        NSUInteger ms = cmd[@"ms"] ? [cmd[@"ms"] unsignedIntValue] : 60;
         if (ms < 30) { ms = 30; }
         if (ms > 800) { ms = 800; }
         usleep((useconds_t)(ms * 1000));
@@ -163,9 +163,10 @@ static double clamp01(double v) {
         if (_dragging) {
             _dragging = NO;
             CGPoint b = [self pointFromNormX:(x > 0 ? x : _lastX) y:(y > 0 ? y : _lastY)];
-            // 最短按住 100ms：网页鼠标点按常常只有 20~40ms，SpringBoard 会当成无效触摸丢掉
+            // 最短按住 60ms：网页鼠标点按常常只有 20~40ms，SpringBoard 会当成无效触摸丢掉；
+            // 但按太久也会直接加延迟（触摸是松手才生效），60ms 是「不被丢」和「不拖」的折中
             double held = CACurrentMediaTime() - _downTime;
-            if (held < 0.10) { usleep((useconds_t)((0.10 - held) * 1e6)); }
+            if (held < 0.06) { usleep((useconds_t)((0.06 - held) * 1e6)); }
             NSLog(@"[inject] up (%f,%f) 按住 %.0fms", b.x, b.y, held * 1000);
             [gen liftUpAtPoints:&b touchCount:1];
         }
