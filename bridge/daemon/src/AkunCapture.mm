@@ -58,6 +58,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     NSTimeInterval _lastChangeMono; // 最近一次「画面确实变了」的时刻
     NSTimeInterval _lastPushMono; // 上次真正推帧的时刻（fps 闸门用）
     double _prepMsAvg;            // 准备一帧（渲染+缩图+推帧）的滑窗平均耗时，闸门提前量用
+    double _costMsAvg;            // 单帧总耗时的跨窗口平均，「唤醒即发」用它判断流水线是否已空出来
+    int _burstCount;              // 本窗口内「唤醒即发」的次数（用于验证这一帧真的没排队）
     double _pacePadSec;           // 节拍闭环：上一帧实际间隔与目标的差距，逐个微调
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
@@ -342,7 +344,14 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double prep = MIN(_prepMsAvg / 1000.0, minGap * 0.9);
     BOOL timeOk = (now - _lastPushMono >= minGap - prep + _pacePadSec);
     BOOL keepaliveDue = (now - _lastPushTime >= 2.0);
-    if (!timeOk && !keepaliveDue) { return; }
+    // 「唤醒即发」：长时间静止后画面第一次变化（= 用户点了、开了应用），
+    // 不排队等下一拍，只要流水线已经空出来就立刻出帧。
+    // 这一帧平均省掉半个帧间隔（30fps 下约 17ms），而持续动画仍按 fps 走，
+    // 所以平均帧率/发热几乎不变 —— 这才是「跟手」和「不卡」能同时成立的地方。
+    BOOL wasIdle = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) > 0.35);
+    BOOL wakeBurst = wasIdle && (now - _lastPushMono >= _costMsAvg / 1000.0 * 1.05);
+    if (!timeOk && !keepaliveDue && !wakeBurst) { return; }
+    if (wakeBurst && !timeOk) { _burstCount++; }
 
     BOOL changed = YES;
     if (_dirtyFrameCount) {
@@ -402,6 +411,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
     double prepMs = (t3 - t0) * 1000.0;
     _prepMsAvg = MIN((_prepMsAvg <= 0.0) ? prepMs : (_prepMsAvg * 0.8 + prepMs * 0.2), 60.0);
+    double frameCostMs = ((t1 - t0) + (t2 - t1) + (t3 - t2)) * 1000.0;
+    _costMsAvg = (_costMsAvg <= 0.0) ? frameCostMs : (_costMsAvg * 0.85 + frameCostMs * 0.15);
 
     _perfFrames++;
     _allocMsSum += _lastAllocMs;
@@ -427,11 +438,11 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double budgetMs = 1000.0 / (double)_activeFps;
 
     double allocMs = _allocMsSum / n;
-    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms | 闸门 pad=%.1fms prep=%.1fms 帧距=%.1fms",
+    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms | 闸门 pad=%.1fms prep=%.1fms 帧距=%.1fms 唤醒=%d",
           realFps, allocMs, renderMs, scaleMs, pushMs, costMs, budgetMs,
-          _pacePadSec * 1000.0, _prepMsAvg, (n > 0 ? span / n * 1000.0 : 0));
+          _pacePadSec * 1000.0, _prepMsAvg, (n > 0 ? span / n * 1000.0 : 0), _burstCount);
 
-    _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0;
+    _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0; _burstCount = 0;
     _perfWindowStart = now;
 
     // 降档只用于「真的跑不动」：单帧耗时明显超过帧预算才会持续掉帧。
