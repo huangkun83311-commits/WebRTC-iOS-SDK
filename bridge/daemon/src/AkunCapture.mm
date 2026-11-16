@@ -36,6 +36,11 @@ static const int kDefaultFPS = 30;
 static const double kPollSec = 0.002;
 static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
+// 「跟手升帧」的时间戳：任何一次输入注入都会把它更新
+static double gInteractMono = 0.0;
+
+void AkunBridgeNoteInteraction(void) { gInteractMono = CACurrentMediaTime(); }
+
 @implementation AkunCapture {
     dispatch_queue_t _queue;
     dispatch_source_t _timer;
@@ -376,9 +381,16 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
     NSTimeInterval now = CACurrentMediaTime();
 
+    // 「跟手升帧」：用户正在操作的那 1.2 秒里把帧率临时抬到 40。
+    // 30fps 的最大问题是「点了以后还得等下一帧」，平均白等 17ms、最坏 33ms；
+    // 抬手期间 40fps 把这段压到 25ms 满格 —— 只在操作瞬间生效，停手立刻回落，
+    // 所以不会像常驻 45fps 那样两分钟就热降频。
+    int fpsNow = _activeFps;
+    if ((now - gInteractMono) < 1.2 && fpsNow < 40) { fpsNow = 40; }
+
     // 先做「该不该出帧」的时间判断，再查脏图：_dirtyFrameCount 是系统调用，
     // 2ms 轮询下每秒 500 次会把渲染拖慢（实测 6ms → 19ms）。时间没到就绝不查脏。
-    double minGap = 1.0 / (double)MAX(1, _activeFps);
+    double minGap = 1.0 / (double)MAX(1, fpsNow);
     double prep = MIN(_prepMsAvg / 1000.0, minGap * 0.9);
     BOOL timeOk = (now - _lastPushMono >= minGap - prep + _pacePadSec);
     BOOL keepaliveDue = (now - _lastPushTime >= 2.0);

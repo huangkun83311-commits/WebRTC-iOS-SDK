@@ -12,6 +12,9 @@
 
 // 全局：最后一次触摸注入的时刻（给抓屏侧算「点击→出帧」用）
 double gLastInputMono = 0.0;
+
+// 抓屏侧提供的「跟手升帧」钩子：每次注入输入就通知它，抓屏会在 1.2 秒内抬到 40fps
+extern void AkunBridgeNoteInteraction(void);
 #import "AkunOrientation.h"
 
 #import <UIKit/UIKit.h>
@@ -153,6 +156,7 @@ static double clamp01(double v) {
         CGPoint p = [self pointFromNormX:x y:y];
         NSLog(@"[inject] down (%f,%f)", p.x, p.y);
         gLastInputMono = CACurrentMediaTime();
+        AkunBridgeNoteInteraction();
         [gen touchDownAtPoints:&p touchCount:1];
     } else if ([t isEqualToString:@"m"]) {
         if (_dragging) {
@@ -176,16 +180,19 @@ static double clamp01(double v) {
         CGPoint p = [self pointFromNormX:x y:y];
         NSLog(@"[inject] dtap (%f,%f)", p.x, p.y);
         gLastInputMono = CACurrentMediaTime();
+        AkunBridgeNoteInteraction();
         [gen doubleTap:p];
     } else if ([t isEqualToString:@"swipe"]) {
         CGPoint a = [self pointFromNormX:x y:y];
         CGPoint b = [self pointFromNormX:[cmd[@"x2"] doubleValue] y:[cmd[@"y2"] doubleValue]];
+        AkunBridgeNoteInteraction();
         [gen dragLinearWithStartPoint:a endPoint:b duration:0.25];
     } else if ([t isEqualToString:@"k"]) {
         NSString *code = cmd[@"code"];
         if ([code isEqualToString:@"home"]) {
             // 以前这里既不打点也不记时刻，导致「按 home → 画面」这段无法被 [lat] 量到
             gLastInputMono = CACurrentMediaTime();
+            AkunBridgeNoteInteraction();
             NSLog(@"[inject] home");
             [gen menuPress];
         }
