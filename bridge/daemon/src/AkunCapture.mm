@@ -366,8 +366,16 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         double gap = now - _lastPushMono; // 上一帧到本帧的间隔
         double target = 1.0 / (double)MAX(1, _activeFps);
         if (gap > 0 && gap < 1.0) {
-            if (gap < target - 0.001) { _pacePadSec = MIN(_pacePadSec + (target - gap) * 0.5, target * 0.7); }
-            else if (gap > target + 0.002) { _pacePadSec = MAX(_pacePadSec - 0.001, 0.0); }
+            // 只做小幅修正：上限 15% 周期（约 5ms@30fps），回落按超时的 30% 一次扣到底。
+            // 老实现上限 70%（23ms）且每帧只降 1ms，会把 pad 卡在 15ms 以上，
+            // 出帧周期从 33ms 被拖到 48~150ms（实测帧距 149.6ms，perf 仅 6.7fps）。
+            double padMax = target * 0.15;
+            if (gap < target - 0.001) {
+                _pacePadSec = MIN(_pacePadSec + (target - gap) * 0.5, padMax);
+            } else if (gap > target + 0.001) {
+                double over = gap - target;
+                _pacePadSec = MAX(_pacePadSec - MIN(_pacePadSec, over * 0.3), 0.0);
+            }
         }
     }
 
@@ -393,7 +401,7 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     NSTimeInterval t3 = CACurrentMediaTime();
 
     double prepMs = (t3 - t0) * 1000.0;
-    _prepMsAvg = (_prepMsAvg <= 0.0) ? prepMs : (_prepMsAvg * 0.8 + prepMs * 0.2);
+    _prepMsAvg = MIN((_prepMsAvg <= 0.0) ? prepMs : (_prepMsAvg * 0.8 + prepMs * 0.2), 60.0);
 
     _perfFrames++;
     _allocMsSum += _lastAllocMs;
