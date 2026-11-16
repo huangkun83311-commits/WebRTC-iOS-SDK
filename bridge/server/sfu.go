@@ -93,6 +93,64 @@ type sfuPeer struct {
 	candMu   sync.Mutex
 	candSent bool
 	candBuf  []map[string]interface{}
+
+	lan bool // 该连接是否局域网直连（决定发内网候选还是公网候选）
+}
+
+// hostIsLAN 判断这次请求是不是来自局域网（直连 8080 / 经反代但 Host 是内网地址）。
+// 用途：内网观看端不要把公网 6900 候选也发给他（绕大圈、RTT 从 0 变 50ms+）；
+// 外网观看端不要把 192.168.x / 169.254 / IPv6 候选发给他（浏览器会先试这些死地址，
+// 白等几秒才回退公网候选 —— 外网首帧 3 秒就是这么来的）。
+func hostIsLAN(hostport string) bool {
+	h := hostport
+	if i := strings.LastIndex(hostport, ":"); i > 0 {
+		h = hostport[:i]
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	if ip == nil {
+		// 域名（本机测试/反代）按局域网处理
+		return true
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
+}
+
+// isLANAddr 单个候选地址是否属于"只有局域网才能通"的那类。
+func isLANAddr(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	if ip.To4() == nil {
+		return true // IPv6：frp 没映射，外网用不到
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
+}
+
+// rewriteSDPForPublic 外网访问时重写 answer SDP：删掉所有内网/链路本地/IPv6 候选，
+// 换成唯一一条公网映射候选。只过滤 trickle 是不够的 —— 候选同时写在 SDP 里，
+// 浏览器会优先用 SDP 里的死地址，白等几秒才回退，这就是外网首帧慢的原因。
+func rewriteSDPForPublic(sdp, pubIP string, pubPort int) string {
+	lines := strings.Split(sdp, "\n")
+	out := make([]string, 0, len(lines)+1)
+	added := false
+	for _, ln := range lines {
+		trimmed := strings.TrimSuffix(ln, "\r")
+		if strings.HasPrefix(trimmed, "a=candidate:") {
+			f := strings.Fields(trimmed)
+			// a=candidate:<foundation> <component> <proto> <prio> <addr> <port> typ host ...
+			if len(f) >= 6 && isLANAddr(f[4]) {
+				continue
+			}
+			out = append(out, ln)
+			continue
+		}
+		out = append(out, ln)
+		if !added && strings.HasPrefix(trimmed, "a=ice-ufrag:") {
+			out = append(out, fmt.Sprintf("a=candidate:99 1 udp 2130706431 %s %d typ host generation 0", pubIP, pubPort))
+			added = true
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // sendCand 发送一条 ICE 候选；answer 发出前先缓存，避免对端还没 remote description。
@@ -137,6 +195,49 @@ type viewer struct {
 	pt       uint8
 	packets  atomic.Uint64
 	lastSeen atomic.Int64
+	lastPli  atomic.Int64 // 浏览器 PLI 限流，避免每帧都喊手机
+}
+
+// rtpCache 房间级重传缓存。
+// 关键：服务端只是转发，浏览器丢包后会发 NACK 请求重传；以前这里把观看端 RTCP 直接丢弃，
+// 丢掉的包永远补不回来 —— 浏览器只能干等下一个关键帧，外网"冻 13.9 秒"就是这么来的。
+// 现在把最近 600 个包留在内存里，NACK 来了就地补发（每个观看端按自己的 payload type 改写）。
+type rtpCache struct {
+	mu    sync.Mutex
+	m     map[uint16]*rtp.Packet
+	order []uint16
+}
+
+func (c *rtpCache) put(p *rtp.Packet) {
+	cp := *p
+	cp.Payload = append([]byte(nil), p.Payload...)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[uint16]*rtp.Packet, 640)
+	}
+	if _, ok := c.m[p.SequenceNumber]; ok {
+		return
+	}
+	c.m[p.SequenceNumber] = &cp
+	c.order = append(c.order, p.SequenceNumber)
+	if len(c.order) > 600 {
+		old := c.order[0]
+		c.order = c.order[1:]
+		delete(c.m, old)
+	}
+}
+
+func (c *rtpCache) get(seq uint16) *rtp.Packet {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.m[seq]
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.Payload = append([]byte(nil), p.Payload...)
+	return &cp
 }
 
 type sfuRoom struct {
@@ -149,6 +250,7 @@ type sfuRoom struct {
 	h264Info string       // 手机的 H264 fmtp，给直绘端 configure 用
 	lastLog time.Time
 	sent    atomic.Uint64
+	cache   rtpCache
 }
 
 type sfu struct {
@@ -276,7 +378,8 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 		log.Printf("sfu upgrade failed: %v", err)
 		return
 	}
-	p := &sfuPeer{room: room, role: role, conn: conn}
+	lanAccess := hostIsLAN(r.Host)
+	p := &sfuPeer{room: room, role: role, conn: conn, lan: lanAccess}
 	rm := s.room(room)
 
 	pc, err := newPeer()
@@ -293,6 +396,12 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 			return
 		}
 		j := c.ToJSON()
+		// 按访问来源只发"真能通"的那一类候选：
+		// 外网访问 → 只留 IPv4 公网侧（内网/169.254/IPv6 一律不发，避免浏览器白等）；
+		// 内网访问 → 只留内网，别把公网绕行候选塞给局域网用户。
+		if !p.lan && c.Address != "" && isLANAddr(c.Address) {
+			return
+		}
 		p.sendCand(map[string]interface{}{
 			"type":          "candidate",
 			"candidate":     j.Candidate,
@@ -301,7 +410,7 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 		})
 		// 额外补一条"公网映射"候选：只有当 ICE UDP 固定端口 + 公网 IP 都配了才发。
 		// 浏览器同时拿到内网 192.168.x.x:6900 和公网 106.52.43.129:6900，谁通走谁。
-		if icePublicIP != "" && iceUDPPort > 0 && !publicCandSent {
+		if !p.lan && icePublicIP != "" && iceUDPPort > 0 && !publicCandSent {
 			publicCandSent = true
 			p.sendCand(map[string]interface{}{
 				"type":          "candidate",
@@ -355,6 +464,9 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 						rs.push(raw)
 					}
 				}
+			}
+			if len(targets) > 0 {
+				rm.cache.put(pkt)
 			}
 			for _, v := range targets {
 				out := *pkt
@@ -507,16 +619,58 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 					log.Printf("sfu addtrack: %v", err)
 					return
 				}
-				go func(sender *webrtc.RTPSender) {
-					// 观看端的 RTCP（NACK/PLI）丢弃；丢包重传由浏览器侧 NACK 就地处理。
-					buf := make([]byte, 1500)
+				vw = &viewer{peer: p, track: track, pt: prof.payloadType}
+				// 观看端 RTCP：NACK 从房间缓存就地补发，PLI 转给手机要关键帧。
+				go func(sender *webrtc.RTPSender, v *viewer) {
+					buf := make([]byte, 2048)
 					for {
-						if _, _, err := sender.Read(buf); err != nil {
+						n, _, err := sender.Read(buf)
+						if err != nil {
 							return
 						}
+						pkts, err := rtcp.Unmarshal(buf[:n])
+						if err != nil {
+							continue
+						}
+						for _, pk := range pkts {
+							switch x := pk.(type) {
+							case *rtcp.TransportLayerNack:
+								var nacked, sent int
+								for _, pair := range x.Nacks {
+									for _, seq := range pair.PacketList() {
+										rp := rm.cache.get(seq)
+										if rp == nil {
+											nacked++
+											continue
+										}
+										out := *rp
+										out.PayloadType = v.pt
+										if err := v.track.WriteRTP(&out); err == nil {
+											sent++
+										}
+									}
+								}
+								if sent > 0 && time.Now().UnixNano()-v.lastPli.Load() > int64(2*time.Second) {
+									log.Printf("sfu room=%s 补发重传 %d 包（缓存未命中 %d）", room, sent, nacked)
+								}
+							case *rtcp.PictureLossIndication:
+								// 浏览器自己发现画面卡了 → 立刻转给手机（限流 500ms 一次）
+								if time.Now().UnixNano()-v.lastPli.Load() > int64(500*time.Millisecond) {
+									v.lastPli.Store(time.Now().UnixNano())
+									rm.mu.RLock()
+									pub2 := rm.pub
+									ssrc2 := rm.pubSSRC
+									rm.mu.RUnlock()
+									if pub2 != nil && pub2.pc != nil {
+										_ = pub2.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc2}})
+									}
+									kickFrame(room)
+									log.Printf("sfu room=%s 观看端PLI→已向手机要关键帧", room)
+								}
+							}
+						}
 					}
-				}(rs)
-				vw = &viewer{peer: p, track: track, pt: prof.payloadType}
+				}(rs, vw)
 				rm.mu.Lock()
 				rm.readers = append(rm.readers, vw)
 				rm.mu.Unlock()
@@ -537,7 +691,12 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 				return
 			}
 			<-gather
-			_ = p.sendJSON(map[string]interface{}{"type": "answer", "sdp": pc.LocalDescription().SDP})
+			answerSDP := pc.LocalDescription().SDP
+			if !p.lan && icePublicIP != "" && iceUDPPort > 0 {
+				answerSDP = rewriteSDPForPublic(answerSDP, icePublicIP, iceUDPPort)
+				log.Printf("sfu room=%s 外网观看端：answer 只保留公网候选 %s:%d", room, icePublicIP, iceUDPPort)
+			}
+			_ = p.sendJSON(map[string]interface{}{"type": "answer", "sdp": answerSDP})
 			// answer 已发，对端可以 SetRemoteDescription 了，这时候补发攒下的候选。
 			p.flushCand()
 			log.Printf("sfu room=%s role=%s 已回 answer", room, role)

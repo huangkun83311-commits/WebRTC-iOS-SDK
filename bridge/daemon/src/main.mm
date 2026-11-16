@@ -503,7 +503,10 @@ static NSString *AkunLocalIPv4(void) {
 
 - (void)scheduleReconnect {
     self.reconnectAttempt++;
-    double delay = MIN(pow(2.0, (double)self.reconnectAttempt), 30.0);
+    // 重连退避：0.5 → 1 → 2 → 4 → 5 秒封顶。
+    // 原来是 2/4/8/16/30，服务端一重启手机要等十几秒才回来，
+    // 用户看到的就是「首帧 7s / 16s」。网络抖一下也只掉半秒。
+    double delay = MIN(0.5 * pow(2.0, (double)(self.reconnectAttempt - 1)), 5.0);
     NSLog(@"[daemon] %0.1fs 后重连（第 %ld 次）", delay, (long)self.reconnectAttempt);
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
