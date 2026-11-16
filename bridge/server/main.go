@@ -489,15 +489,29 @@ func main() {
 			fps = 8
 			cap = 400000
 		} else if mode == "auth" {
-			// 授权档：只看得到在做什么，字还得认得出，其他一律让路
-			scale = 0.30
-			fps = 20
-			if cap > 800000 {
-				cap = 800000
+			// 授权档：授权出去几十台，但同时被看的只有 10-20 路。
+			// 按"同时路数"摊上行才有意义；按总台数摊会把每台压到看不了字。
+			conc := 20
+			if v, err := strconv.Atoi(q.Get("concurrent")); err == nil && v > 0 {
+				conc = v
+			} else if devices < 20 {
+				conc = devices
 			}
-			if cap < 250000 {
-				cap = 250000
+			perConcKbps := uplink * 1000 * 0.9 / float64(conc)
+			cap = int(perConcKbps * 1000)
+			scale = 0.35
+			fps = 30
+			if cap < 1000000 {
+				scale = 0.32
+				fps = 24
 			}
+			if cap > 1500000 {
+				cap = 1500000
+			}
+			if cap < 500000 {
+				cap = 500000
+			}
+			perDevKbps = perConcKbps
 		} else {
 			switch {
 			case perDevKbps >= 2500:
