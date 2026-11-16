@@ -421,6 +421,11 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     // 触摸必然改变画面，等探测只是白等；交互期强制出帧后，
     // 静止期的脏图探测就可以放心放慢，CPU 从半个核降到 5% 以下。
     BOOL forceNow = (gInteractMono > 0.0) && ((now - gInteractMono) < 1.5) && (gInteractMono > 0.0);
+    // 交互期允许插队，但必须封顶：原来只要 1.5s 内有触摸就无条件出帧，
+    // 实测连续点击会跑到 113fps（渲染 5.2ms + 缩图 3.0ms + 编码 7ms ≈ 单核打满），
+    // 而跟手已经到 10~17ms 的单帧级别，再快手感不会更好，只会发热降频。
+    // 交互期按 fps+4 硬闸；静止唤醒的第一帧不受影响（那帧间隔本来远超闸门）。
+    if (forceNow && (now - _lastPushMono) < 1.0 / (double)(fpsNow + 4)) { return; }
     // 关键：静止时不能再走 timeOk。timeOk 在静止期永远成立（距上次推帧已经 2 秒），
     // 结果每个 2ms 轮询都去查一次脏图 —— 实测 2 秒烧掉 900ms CPU（半个核），
     // 机器持续发热，十几分钟后热降频，正是"越用越卡"的来源。

@@ -604,6 +604,8 @@
             tapMs: tapHits.length ? tapHits[tapHits.length - 1] : null, ff: firstFrameMs,
             gapMax: Math.round(gapMax), tab: TABID, vis: document.visibilityState, inapp: IN_APP
           }) });
+        // 每秒清零：否则 HUD 显示的是「页面打开以来的最长间隔」，不是当前状态
+        gapMax = 0;
       } catch (e) {}
     } catch (e) {}
   }, 1000);
