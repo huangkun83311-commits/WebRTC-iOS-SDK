@@ -488,7 +488,10 @@
   setInterval(() => {
     if (document.visibilityState !== 'visible') { return; }
     const now = performance.now();
-    if (lastFrameAt > 0 && now - lastFrameAt > 1500 && now - kfAt > 1500) {
+    // 两种情况都要自救：① 出过帧但卡住 1.5s；② 建连 3s 还一帧都没出（开窗一直黑）。
+    const stalled = lastFrameAt > 0 ? (now - lastFrameAt > 1500)
+                                    : (framesTotal === 0 && now - tPage0 > 3000);
+    if (stalled && now - kfAt > 1500) {
       kfAt = now;
       try {
         if (videoWs && videoWs.readyState === 1) {
