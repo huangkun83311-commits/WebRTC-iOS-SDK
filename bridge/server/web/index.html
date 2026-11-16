@@ -40,6 +40,26 @@
   #hud hr{border:0;border-top:1px solid #21262d;margin:7px 0}
   #hud .tap{color:#8b949e}
   #hud .tap b{color:#58a6ff}
+  /* 辅助功能面板：对标 AKUN 的 19940 动作集，但走我们自己的 WS 通道 */
+  #aux{position:fixed;left:14px;bottom:14px;width:340px;max-height:62vh;overflow:auto;
+       background:rgba(13,17,23,.95);border:1px solid #2b333f;border-radius:10px;
+       padding:10px 12px;font:12px/1.6 -apple-system,"Microsoft Yahei",sans-serif;z-index:26;
+       box-shadow:0 6px 24px rgba(0,0,0,.5)}
+  #aux.hide{display:none}
+  #aux h4{margin:0 0 8px;font:600 12px/1.4 -apple-system,"Microsoft Yahei",sans-serif;color:#8b949e;letter-spacing:.5px}
+  #aux .grp{display:flex;gap:6px;margin-bottom:7px;align-items:center}
+  #aux .grp input{flex:1;min-width:0;background:#0d1117;border:1px solid #30363d;color:#e6e9ef;
+       border-radius:6px;padding:4px 6px;font:12px -apple-system,"Microsoft Yahei",sans-serif}
+  #aux button{background:#21262d;border:1px solid #30363d;color:#e6e9ef;border-radius:6px;
+       padding:3px 8px;font:12px -apple-system,"Microsoft Yahei",sans-serif;cursor:pointer;white-space:nowrap}
+  #aux button:hover{background:#30363d}
+  #aux .ok{color:#3fb950}
+  #aux .bad{color:#f85149}
+  #aux .muted{color:#8b949e}
+  #aux .out{border-top:1px solid #21262d;margin-top:6px;padding-top:6px;font:12px/1.6 ui-monospace,Consolas,monospace;
+       color:#c9d1d9;max-height:34vh;overflow:auto}
+  #aux .app{display:flex;justify-content:space-between;gap:6px;padding:1px 0}
+  #aux .app span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -74,7 +94,8 @@
   <button id="applyPreset" title="按 台数/上行 自动算出并下发档位">按档次下发</button>
   <span id="presetInfo" style="color:#8b949e;font-size:12px"></span>
   <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v9 · 右键不再误点</span>
+  <button id="auxBtn" class="ghost" title="辅助功能：文字输入 / 锁屏唤醒 / 音量亮度 / 应用启停 / 剪贴板">辅助功能</button>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v10 · 辅助功能全接</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -107,6 +128,47 @@
   <h4>跟手实测（本机）</h4>
   <div class="row"><span>点击→画面变化</span><span class="v" id="hTap">--</span></div>
   <div class="tap" id="hTapLog">按下游画面里点击一次即可测</div>
+</div>
+
+<div id="aux" class="hide">
+  <h4>辅助功能 · 与 AKUN 同功能，走本机 WebRTC 控制通道</h4>
+  <div class="grp">
+    <input id="auxText" placeholder="要输入的文字（中文走剪贴板粘贴）" />
+    <button id="auxSendText" title="写入设备剪贴板 + 键盘通道 Cmd+V 粘贴">输入</button>
+  </div>
+  <div class="grp">
+    <button data-aux="lock">锁屏</button>
+    <button data-aux="unlock">唤醒</button>
+    <button data-aux="respring">注销</button>
+    <button data-aux="go_home">回桌面</button>
+    <button data-aux="device_info">设备信息</button>
+  </div>
+  <div class="grp">
+    <button data-aux="volume_up">音量+</button>
+    <button data-aux="volume_down">音量-</button>
+    <button data-aux="toggle_mute">静音</button>
+    <button data-aux="brightness_up">亮度+</button>
+    <button data-aux="brightness_down">亮度-</button>
+  </div>
+  <div class="grp">
+    <input id="auxTarget" placeholder="网址 或 BundleID（如 com.apple.mobilesafari）" />
+    <button id="auxOpen" title="https:// 开头按打开网址处理，否则按 BundleID 启动">打开</button>
+  </div>
+  <div class="grp">
+    <button onclick="__auxKey('enter')" title="发送回车键">回车</button>
+    <button onclick="__auxKey('backspace')" title="发送退格键">退格</button>
+    <button onclick="__auxKey('escape')" title="发送 Esc">Esc</button>
+    <button onclick="__auxKey('up')" title="方向键上">↑</button>
+    <button onclick="__auxKey('down')" title="方向键下">↓</button>
+    <button onclick="__auxKey('left')" title="方向键左">←</button>
+    <button onclick="__auxKey('right')" title="方向键右">→</button>
+  </div>
+  <div class="grp">
+    <button id="auxApps" title="列出已安装应用">应用列表</button>
+    <button id="auxClip" title="读设备剪贴板">取剪贴板</button>
+    <button id="auxClose" class="ghost">收起</button>
+  </div>
+  <div class="out" id="auxOut">--</div>
 </div>
 
 <div class="stage is-idle" id="stage">
@@ -305,6 +367,7 @@
              + (cfg.scale != null ? cfg.scale.toFixed(2) : '--'));
         return;
       }
+      if (m && m.t === 'auxResult') { onAuxResult(m); return; }
       log('ctrl recv', ev.data);
     };
   }
@@ -515,6 +578,68 @@
     }, 2000);
   }
 
+
+  /* ---------------- 辅助功能（对标 AKUN 的 19940 动作集） ---------------- */
+  let auxSeq = 0;
+  function auxSend(a, extra) {
+    const id = ++auxSeq;
+    ctrl(Object.assign({ t: 'aux', a: a, id: id }, extra || {}));
+    setAuxOut('已发送 ' + a + (extra && extra.text ? '：' + extra.text : ''));
+    return id;
+  }
+  function setAuxOut(html) { $('auxOut').innerHTML = html; }
+
+  function esc(t) {
+    return String(t == null ? '' : t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function onAuxResult(m) {
+    const a = m.a;
+    if (m.success === false) { setAuxOut('<span class="bad">' + esc(a) + ' 失败：' + esc(m.error || '未知') + '</span>'); return; }
+    if (a === 'list_apps') {
+      const apps = m.apps || [];
+      setAuxOut('<div class="muted">已安装 ' + (m.count || apps.length) + ' 个（显示前 60 个）</div>'
+        + apps.slice(0, 60).map(A =>
+          '<div class="app"><span>' + esc(A.name) + '<br><span class="muted" style="font-size:11px">' + esc(A.bundle) + '</span></span>'
+          + '<button onclick="__auxLaunch(\'' + esc(A.bundle) + '\')">启动</button>'
+          + '<button onclick="__auxKill(\'' + esc(A.bundle) + '\')">关闭</button></div>').join(''));
+      return;
+    }
+    if (a === 'get_clipboard') { setAuxOut('剪贴板：<b>' + esc(m.text || '（空）') + '</b>'); return; }
+    if (a === 'device_info') {
+      setAuxOut('<div>型号 ' + esc(m.model) + ' · iOS ' + esc(m.system_version) + '</div>'
+        + '<div class="muted">' + esc(m.udid) + '</div><div class="muted">deb ' + esc(m.version) + '</div>');
+      return;
+    }
+    if (a === 'find_app') {
+      setAuxOut(m.name ? ('找到：<b>' + esc(m.name) + '</b><br><span class="muted">' + esc(m.bid) + '</span> '
+        + '<button onclick="__auxLaunch(\'' + esc(m.bid) + '\')">启动</button>') : '没找到');
+      return;
+    }
+    setAuxOut('<span class="ok">' + esc(a) + ' 完成</span>' + (m.text ? '：' + esc(m.text) : ''));
+  }
+  window.__auxKey = (k) => { auxSend('key', { code: k }); };
+  window.__auxLaunch = (b) => { auxSend('launch_app', { bundle: b }); };
+  window.__auxKill = (b) => { auxSend('kill_app', { bundle: b }); };
+
+  $('auxBtn').onclick = () => $('aux').classList.toggle('hide');
+  $('auxClose').onclick = () => $('aux').classList.add('hide');
+  document.querySelectorAll('#aux [data-aux]').forEach(b => {
+    b.onclick = () => auxSend(b.getAttribute('data-aux'));
+  });
+  $('auxSendText').onclick = () => {
+    const t = $('auxText').value;
+    if (!t) { setAuxOut('先填文字'); return; }
+    auxSend('input_text', { text: t });
+  };
+  $('auxOpen').onclick = () => {
+    const v = ($('auxTarget').value || '').trim();
+    if (!v) { setAuxOut('先填网址或 BundleID'); return; }
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(v)) auxSend('open_url', { url: v });
+    else auxSend('launch_app', { bundle: v });
+  };
+  $('auxApps').onclick = () => auxSend('list_apps');
+  $('auxClip').onclick = () => auxSend('get_clipboard');
 
   /* ---------------- 面板开关 ---------------- */
   function toggleHud() { $('hud').classList.toggle('hide'); }

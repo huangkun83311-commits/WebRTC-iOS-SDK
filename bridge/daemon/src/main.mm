@@ -277,7 +277,21 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
             NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             if ([cmd isKindOfClass:[NSDictionary class]]) {
                 NSString *type = cmd[@"t"];
-                if ([type isEqualToString:@"ping"]) {
+                NSString *act = cmd[@"action"];
+                // AKUN 19940 风格裸 JSON：{"action":"list_apps"} → 回 {"success":...}
+                // 中控的辅助功能模块一行都不用改，只把发送通道从 19940 换成我们的 WS。
+                if (act.length) {
+                    {
+                        NSMutableDictionary *res2 = [NSMutableDictionary dictionaryWithDictionary:
+                            [self.injector handleAux:cmd] ?: @{ @"success" : @NO }];
+                        res2[@"version"] = @"1.0.0";
+                        NSData *d2 = [NSJSONSerialization dataWithJSONObject:res2 options:0 error:nil];
+                        NSString *s2 = [[NSString alloc] initWithData:d2 encoding:NSUTF8StringEncoding];
+                        NSLog(@"[aux] %@ -> %@", act, res2[@"success"]);
+                        [self.ctrlTask sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:s2]
+                                  completionHandler:^(NSError *e) {}];
+                    }
+                } else if ([type isEqualToString:@"ping"]) {
                     // 只测控制链路往返，不触发任何动作
                     NSDictionary *pong = @{@"t" : @"pong", @"ts" : cmd[@"ts"] ?: @0};
                     NSData *d = [NSJSONSerialization dataWithJSONObject:pong options:0 error:nil];
@@ -307,6 +321,18 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
                     [self.rtc setAdaptiveBaseScale:scale bitrate:br];
                     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br; self.cfgHardCap = cap;
                     [self.capture setFps:fps];
+                } else if ([cmd[@"t"] isEqualToString:@"aux"]) {
+                    // 辅助功能：与 AKUN 的 19940 动作一一对应，但走我们自己的控制通道
+                    NSDictionary *res = [self.injector handleAux:cmd] ?: @{ @"success" : @NO };
+                    NSMutableDictionary *reply = [NSMutableDictionary dictionaryWithDictionary:res];
+                    reply[@"t"] = @"auxResult";
+                    reply[@"a"] = cmd[@"a"] ?: @"";
+                    if (cmd[@"id"]) { reply[@"id"] = cmd[@"id"]; }
+                    NSData *rd = [NSJSONSerialization dataWithJSONObject:reply options:0 error:nil];
+                    NSString *rs = [[NSString alloc] initWithData:rd encoding:NSUTF8StringEncoding];
+                    NSLog(@"[aux] %@ -> %@", cmd[@"a"], res[@"success"]);
+                    [self.ctrlTask sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:rs]
+                              completionHandler:^(NSError *e) {}];
                 } else {
                     NSString *ct = cmd[@"t"];
                     if ([ct isEqualToString:@"tap"] || [ct isEqualToString:@"dtap"] ||

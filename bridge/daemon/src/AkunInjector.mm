@@ -18,6 +18,44 @@ extern void AkunBridgeNoteInteraction(void);
 #import "AkunOrientation.h"
 
 #import <UIKit/UIKit.h>
+#import <objc/message.h>
+#import <dlfcn.h>
+#import <spawn.h>
+#import <sys/wait.h>
+
+// ---- 私有 API 的轻量调用助手（辅助功能用）----
+static id akun_msg0(id obj, NSString *sel) {
+    SEL s = NSSelectorFromString(sel);
+    if (!obj || ![obj respondsToSelector:s]) { return nil; }
+    id (*fn)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    return fn(obj, s);
+}
+static __attribute__((unused)) id akun_msg1(id obj, NSString *sel, id a) {
+    SEL s = NSSelectorFromString(sel);
+    if (!obj || ![obj respondsToSelector:s]) { return nil; }
+    id (*fn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+    return fn(obj, s, a);
+}
+static BOOL akun_bool1(id obj, NSString *sel, id a) {
+    SEL s = NSSelectorFromString(sel);
+    if (!obj || ![obj respondsToSelector:s]) { return NO; }
+    BOOL (*fn)(id, SEL, id) = (BOOL (*)(id, SEL, id))objc_msgSend;
+    return fn(obj, s, a);
+}
+// LSApplicationWorkspace：私有框架，daemon 里 dlopen 后按类名取
+static id akun_appWorkspace(void) {
+    static id ws = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+        dlopen("/System/Library/PrivateFrameworks/CoreServicesStore.framework/CoreServicesStore", RTLD_LAZY);
+        Class c = NSClassFromString(@"LSApplicationWorkspace");
+        ws = akun_msg0(c, @"defaultWorkspace");
+    });
+    return ws;
+}
+
+
 
 #import "vendor/STHIDEventGenerator.h"
 #import "vendor/Logging.h"
@@ -29,6 +67,11 @@ BOOL tvncVerboseLoggingEnabled = NO;
 int gOrientationFixQuad = 0;
 
 // 这几个入口在 .h 里没有，但 AKUN 的 vnc 服务就是直接这么调的（见 trollvncserver.mm ptrAddEvent）
+// 键盘通道：AKUN 的 input_text 就是「写剪贴板 + Cmd+V」，走的正是这个方法
+@interface STHIDEventGenerator (AkunPrivateKeyboard)
+- (void)_sendIOHIDKeyboardEvent:(uint32_t)page usage:(uint32_t)usage isKeyDown:(boolean_t)isKeyDown;
+@end
+
 @interface STHIDEventGenerator (AkunPrivateTouch)
 - (void)touchDownAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
 - (void)liftUpAtPoints:(CGPoint *)locations touchCount:(NSUInteger)touchCount;
@@ -203,6 +246,205 @@ static double clamp01(double v) {
         else if (usage == 0xEA) { [gen volumeDecrementPress]; }
         else if (usage == 0x223) { [gen menuPress]; }
     }
+}
+
+
+#pragma mark - 辅助功能（对标 AKUN 19940 指令集，传输仍走我们自己的 WS）
+
+- (NSDictionary *)handleAux:(NSDictionary *)cmd {
+    STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
+    NSString *a = cmd[@"a"] ?: cmd[@"action"];   // 兼容 AKUN 19940 风格 {"action":"xxx"}
+    if (!a.length) { return @{ @"success" : @NO, @"error" : @"missing action" }; }
+
+    if ([a isEqualToString:@"device_info"]) {
+        UIDevice *d = [UIDevice currentDevice];
+        NSString *name = d.name ?: @"iPhone";
+        NSString *udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
+        return @{ @"success" : @YES,
+                  @"device_name" : name,
+                  @"system_version" : d.systemVersion ?: @"",
+                  @"model" : d.model ?: @"",
+                  @"udid" : udid,
+                  @"udid_source" : @"idfv",
+                  @"form" : @"deb",
+                  @"version" : @"1.0.0" };
+    }
+    if ([a isEqualToString:@"go_home"]) {
+        [gen menuPress];
+        return @{ @"success" : @YES };
+    }
+    if ([a isEqualToString:@"unlock"]) {
+        // 与 AKUN 一致：双 Home，不做上滑手势
+        [gen menuPress];
+        usleep(200000);
+        [gen menuPress];
+        return @{ @"success" : @YES };
+    }
+    if ([a isEqualToString:@"lock"]) {
+        // 电源键（HID KeyboardOrKeypad 0x30），等效于按一下侧键锁屏
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:0x30 isKeyDown:true];
+        usleep(30000);
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:0x30 isKeyDown:false];
+        return @{ @"success" : @YES };
+    }
+    if ([a isEqualToString:@"respring"]) {
+        // 重启 SpringBoard：daemon 是 root，直接 killall
+        pid_t pid = 0;
+        const char *argv[] = { "/usr/bin/killall", "-9", "SpringBoard", NULL };
+        posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, (char *const *)argv, NULL);
+        return @{ @"success" : @YES, @"note" : @"respring 已发出" };
+    }
+    if ([a isEqualToString:@"get_clipboard"]) {
+        NSString *s = [UIPasteboard generalPasteboard].string ?: @"";
+        return @{ @"success" : @YES, @"text" : s };
+    }
+    if ([a isEqualToString:@"set_clipboard"]) {
+        NSString *s = cmd[@"text"] ?: @"";
+        [UIPasteboard generalPasteboard].string = s;
+        return @{ @"success" : @YES };
+    }
+    if ([a isEqualToString:@"input_text"]) {
+        NSString *s = cmd[@"text"] ?: @"";
+        if (!s.length) { return @{ @"success" : @NO, @"error" : @"empty text" }; }
+        // AKUN 的做法：写剪贴板 → 键盘通道发 Cmd+V。中文也能进，因为走的是粘贴而不是逐字敲
+        [UIPasteboard generalPasteboard].string = s;
+        usleep(30000);
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:0xE3 isKeyDown:true];   // LeftGUI
+        usleep(20000);
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:0x19 isKeyDown:true];   // 'v'
+        usleep(20000);
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:0x19 isKeyDown:false];
+        usleep(20000);
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:0xE3 isKeyDown:false];
+        NSLog(@"[aux] input_text len=%lu", (unsigned long)s.length);
+        return @{ @"success" : @YES };
+    }
+    if ([a isEqualToString:@"set_volume"] || [a isEqualToString:@"set_brightness"] ||
+        [a isEqualToString:@"volume_up"] || [a isEqualToString:@"volume_down"] ||
+        [a isEqualToString:@"toggle_mute"] || [a isEqualToString:@"brightness_up"] ||
+        [a isEqualToString:@"brightness_down"]) {
+        if ([a isEqualToString:@"volume_up"]) { [gen volumeIncrementPress]; return @{ @"success" : @YES }; }
+        if ([a isEqualToString:@"volume_down"]) { [gen volumeDecrementPress]; return @{ @"success" : @YES }; }
+        if ([a isEqualToString:@"brightness_up"] || [a isEqualToString:@"brightness_down"]) {
+            CGFloat cur = [UIScreen mainScreen].brightness;
+            CGFloat next = [a isEqualToString:@"brightness_up"] ? cur + 0.1 : cur - 0.1;
+            next = MAX(0.05, MIN(1.0, next));
+            [UIScreen mainScreen].brightness = next;
+            return @{ @"success" : @YES, @"brightness" : @(next) };
+        }
+        if ([a isEqualToString:@"set_volume"] || [a isEqualToString:@"toggle_mute"]) {
+            float v = [cmd[@"value"] floatValue];
+            if ([a isEqualToString:@"toggle_mute"]) { v = 0.0f; }
+            Class avsc = NSClassFromString(@"AVSystemController");
+            id shared = akun_msg0(avsc, @"sharedAVSystemController");
+            SEL s = NSSelectorFromString(@"setVolumeTo:forCategory:");
+            if (shared && [shared respondsToSelector:s]) {
+                BOOL (*fn)(id, SEL, float, id) = (BOOL (*)(id, SEL, float, id))objc_msgSend;
+                fn(shared, s, v, @"Audio/Video");
+                return @{ @"success" : @YES, @"volume" : @(v) };
+            }
+            return @{ @"success" : @NO, @"error" : @"AVSystemController 不可用" };
+        }
+        CGFloat b = [cmd[@"value"] floatValue];
+        [UIScreen mainScreen].brightness = MAX(0.05, MIN(1.0, b));
+        return @{ @"success" : @YES, @"brightness" : @([UIScreen mainScreen].brightness) };
+    }
+    if ([a isEqualToString:@"list_apps"] || [a isEqualToString:@"find_app"]) {
+        id ws = akun_appWorkspace();
+        if (!ws) { return @{ @"success" : @NO, @"error" : @"LSApplicationWorkspace 不可用" }; }
+        NSArray *apps = akun_msg0(ws, @"allInstalledApplications") ?: @[];
+        NSString *q = cmd[@"name"];
+        NSMutableArray *out = [NSMutableArray array];
+        for (id app in apps) {
+            NSString *bid = akun_msg0(app, @"applicationIdentifier");
+            NSString *nm = akun_msg0(app, @"localizedName");
+            if (!bid.length && !nm.length) { continue; }
+            if (q.length) {
+                BOOL hit = ([nm rangeOfString:q].location != NSNotFound) ||
+                           ([bid rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound);
+                if (!hit) { continue; }
+            }
+            [out addObject:@{ @"bundle" : bid ?: @"", @"name" : nm ?: @"" }];
+            if (out.count >= 400) { break; }
+        }
+        return @{ @"success" : @YES, @"apps" : out, @"count" : @(out.count) };
+    }
+    if ([a isEqualToString:@"launch_app"]) {
+        id ws = akun_appWorkspace();
+        NSString *bid = cmd[@"bundle"] ?: cmd[@"name"];
+        if (!ws || !bid.length) { return @{ @"success" : @NO, @"error" : @"缺 bundle 或工作区不可用" }; }
+        BOOL ok = akun_bool1(ws, @"openApplicationWithBundleID:", bid);
+        return @{ @"success" : @(ok), @"bundle" : bid };
+    }
+    if ([a isEqualToString:@"open_url"]) {
+        id ws = akun_appWorkspace();
+        NSString *u = cmd[@"url"] ?: @"";
+        NSURL *url = [NSURL URLWithString:u];
+        if (!ws || !url) { return @{ @"success" : @NO, @"error" : @"缺 url 或工作区不可用" }; }
+        BOOL ok = NO;
+        if ([ws respondsToSelector:NSSelectorFromString(@"openSensitiveURL:withOptions:")]) {
+            SEL s = NSSelectorFromString(@"openSensitiveURL:withOptions:");
+            BOOL (*fn)(id, SEL, id, id) = (BOOL (*)(id, SEL, id, id))objc_msgSend;
+            ok = fn(ws, s, url, @{});
+        } else {
+            ok = akun_bool1(ws, @"openURL:", url);
+        }
+        return @{ @"success" : @(ok), @"url" : u };
+    }
+    if ([a isEqualToString:@"kill_app"]) {
+        NSString *bid = cmd[@"bundle"] ?: @"";
+        if (!bid.length) { return @{ @"success" : @NO, @"error" : @"缺 bundle" }; }
+        // 用 launchctl 的等价路径：直接找进程名不好使，这里走 SpringBoard 的常用私有选择器
+        id ws = akun_appWorkspace();
+        BOOL ok = akun_bool1(ws, @"terminateApplicationForBundleIdentifier:", bid);
+        NSLog(@"[aux] kill_app %@ -> %d", bid, ok);
+        return @{ @"success" : @(ok), @"bundle" : bid };
+    }
+    if ([a isEqualToString:@"list_packages"]) {
+        // dpkg 状态库直读，避免依赖 rootd
+        NSString *path = @"/var/lib/dpkg/status";
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        if (!txt) { return @{ @"success" : @NO, @"error" : @"读不到 dpkg status" }; }
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSString *block in [txt componentsSeparatedByString:@"\n\n"]) {
+            NSString *pkg = nil, *ver = nil, *status = nil;
+            for (NSString *line in [block componentsSeparatedByString:@"\n"]) {
+                if ([line hasPrefix:@"Package: "]) { pkg = [line substringFromIndex:9]; }
+                else if ([line hasPrefix:@"Version: "]) { ver = [line substringFromIndex:9]; }
+                else if ([line hasPrefix:@"Status: "]) { status = [line substringFromIndex:8]; }
+            }
+            if (pkg.length) {
+                [out addObject:@{ @"package" : pkg, @"version" : ver ?: @"", @"status" : status ?: @"" }];
+            }
+        }
+        return @{ @"success" : @YES, @"packages" : out, @"count" : @(out.count) };
+    }
+    if ([a isEqualToString:@"delete_file"]) {
+        NSString *p = cmd[@"path"] ?: @"";
+        if (![p hasPrefix:@"/"]) { return @{ @"success" : @NO, @"error" : @"需要绝对路径" }; }
+        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+        return @{ @"success" : @(ok), @"deleted" : @(ok) };
+    }
+    if ([a isEqualToString:@"key"]) {
+        // 键盘通道：AKUN 的按键动作，走 STHIDEventGenerator 的 HID 键盘事件
+        NSString *k = cmd[@"code"] ?: @"";
+        NSDictionary *map = @{ @"enter" : @0x28, @"backspace" : @0x2A, @"escape" : @0x29,
+                               @"tab" : @0x2B, @"space" : @0x2C, @"delete" : @0x4C,
+                               @"up" : @0x52, @"down" : @0x51, @"left" : @0x50, @"right" : @0x4F };
+        NSNumber *n = map[k];
+        if (!n) { return @{ @"success" : @NO, @"error" : @"未知按键" }; }
+        BOOL gui = [cmd[@"gui"] boolValue];
+        if (gui) { [gen _sendIOHIDKeyboardEvent:0x07 usage:0xE3 isKeyDown:true]; usleep(20000); }
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:n.unsignedIntValue isKeyDown:true];
+        usleep(20000);
+        [gen _sendIOHIDKeyboardEvent:0x07 usage:n.unsignedIntValue isKeyDown:false];
+        if (gui) { usleep(20000); [gen _sendIOHIDKeyboardEvent:0x07 usage:0xE3 isKeyDown:false]; }
+        return @{ @"success" : @YES, @"key" : k };
+    }
+    if ([a isEqualToString:@"screenshot"]) {
+        return @{ @"success" : @NO, @"error" : @"screenshot 暂未接入（画面走 WebRTC，不重复截屏）" };
+    }
+    return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"unhandled action: %@", a] };
 }
 
 @end

@@ -11,4 +11,7 @@
 /// 坐标一律归一化（0~1），设备分辨率由注入端自己换算。
 - (void)handleCommand:(NSDictionary *)cmd;
 
+/// 辅助功能（对标 AKUN 19940 的动作集）：返回 {success, ...}，由上层回给网页。
+- (NSDictionary *)handleAux:(NSDictionary *)cmd;
+
 @end
