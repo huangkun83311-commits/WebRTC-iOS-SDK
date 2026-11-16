@@ -74,7 +74,7 @@
   <button id="applyPreset" title="按 台数/上行 自动算出并下发档位">按档次下发</button>
   <span id="presetInfo" style="color:#8b949e;font-size:12px"></span>
   <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v8 · 档位自动换算</span>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v9 · 右键不再误点</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -333,6 +333,9 @@
 
   screenEl.addEventListener('pointerdown', (ev) => {
     if (!ctrlWs || ctrlWs.readyState !== 1) return;
+    // 只有左键（或触摸）才是「点击」；右键/中键一律交给 contextmenu 处理。
+    // 不加这行的话，右键按下会在光标处发一次按下+抬起（凭空点一下），再发 home，两件事一起发生。
+    if (ev.pointerType === 'mouse' && ev.button !== 0) { pressStart = null; dragging = false; return; }
     try { screenEl.setPointerCapture(ev.pointerId); } catch (e) {}
     dragging = false;
     const p = norm(ev);
@@ -353,6 +356,7 @@
 
   screenEl.addEventListener('pointermove', (ev) => {
     if (!pressStart) return;
+    if (ev.pointerType === 'mouse' && ev.button !== 0 && ev.buttons !== 1) return;
     const now = performance.now();
     if (now - lastMoveSent < 33) return;   // 与设备 30fps 抓屏对齐：发得比屏幕更新还快只会堆在注入队列里
     const p = norm(ev);
@@ -386,7 +390,10 @@
   // 右键 / 长按 → Home 键
   screenEl.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
-    ctrl({ t: 'k', code: 'home' });
+    lastTap = null;          // 右键之后第一下左键必须当单击，不能和右键前那次点击拼成双击
+    pressStart = null;
+    dragging = false;
+    ctrl({ t: 'k', code: 'home' });   // 与 AKUN 一致：右键 = 返回桌面
   });
 
   window.addEventListener('keydown', (ev) => {
