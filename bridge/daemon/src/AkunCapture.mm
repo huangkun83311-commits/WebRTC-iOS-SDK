@@ -62,7 +62,8 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double _prepMsAvg;            // 准备一帧（渲染+缩图+推帧）的滑窗平均耗时，闸门提前量用
     double _costMsAvg;            // 单帧总耗时的跨窗口平均，「唤醒即发」用它判断流水线是否已空出来
     int _burstCount;              // 本窗口内「唤醒即发」的次数（用于验证这一帧真的没排队）
-    double _pacePadSec;           // 节拍闭环：上一帧实际间隔与目标的差距，逐个微调
+    double _pacePadSec;
+    double _dirtyMsSum;           // 节拍闭环：上一帧实际间隔与目标的差距，逐个微调
     double _pushMsSum;           // 交给 WebRTC 的耗时合计
     NSTimeInterval _perfWindowStart;
     // GPU 缩图（Core Image + Metal）：拿不到 Metal 就退回 vImage
@@ -350,17 +351,28 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     // 不排队等下一拍，只要流水线已经空出来就立刻出帧 —— 这一帧省掉最多半个帧间隔。
     // 注意：静止期间允许按「流水线空闲」的节奏去查脏图（约 cost 一次，16ms），
     // 但只有真的变了才插队出帧；没变就继续等，否则会变成静止画面也狂渲染（烧 CPU）。
-    double costSec = _costMsAvg / 1000.0 * 1.05;
-    BOOL pipelineFree = (now - _lastPushMono >= costSec);
+    // 静止期：探测间隔压到 8ms（125 次/秒），把「点了以后被发现」的等待从 ~17ms 降到 ~8ms。
+    // 但不能更激进：_dirtyFrameCount 是系统调用，2ms 轮询（500 次/秒）会拖慢渲染（实测 6ms→19ms）。
+    const double kIdleProbeSec = 0.008;
+    BOOL pipelineFree = (now - _lastPushMono >= kIdleProbeSec);
     BOOL wasIdle = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) > 0.35);
     BOOL mayProbe = timeOk || keepaliveDue || (wasIdle && pipelineFree);
     if (!mayProbe) { return; }
 
     BOOL changed = YES;
     if (_dirtyFrameCount) {
+        NSTimeInterval d0 = CACurrentMediaTime();
         CFIndex c = _dirtyFrameCount(NULL);
+        _dirtyMsSum += (CACurrentMediaTime() - d0) * 1000.0;   // 脏图检测自身开销，算进 perf
         changed = (c != _lastDirtyCount);
-        if (changed) { _lastChangeMono = now; }
+        if (changed) {
+            _lastChangeMono = now;
+            // 设备侧细分：从触摸注入到「发现画面变了」（含 Safari 重绘 + 我们的探测等待）
+            if (gLastInputMono > 0.0) {
+                double d = (now - gLastInputMono) * 1000.0;
+                if (d >= 0.0 && d < 2000.0) { NSLog(@"[lat] 注入→检测 %.1fms", d); }
+            }
+        }
         _lastDirtyCount = c;
     }
     // 判定「正在动」还是「静止」：最近 0.5s 内变过就算在动（视频/游戏里某一 tick 恰好没变不算静止）。
@@ -451,11 +463,12 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     double budgetMs = 1000.0 / (double)_activeFps;
 
     double allocMs = _allocMsSum / n;
-    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 合计 %.1fms / 预算 %.1fms | 闸门 pad=%.1fms prep=%.1fms 帧距=%.1fms 唤醒=%d",
-          realFps, allocMs, renderMs, scaleMs, pushMs, costMs, budgetMs,
+    double dirtyMs = (_perfFrames > 0) ? _dirtyMsSum / n : 0.0;
+    NSLog(@"[perf] 实际 %.1ffps 取缓冲 %.1fms 渲染 %.1fms 缩图 %.1fms 推帧 %.1fms 脏图 %.1fms 合计 %.1fms / 预算 %.1fms | 闸门 pad=%.1fms prep=%.1fms 帧距=%.1fms 唤醒=%d",
+          realFps, allocMs, renderMs, scaleMs, pushMs, dirtyMs, costMs, budgetMs,
           _pacePadSec * 1000.0, _prepMsAvg, (n > 0 ? span / n * 1000.0 : 0), _burstCount);
 
-    _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0; _burstCount = 0;
+    _perfFrames = 0; _renderMsSum = 0; _scaleMsSum = 0; _pushMsSum = 0; _allocMsSum = 0; _burstCount = 0; _dirtyMsSum = 0;
     _perfWindowStart = now;
 
     // 降档只用于「真的跑不动」：单帧耗时明显超过帧预算才会持续掉帧。
