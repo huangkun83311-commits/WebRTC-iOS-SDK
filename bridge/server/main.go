@@ -62,7 +62,30 @@ type hub struct {
 	profiles map[string]map[string]interface{}
 }
 
-func newHub() *hub { return &hub{rooms: make(map[string]map[*client]struct{}), sfu: newSFU()} }
+func newHub() *hub {
+	h := &hub{rooms: make(map[string]map[*client]struct{}), sfu: newSFU()}
+	// 观看端一进来，就顺着设备自己的控制房间喊一声「赶紧出一帧」。
+	// 手机在 ctrl-<id> 里是 subscriber，这句会原样到它手上，它抓到帧立刻编码推流。
+	onNeedFrame = func(deviceID string) {
+		payload, _ := json.Marshal(map[string]interface{}{"t": "kickframe", "why": "viewer-join"})
+		h.pushRoom("ctrl-"+deviceID, payload)
+	}
+	return h
+}
+
+// pushRoom 给某个房间里的所有连接发一条消息（不经过 broadcast 的"除我之外"逻辑）。
+func (h *hub) pushRoom(room string, payload []byte) int {
+	h.mu.RLock()
+	set := h.rooms[room]
+	h.mu.RUnlock()
+	n := 0
+	for c := range set {
+		if err := c.send(payload); err == nil {
+			n++
+		}
+	}
+	return n
+}
 
 func (h *hub) join(c *client) int {
 	h.mu.Lock()

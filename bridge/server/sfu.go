@@ -122,7 +122,23 @@ type sfu struct {
 	rooms map[string]*sfuRoom
 }
 
+// onNeedFrame 让「有人要看」这件事直接传回手机：新观看端进来、或手机重新推流上来时，
+// 手机立刻吐一帧（画面静止时它平时 2 秒才保活一帧，这就是首屏黑 1~2 秒的真凶）。
+var onNeedFrame func(deviceID string)
+
 func newSFU() *sfu { return &sfu{rooms: make(map[string]*sfuRoom)} }
+
+// kickFrame 通知对应设备的控制通道「马上出一帧」。
+func kickFrame(room string) {
+	if onNeedFrame == nil {
+		return
+	}
+	id := strings.TrimPrefix(room, "video-")
+	if id == "" || id == room {
+		return
+	}
+	go onNeedFrame(id)
+}
 
 func (s *sfu) room(name string) *sfuRoom {
 	s.mu.Lock()
@@ -446,7 +462,8 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 			<-gather
 			_ = p.sendJSON(map[string]interface{}{"type": "answer", "sdp": pc.LocalDescription().SDP})
 			log.Printf("sfu room=%s role=%s 已回 answer", room, role)
-			// 新观看端进来后，让手机立刻吐一个关键帧，避免等下一个自然 I 帧。
+			// 新观看端进来后：① RTCP PLI 要一个关键帧；② 直接喊手机抓一帧 ——
+			// 只发 PLI 是不够的，编码器要等「下一帧输入」才吐 IDR，静止画面下那帧要等 2 秒保活。
 			if role == "viewer" {
 				rm.mu.RLock()
 				pub := rm.pub
@@ -458,6 +475,8 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 					_ = pub.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc}})
 					log.Printf("sfu room=%s 已向手机请求关键帧 ssrc=%d", room, ssrc)
 				}
+				kickFrame(room)
+				log.Printf("sfu room=%s 已通知手机立刻出帧（首屏不等保活）", room)
 			}
 		case "answer":
 			if role == "publisher" {

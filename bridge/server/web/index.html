@@ -129,6 +129,7 @@
   <hr />
   <h4>跟手实测（本机）</h4>
   <div class="row"><span>点击→画面变化</span><span class="v" id="hTap">--</span></div>
+  <div class="row"><span>首帧耗时</span><span class="v" id="hFF">--</span></div>
   <div class="tap" id="hTapLog">按下游画面里点击一次即可测</div>
 </div>
 
@@ -473,8 +474,16 @@
 
   /* ---------------- FPS 统计（按真实解码帧计数，不是屏幕刷新率） ---------------- */
   let frames = 0, framesTotal = 0, lastTs = performance.now();
+  // 首帧耗时：从页面脚本开始跑到第一帧真正呈现。这就是「打开窗口多久出画」，
+  // 对标 AKUN 的 200~300ms；这里直接上报到 /api/client，不用靠肉眼猜。
+  const tPage0 = performance.now();
+  let firstFrameMs = -1;
   function onVF() {
     frames++; framesTotal++;
+    if (firstFrameMs < 0) {
+      firstFrameMs = Math.round(performance.now() - tPage0);
+      setV('hFF', firstFrameMs + ' ms', firstFrameMs > 800 ? 'bad' : (firstFrameMs > 400 ? 'warn' : 'ok'));
+    }
     // 跟手探针：新的一帧真的呈现出来了 → 记下这一帧的延迟。
     // 这里用「已呈现帧数」判断，不再对 video 做 drawImage —— 软件解码的浏览器里
     // 每次 drawImage+getImageData 要几十毫秒，它自己就会把画面和延迟一起拖垮。
@@ -560,7 +569,7 @@
             lost: lost, lostPct: +lostPct.toFixed(2), jitter: jit, buf: bufMs, dec: decMs,
             drop: inb.framesDropped || 0, freeze: inb.freezeCount || 0,
             nack: inb.nackCount || 0, pli: inb.pliCount || 0, rtt: rtt,
-            tapMs: tapHits.length ? tapHits[tapHits.length - 1] : null
+            tapMs: tapHits.length ? tapHits[tapHits.length - 1] : null, ff: firstFrameMs
           }) });
       } catch (e) {}
     } catch (e) {}

@@ -18,6 +18,7 @@
 #import <sys/socket.h>
 #import <UIKit/UIKit.h>
 #import "AkunCapture.h"
+extern void AkunBridgeNoteInteraction(void);   // 抓屏层：进交互窗口，下一拍强制出帧
 #import "AkunInjector.h"
 #import "AkunRTC.h"
 #import "AkunDiscovery.h"
@@ -428,6 +429,12 @@ static NSString *AkunLocalIPv4(void) {
                         [self.ctrlTask sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:s2]
                                   completionHandler:^(NSError *e) {}];
                     }
+                } else if ([type isEqualToString:@"kickframe"]) {
+                    // 有人打开观看端（或手机重连上来）时服务端会喊这一声。
+                    // 静止画面下抓屏层 2 秒才保活一帧，新观众就得黑屏 1~2 秒；
+                    // 这里当成一次"交互"处理：下一拍立刻出帧，首屏从秒级降到几十毫秒。
+                    AkunBridgeNoteInteraction();
+                    NSLog(@"[rtc] kickframe：新观众进来，立刻出帧");
                 } else if ([type isEqualToString:@"ping"]) {
                     // 只测控制链路往返，不触发任何动作
                     NSDictionary *pong = @{@"t" : @"pong", @"ts" : cmd[@"ts"] ?: @0};
