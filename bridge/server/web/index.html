@@ -58,7 +58,7 @@
     <option value="0.45,25,1200000">看字优先 0.45 / 25fps / 1.2M</option>
   </select>
   <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v5 · 双击+节流对齐</span>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v6 · 双端数据+落盘</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -80,6 +80,13 @@
   <div class="row"><span>丢帧/冻结</span><span class="v" id="hFreeze">--</span></div>
   <div class="row"><span>重传 NACK</span><span class="v" id="hNack">--</span></div>
   <div class="row"><span>链路 RTT</span><span class="v" id="hRtt">--</span></div>
+  <hr />
+  <h4>设备侧（手机发得怎么样）</h4>
+  <div class="row"><span>设备 fps</span><span class="v" id="dFps">--</span></div>
+  <div class="row"><span>渲染/缩图</span><span class="v" id="dRender">--</span></div>
+  <div class="row"><span>编码耗时</span><span class="v" id="dEnc">--</span></div>
+  <div class="row"><span>上行</span><span class="v" id="dUp">--</span></div>
+  <div class="row"><span>设备档位</span><span class="v" id="dCfg">--</span></div>
   <hr />
   <h4>跟手实测（本机）</h4>
   <div class="row"><span>点击→画面变化</span><span class="v" id="hTap">--</span></div>
@@ -264,6 +271,24 @@
         const m = JSON.parse(ev.data);
         if (m && m.t === 'pong' && m.ts) { rttMs = Date.now() - m.ts; return; }
       } catch (e) {}
+      if (m && m.t === 'metrics') {
+        const cap = m.cap || {}, rtc = m.rtc || {}, cfg = m.cfg || {};
+        setV('dFps', (cap.fps != null ? cap.fps.toFixed(1) + ' fps' : '--')
+             + (cap.w && cap.h ? ' · ' + cap.w + 'x' + cap.h : ''),
+             (cap.fps || 0) >= Math.min(25, cfg.fps || 30) ? 'ok' : 'warn');
+        setV('dRender', (cap.render != null ? cap.render.toFixed(1) : '--') + ' / '
+             + (cap.scale != null ? cap.scale.toFixed(1) : '--') + ' ms'
+             + '（合计 ' + (cap.cost != null ? cap.cost.toFixed(1) : '--') + ' / 预算 '
+             + (cap.budget != null ? cap.budget.toFixed(1) : '--') + '）',
+             (cap.cost != null && cap.budget != null && cap.cost > cap.budget * 1.15) ? 'bad' : 'ok');
+        setV('dEnc', (rtc.encMs != null && rtc.encMs >= 0 ? rtc.encMs.toFixed(1) + ' ms' : '--'),
+             (rtc.encMs > 15) ? 'warn' : '');
+        setV('dUp', (rtc.uplink != null ? Math.round(rtc.uplink) + ' kbps' : '--')
+             + ' 上限 ' + (rtc.cap != null ? Math.round(rtc.cap / 1000) + 'k' : '--'));
+        setV('dCfg', (cfg.fps != null ? cfg.fps + 'fps' : '--') + ' / '
+             + (cfg.scale != null ? cfg.scale.toFixed(2) : '--'));
+        return;
+      }
       log('ctrl recv', ev.data);
     };
   }
@@ -422,6 +447,19 @@
 
       const line = `${w}x${h} ${Math.round(kbps)}kbps 丢${lost}${rtt != null ? ' 延迟' + rtt + 'ms' : ''}`;
       $('stat').textContent = line;
+
+      // 落盘：一行 JSON，服务端写 clientstats.log，排障时直接读日志
+      try {
+        fetch('/api/client', { method: 'POST', keepalive: true,
+          body: JSON.stringify({
+            room: ($('room').value || '').trim(),
+            res: w + 'x' + h, fps: inb.framesPerSecond || 0, kbps: Math.round(kbps),
+            lost: lost, lostPct: +lostPct.toFixed(2), jitter: jit, buf: bufMs, dec: decMs,
+            drop: inb.framesDropped || 0, freeze: inb.freezeCount || 0,
+            nack: inb.nackCount || 0, pli: inb.pliCount || 0, rtt: rtt,
+            tapMs: tapHits.length ? tapHits[tapHits.length - 1] : null
+          }) });
+      } catch (e) {}
     } catch (e) {}
   }, 1000);
 

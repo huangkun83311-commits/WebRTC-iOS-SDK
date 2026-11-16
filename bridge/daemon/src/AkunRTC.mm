@@ -45,6 +45,9 @@
 @property (nonatomic, assign) double lastStatsTimestamp; // 上一窗口时间戳（微秒）
 @end
 
+static NSDictionary *gLastRtcMetrics = nil;
+NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
+
 @implementation AkunRTC
 
 - (instancetype)initWithServerBase:(NSString *)base deviceId:(NSString *)deviceId {
@@ -419,6 +422,12 @@
     if (bytesSent >= 0) { self.lastBytesSent = bytesSent; }
     if (statsTs > 0) { self.lastStatsTimestamp = statsTs; }
 
+    gLastRtcMetrics = @{@"uplink" : @(kbps),
+                        @"lost" : @(fractionLost > 0 ? fractionLost * 100.0 : -1.0),
+                        @"rtt" : @(rttSeconds > 0 ? rttSeconds * 1000.0 : -1.0),
+                        @"encMs" : @((framesEncoded > 0 && totalEncodeTime > 0) ? (totalEncodeTime / framesEncoded) * 1000.0 : -1.0),
+                        @"scale" : @(self.adaptScale),
+                        @"cap" : @(self.adaptBitrateBps)};
     NSLog(@"[adapt] 上行=%.0fkbps 丢包=%.1f%% rtt=%.0fms 编码=%.1fms scale=%.2f 上限=%ldbps",
           kbps,
           fractionLost > 0 ? fractionLost * 100.0 : -1.0,

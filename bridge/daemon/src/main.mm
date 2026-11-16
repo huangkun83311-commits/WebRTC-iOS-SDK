@@ -21,6 +21,9 @@
 static NSString *kPrefsPathLegacy = @"/var/mobile/Library/Preferences/com.akun.bridge.plist";
 static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/com.akun.bridge.plist";
 
+extern NSDictionary *AkunBridgeCaptureMetrics(void);
+extern NSDictionary *AkunBridgeRtcMetrics(void);
+
 @interface AkunDaemon : NSObject <NSURLSessionWebSocketDelegate>
 @property (nonatomic, strong) AkunCapture *capture;
 @property (nonatomic, strong) AkunInjector *injector;
@@ -135,6 +138,26 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     // 缩图由抓屏层用 vImage 一次做完，编码器只管编码 → 省下每帧一次 2.7MP 的缩放+转码，卡顿的主要来源。
     self.capture.outputScale = scale;
     __weak typeof(self) weakSelf = self;
+    // 每 2 秒把设备侧真实指标推到控制房间：网页（以及我）就能同时看到
+    // 「手机这边发得怎么样」和「浏览器那边收得怎么样」，排障不用两头猜。
+    [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+        NSDictionary *cap = AkunBridgeCaptureMetrics();
+        NSDictionary *rtc = AkunBridgeRtcMetrics();
+        if (!cap || !rtc) { return; }
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        m[@"t"] = @"metrics";
+        m[@"cap"] = cap;
+        m[@"rtc"] = rtc;
+        m[@"cfg"] = @{@"fps" : @(self.cfgFps), @"scale" : @(self.cfgScale), @"bitrate" : @(self.cfgBitrate)};
+        NSData *d = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
+        if (!d) { return; }
+        NSString *js = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        NSURLSessionWebSocketTask *task = self.ctrlTask;
+        if (task && task.state == NSURLSessionTaskStateRunning) {
+            [task sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:js]
+             completionHandler:^(NSError *e) {}];
+        }
+    }];
     self.capture.frameHandler = ^(CVPixelBufferRef pixelBuffer) {
         weakSelf.frameCount++;
         if (weakSelf.frameCount % 60 == 0) {

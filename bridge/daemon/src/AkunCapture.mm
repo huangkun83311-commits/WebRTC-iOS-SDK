@@ -41,6 +41,10 @@ static double gInteractMono = 0.0;
 
 void AkunBridgeNoteInteraction(void) { gInteractMono = CACurrentMediaTime(); }
 
+// 上一窗口的性能快照：main.mm 每 2 秒把它推给服务端，网页上就能同时看到「手机发得怎么样」
+static NSDictionary *gLastMetrics = nil;
+NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
+
 @implementation AkunCapture {
     dispatch_queue_t _queue;
     dispatch_source_t _timer;
@@ -392,7 +396,11 @@ void AkunBridgeNoteInteraction(void) { gInteractMono = CACurrentMediaTime(); }
     // 2ms 轮询下每秒 500 次会把渲染拖慢（实测 6ms → 19ms）。时间没到就绝不查脏。
     double minGap = 1.0 / (double)MAX(1, fpsNow);
     double prep = MIN(_prepMsAvg / 1000.0, minGap * 0.9);
-    BOOL timeOk = (now - _lastPushMono >= minGap - prep + _pacePadSec);
+    // prep 抵扣让流水线能提前开跑，但会让实际帧率超过声明值（实测 45fps 档跑到 54fps，
+    // 多出来的帧既不加手感，只是在加热机器）。这里给超发封顶 +2fps。
+    double minGapClamp = 1.0 / (double)(fpsNow + 2);
+    double gapNeed = MAX(minGap - prep, minGapClamp);
+    BOOL timeOk = (now - _lastPushMono >= gapNeed + _pacePadSec);
     BOOL keepaliveDue = (now - _lastPushTime >= 2.0);
     // 「唤醒即发」：长时间静止后画面第一次变化（= 用户点了、开了应用），
     // 不排队等下一拍，只要流水线已经空出来就立刻出帧 —— 这一帧省掉最多半个帧间隔。
@@ -521,6 +529,18 @@ void AkunBridgeNoteInteraction(void) { gInteractMono = CACurrentMediaTime(); }
 
     double allocMs = _allocMsSum / n;
     double dirtyMs = (_perfFrames > 0) ? _dirtyMsSum / n : 0.0;
+    gLastMetrics = @{@"fps" : @(realFps),
+                     @"render" : @(renderMs),
+                     @"scale" : @(scaleMs),
+                     @"push" : @(pushMs),
+                     @"dirty" : @(dirtyMs),
+                     @"cost" : @(costMs),
+                     @"budget" : @(budgetMs),
+                     @"activeFps" : @(_activeFps),
+                     @"gpuFrames" : @(_scaleGpuFrames),
+                     @"cpuFrames" : @(_scaleCpuFrames),
+                     @"w" : @(_poolW),
+                     @"h" : @(_poolH)};
     NSString *scaleSplit = [NSString stringWithFormat:@"GPU%d帧/%.1fms CPU%d帧",
                             _scaleGpuFrames,
                             (_scaleGpuFrames > 0 ? _scaleGpuMsSum / _scaleGpuFrames : 0.0),

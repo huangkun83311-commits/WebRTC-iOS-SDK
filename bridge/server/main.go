@@ -15,10 +15,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -355,7 +357,36 @@ func main() {
 			"version": "1.0.0",
 		})
 	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	// 客户端侧指标落盘：网页每秒把 getStats 摘要 POST 上来，写成一行日志。
+	// 这样「电脑这边到底收到什么（帧率/码率/丢包/缓冲/解码/点击延迟）」有据可查，
+	// 不用靠人在页面上念数字；GET 拿回来就是这段日志的尾部。
+	clientStatsPath := "clientstats.log"
+	mux.HandleFunc("/api/client", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			truncate := func(b []byte) []byte {
+				if len(b) > 60000 {
+					return b[len(b)-60000:]
+				}
+				return b
+			}
+			b, err := os.ReadFile(clientStatsPath)
+			if err != nil {
+				w.Write([]byte("(还没有客户端数据)\n"))
+				return
+			}
+			w.Write(truncate(b))
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+		line := time.Now().Format("2006-01-02 15:04:05") + " " + strings.TrimSpace(string(body)) + "\n"
+		if f, err := os.OpenFile(clientStatsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			f.WriteString(line)
+			f.Close()
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 	// 在线调画质：/api/config?room=dev001&scale=0.35&fps=24&bitrate=3000000
