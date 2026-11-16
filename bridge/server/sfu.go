@@ -452,7 +452,7 @@ func (s *sfu) handleSFU(w http.ResponseWriter, r *http.Request, room, role strin
 			targets := rm.readers
 			raws := rm.raws
 			nowT := time.Now()
-			doLog := (len(targets) > 0 || len(raws) > 0) && nowT.Sub(rm.lastLog) > 2*time.Second
+			doLog := (len(targets) > 0 || len(raws) > 0) && nowT.Sub(rm.lastLog) > 10*time.Second
 			if doLog {
 				rm.lastLog = nowT
 			}

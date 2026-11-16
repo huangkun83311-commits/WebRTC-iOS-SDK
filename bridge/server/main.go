@@ -231,11 +231,17 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 func logRelay(room, role string, payload []byte) {
 	var meta struct {
 		Type      string `json:"type"`
+		T         string `json:"t"`
 		Candidate string `json:"candidate"`
 		Sdp       string `json:"sdp"`
 	}
 	if err := json.Unmarshal(payload, &meta); err != nil {
 		log.Printf("relay room=%s role=%s size=%d (非JSON)", room, role, len(payload))
+		return
+	}
+	// 心跳类报文（设备每 2 秒推一次 metrics、ping/pong）不打日志：
+	// 一台设备一天就是上万行，把真正的排障信息埋掉。
+	if meta.T == "metrics" || meta.T == "ping" || meta.T == "pong" {
 		return
 	}
 	extra := ""
