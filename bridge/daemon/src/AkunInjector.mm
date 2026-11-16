@@ -176,6 +176,9 @@ static double clamp01(double v) {
     } else if ([t isEqualToString:@"k"]) {
         NSString *code = cmd[@"code"];
         if ([code isEqualToString:@"home"]) {
+            // 以前这里既不打点也不记时刻，导致「按 home → 画面」这段无法被 [lat] 量到
+            gLastInputMono = CACurrentMediaTime();
+            NSLog(@"[inject] home");
             [gen menuPress];
         }
     } else if ([t isEqualToString:@"hk"]) {
