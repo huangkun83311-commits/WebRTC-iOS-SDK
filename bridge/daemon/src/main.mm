@@ -43,6 +43,7 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
 @property (nonatomic, assign) BOOL discovering;
 @property (nonatomic, assign) NSInteger reconnectAttempt;
 @property (nonatomic, assign) uint64_t frameCount;
+@property (nonatomic, assign) double kickAtMono;   // 收到 kickframe 的时刻（量首帧用）
 // 当前生效的画质参数（AkunRTC 的 scale/targetFps/maxBitrateBps 没公开，这里自己存一份给 cfg 指令做基线）
 @property (nonatomic, assign) double cfgScale;
 @property (nonatomic, assign) int cfgFps;
@@ -303,6 +304,11 @@ static NSString *AkunLocalIPv4(void) {
     }];
     self.capture.frameHandler = ^(CVPixelBufferRef pixelBuffer) {
         weakSelf.frameCount++;
+        if (weakSelf.kickAtMono > 0.0) {
+            // 从「服务端说有人要看」到「第一帧交进编码器」的真实耗时。
+            NSLog(@"[kick] 喊到首帧 %.1fms", (CACurrentMediaTime() - weakSelf.kickAtMono) * 1000.0);
+            weakSelf.kickAtMono = 0.0;
+        }
         if (weakSelf.frameCount % 60 == 0) {
             NSLog(@"[daemon] frames=%llu %zux%zu", weakSelf.frameCount,
                   CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer));
@@ -434,6 +440,7 @@ static NSString *AkunLocalIPv4(void) {
                     // 静止画面下抓屏层 2 秒才保活一帧，新观众就得黑屏 1~2 秒；
                     // 这里当成一次"交互"处理：下一拍立刻出帧，首屏从秒级降到几十毫秒。
                     AkunBridgeNoteInteraction();
+                    self.kickAtMono = CACurrentMediaTime();
                     NSLog(@"[rtc] kickframe：新观众进来，立刻出帧");
                 } else if ([type isEqualToString:@"ping"]) {
                     // 只测控制链路往返，不触发任何动作
