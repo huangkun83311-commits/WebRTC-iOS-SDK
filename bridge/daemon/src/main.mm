@@ -110,16 +110,17 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
 
     // 输出参数默认值：scale 跟 AKUN 出厂一致（0.35，字体清晰度等同 AKUN），
     // 需要更清晰或更省流量时，不改包、走 /api/config 在线下发档位即可。
-    // fps 直接决定操作手感（等节拍的时间就是纯延迟）：实测 30fps 平均 149ms、
-    // 45fps 50ms、60fps 34ms（同一台机器同一条链路）。所以默认给 45，
-    // 机器真跑不动时由 AkunCapture 的帧率自适应退回（保底 24fps，不会再掉到 12）。
+    // 帧率不是越高越好：A11 单帧管道约 19ms，硬拉到 45fps 会把 CPU 长期占满，
+    // 十几分钟后热降频，反而「越用越卡」。30fps 是这台机器的稳态甜点：
+    // 帧距 34ms、单帧占空 ~60%，长时间跑不掉帧、不烫手。
+    // 需要更跟手时网页档位可以现场提到 45/60，掉下来由自适应兜底（保底 24fps）。
     double scale = prefs[@"Scale"] ? [prefs[@"Scale"] doubleValue] : 0.35;
-    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 45;
-    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 900000;
+    int fps = prefs[@"Fps"] ? [prefs[@"Fps"] intValue] : 30;
+    NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 700000;
     if (scale <= 0.0) { scale = 0.35; }
-    if (fps <= 0) { fps = 45; }
+    if (fps <= 0) { fps = 30; }
     if (fps > 60) { fps = 60; }
-    if (maxBitrate <= 0) { maxBitrate = 900000; }
+    if (maxBitrate <= 0) { maxBitrate = 700000; }
 
     NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
           self.serverBase.length ? self.serverBase : @"(auto)", self.deviceId,
