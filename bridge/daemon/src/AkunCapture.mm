@@ -12,6 +12,7 @@
 //  双缓冲：渲染到 A 的同时推 B，避免 WebRTC 还在编码时被下一帧覆盖（撕裂）。
 
 #import "AkunCapture.h"
+#import <VideoToolbox/VideoToolbox.h>
 
 extern double gLastInputMono;   // AkunInjector.mm 里打点：最后一次触摸注入时刻
 
@@ -73,6 +74,9 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     // GPU 缩图（Core Image + Metal）：拿不到 Metal 就退回 vImage
     CIContext *_ciCtx;
     BOOL _ciFailed;
+    // VideoToolbox 硬件缩放器：比 Core Image 稳定（CI 在表面被渲染服务占用时会静默掉软件路径）
+    VTPixelTransferSessionRef _vtSession;
+    BOOL _vtWarned;
     // vImage 缩放要一块临时缓冲：以前每帧传 NULL 让它内部现申请，
     // 2.7MP 源图下这笔开销就是 17ms/帧。这里按需申请一次，之后每帧复用。
     void *_vTemp;
@@ -274,7 +278,31 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
         return src;
     }
 
-    // ① 先走 GPU：一帧 1242x2208 的 BGRA 用 CPU 缩要 15ms，GPU 只占 1~3ms 且不占 CPU
+    // ① 首选 VideoToolbox 硬件缩放器。
+    //    踩过的坑：Core Image 在「源表面正被渲染服务占用」时会静默掉到软件路径，
+    //    实测一半帧掉 CPU（每帧 ~38ms），按 home 回桌面时更夸张到每帧 1 秒，
+    //    表现就是「点了返回桌面要两三秒才看到画面」。VT 不吃这个。
+    if (!_vtSession) {
+        VTPixelTransferSessionRef sess = NULL;
+        CVReturn crVT = VTPixelTransferSessionCreate(kCFAllocatorDefault, &sess);
+        if (crVT == kCVReturnSuccess) { _vtSession = sess; }
+        else if (!_vtWarned) { NSLog(@"[capture] VTPixelTransferSessionCreate 失败 cr=%d", (int)crVT); _vtWarned = YES; }
+    }
+    if (_vtSession) {
+        NSTimeInterval v0 = CACurrentMediaTime();
+        CVReturn vtErr = VTPixelTransferSessionTransferImage(_vtSession, src, dst);
+        if (vtErr == kCVReturnSuccess) {
+            _scaleGpuMsSum += (CACurrentMediaTime() - v0) * 1000.0;
+            _scaleGpuFrames++;
+            return dst;
+        }
+        if (!_vtWarned) {
+            NSLog(@"[capture] VT 缩放失败 cr=%d，退回 Core Image", (int)vtErr);
+            _vtWarned = YES;
+        }
+    }
+
+    // ② 其次 Core Image / Metal
     CIContext *ci = [self ciContext];
     if (ci) {
         CIImage *si = [CIImage imageWithCVPixelBuffer:src];
