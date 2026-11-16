@@ -14,6 +14,8 @@
 - (instancetype)initWithServerBase:(NSString *)base deviceId:(NSString *)deviceId;
 
 /// 输出参数：scale 0.1~1.0，fps 建议 3~30，maxBitrateBps 0 表示不限。默认 0.35 / 12 / 1.5M。
+- (void)setBurstBitrateBps:(NSInteger)bps;
+- (void)endBurstBitrate;
 - (void)configureWithScale:(double)scale fps:(int)fps maxBitrateBps:(NSInteger)maxBitrateBps;
 
 /// 由抓屏回调喂帧。首帧到达时会按 scale 计算输出尺寸（adaptOutputFormat）。

@@ -153,6 +153,32 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
     }
 }
 
+/// 突发码率：整屏变化（开应用/回桌面/切页）那一帧有几万字节，
+/// 按 700kbps 的上限要发 0.3~0.5 秒，这就是用户看到的"点击下去半天才动"。
+/// 交互瞬间把上限抬到 base*4（最多 8Mbps），1.5 秒后自动回落，
+/// 平均流量不变，只让"整屏跳一下"的那一帧发完。
+- (void)setBurstBitrateBps:(NSInteger)bps {
+    if (!self.pc || !self.sender) { return; }
+    NSInteger target = bps > 0 ? bps : self.adaptBitrateBps;
+    NSInteger minRate = MIN(target, MAX(300000, (NSInteger)(target * 0.5)));
+    BOOL ok = [self.pc setBweMinBitrateBps:@(minRate)
+                        currentBitrateBps:@(target)
+                            maxBitrateBps:@(target)];
+    RTCRtpParameters *params = self.sender.parameters;
+    if (params && params.encodings.count > 0) {
+        RTCRtpEncodingParameters *enc = params.encodings.firstObject;
+        enc.maxBitrateBps = @(target);
+        enc.minBitrateBps = @(minRate);
+        self.sender.parameters = params;
+    }
+    NSLog(@"[burst] 码率上限 %ld bps（%@）", (long)target, ok ? @"bwe ok" : @"bwe 失败");
+}
+
+/// 突发结束，回到自适应码率（不是回到硬编码默认值，避免把自适应成果冲掉）
+- (void)endBurstBitrate {
+    [self setBurstBitrateBps:self.adaptBitrateBps];
+}
+
 - (NSString *)wsURLString {
     NSString *base = self.serverBase ?: @"";
     if ([base hasPrefix:@"http://"]) {

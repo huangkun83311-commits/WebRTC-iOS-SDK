@@ -30,6 +30,7 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
 @property (nonatomic, strong) AkunRTC *rtc;
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSURLSessionWebSocketTask *ctrlTask;
+@property (nonatomic, assign) NSInteger burstGen;
 @property (nonatomic, copy) NSString *serverBase;
 @property (nonatomic, copy) NSString *deviceId;
 @property (nonatomic, assign) BOOL autoDiscover;
@@ -230,6 +231,22 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
     [self receiveLoopOn:self.ctrlTask];
 }
 
+/// 用户一动手就放开码率上限：整屏变化的那一帧有几万字节，
+/// 700kbps 要发半秒，抬到 4 倍后只要 100 多毫秒；停手 1.5 秒自动收回。
+- (void)kickBurstForInteraction {
+    NSInteger base = self.cfgBitrate > 0 ? self.cfgBitrate : 700000;
+    NSInteger burst = base * 4;
+    if (burst < 3000000) { burst = 3000000; }
+    if (burst > 8000000) { burst = 8000000; }
+    [self.rtc setBurstBitrateBps:burst];
+    self.burstGen += 1;
+    NSInteger gen = self.burstGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gen == self.burstGen) { [self.rtc endBurstBitrate]; }
+    });
+}
+
 - (void)receiveLoopOn:(NSURLSessionWebSocketTask *)task {
     __weak typeof(self) weakSelf = self;
     [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *message, NSError *error) {
@@ -278,7 +295,13 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
                     self.cfgScale = scale; self.cfgFps = fps; self.cfgBitrate = br;
                     [self.capture setFps:fps];
                 } else {
-                    NSLog(@"[ctrl] 收到 %@", message.string ?: @"<bin>");
+                    NSString *ct = cmd[@"t"];
+                    if ([ct isEqualToString:@"tap"] || [ct isEqualToString:@"dtap"] ||
+                        [ct isEqualToString:@"d"] || [ct isEqualToString:@"u"] ||
+                        [ct isEqualToString:@"swipe"] || [ct isEqualToString:@"hk"] ||
+                        ([ct isEqualToString:@"k"] && [cmd[@"code"] isEqualToString:@"home"])) {
+                        [self kickBurstForInteraction];
+                    }
                     [self.injector handleCommand:cmd];
                 }
             }
