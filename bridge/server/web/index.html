@@ -58,7 +58,7 @@
     <option value="0.45,25,1200000">看字优先 0.45 / 25fps / 1.2M</option>
   </select>
   <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v4 · 全量数据</span>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v5 · 双击+节流对齐</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -286,14 +286,26 @@
   let dragging = false;
   let pressStart = null;          // 按下时的归一化坐标 + 时间
   const DRAG_THRESHOLD = 0.006;   // 归一化位移超过它才算拖动
+  let lastTap = null;             // 上一次点击（用于把两次单击合并成系统双击）
+  const DOUBLE_TAP_MS = 300;      // 两次点击间隔在这个范围内就算双击
+  const DOUBLE_TAP_DIST = 0.04;   // 且落点要接近
 
   screenEl.addEventListener('pointerdown', (ev) => {
     if (!ctrlWs || ctrlWs.readyState !== 1) return;
     try { screenEl.setPointerCapture(ev.pointerId); } catch (e) {}
     dragging = false;
     const p = norm(ev);
-    pressStart = { x: p.x, y: p.y, t: performance.now() };
+    const nowMs = performance.now();
+    const isDouble = lastTap && (nowMs - lastTap.t) < DOUBLE_TAP_MS
+      && Math.abs(p.x - lastTap.x) < DOUBLE_TAP_DIST && Math.abs(p.y - lastTap.y) < DOUBLE_TAP_DIST;
+    pressStart = { x: p.x, y: p.y, t: nowMs, dbl: isDouble };
     startTapProbe();   // 记录此刻画面，等它真的变了就把差值算成「跟手延迟」
+    if (isDouble) {
+      // 双击交给系统识别（设备端用 AKUN 的 0.15s 双击间隔），比两次独立单击可靠
+      lastTap = null;
+      ctrl({ t: 'dtap', x: p.x, y: p.y });
+      return;
+    }
     // 按下就立刻把 touchDown 发下去：点按的起手延迟不再依赖松手时刻（AKUN 的 ptrAddEvent 也是这样）
     ctrl({ t: 'd', x: p.x, y: p.y });
   });
@@ -301,7 +313,7 @@
   screenEl.addEventListener('pointermove', (ev) => {
     if (!pressStart) return;
     const now = performance.now();
-    if (now - lastMoveSent < 16) return;   // 最高 60Hz
+    if (now - lastMoveSent < 33) return;   // 与设备 30fps 抓屏对齐：发得比屏幕更新还快只会堆在注入队列里
     const p = norm(ev);
     if (!dragging) {
       const dx = Math.abs(p.x - pressStart.x);
@@ -315,11 +327,14 @@
 
   function endDrag(ev) {
     if (!pressStart) return;
+    if (pressStart.dbl) { pressStart = null; dragging = false; return; }   // 双击：抬起已经由设备端补发
     const p = norm(ev);
     const dt = performance.now() - pressStart.t;
     // 收尾统一发抬起；设备端会兜住最短按住时长（太短的按压 SpringBoard 不认）
     ctrl({ t: 'u', x: dragging ? p.x : pressStart.x, y: dragging ? p.y : pressStart.y });
-    if (!dragging && dt > 450) ctrl({ t: 'k', code: 'home' });   // 长按 → 回桌面
+    // 以前这里有「按住 450ms 松手就回桌面」，真机上点慢一点就会莫名回桌面 —— 已删除。
+    // 回桌面改用右键 / Esc（下面 contextmenu 与 keydown 都有），长按就老老实实长按，交给 iOS 自己弹菜单
+    if (!dragging) lastTap = { t: performance.now(), x: pressStart.x, y: pressStart.y };
     pressStart = null;
     dragging = false;
   }

@@ -171,6 +171,12 @@ static double clamp01(double v) {
             NSLog(@"[inject] up (%f,%f) 按住 %.0fms", b.x, b.y, held * 1000);
             [gen liftUpAtPoints:&b touchCount:1];
         }
+    } else if ([t isEqualToString:@"dtap"]) {
+        // 双击：走 AKUN 的 doubleTap（内部间隔 0.15s），比网页连发两次单击更可靠
+        CGPoint p = [self pointFromNormX:x y:y];
+        NSLog(@"[inject] dtap (%f,%f)", p.x, p.y);
+        gLastInputMono = CACurrentMediaTime();
+        [gen doubleTap:p];
     } else if ([t isEqualToString:@"swipe"]) {
         CGPoint a = [self pointFromNormX:x y:y];
         CGPoint b = [self pointFromNormX:[cmd[@"x2"] doubleValue] y:[cmd[@"y2"] doubleValue]];
