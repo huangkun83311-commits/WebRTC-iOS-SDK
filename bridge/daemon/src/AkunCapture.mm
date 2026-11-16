@@ -30,7 +30,7 @@ static const int kDefaultFPS = 12;
 /// 抓屏轮询间隔：8ms 一次「画面变了吗」。
 /// 以前是 1/fps（20fps=50ms）当节拍，最坏要等 50ms 才抓一次，这就是「点了之后慢半拍」的来源；
 /// 改成 8ms 轮询 + fps 闸门：变化一出现最迟 8ms 就被抓走，帧率仍被 fps 上限压住，不额外花 CPU。
-static const double kPollSec = 0.004;
+static const double kPollSec = 0.002;
 static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
 
 @implementation AkunCapture {

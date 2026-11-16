@@ -117,6 +117,7 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
     NSInteger maxBitrate = prefs[@"MaxBitrate"] ? [prefs[@"MaxBitrate"] integerValue] : 900000;
     if (scale <= 0.0) { scale = 0.35; }
     if (fps <= 0) { fps = 30; }
+    if (fps > 60) { fps = 60; }
     if (maxBitrate <= 0) { maxBitrate = 900000; }
 
     NSLog(@"[daemon] server=%@ device=%@ scale=%.2f fps=%d maxBitrate=%ld",
@@ -243,7 +244,7 @@ static NSString *kPrefsPathRootless = @"/var/jb/var/mobile/Library/Preferences/c
                     if (scale < 0.30) { scale = 0.30; }
                     if (scale > 1.0) { scale = 1.0; }
                     if (fps < 8) { fps = 8; }
-                    if (fps > 30) { fps = 30; }
+                    if (fps > 60) { fps = 60; }
                     NSLog(@"[ctrl] 在线改画质 scale=%.2f fps=%d bitrate=%ld", scale, fps, (long)br);
                     // 缩图在抓屏层（vImage，整屏渲染 + 一次性缩到目标尺寸），编码器不再缩放
                     [self.capture setOutputScale:scale];
