@@ -139,6 +139,10 @@
     <button id="auxSendText" title="写入设备剪贴板 + 键盘通道 Cmd+V 粘贴">输入</button>
   </div>
   <div class="grp">
+    <input id="kbPad" placeholder="键盘直通：在这里敲字符会逐键发到手机（含 Shift 组合）" autocomplete="off" />
+    <button id="kbClear" class="ghost" title="清空">清空</button>
+  </div>
+  <div class="grp">
     <button data-aux="lock">锁屏</button>
     <button data-aux="unlock">唤醒</button>
     <button data-aux="respring">注销</button>
@@ -621,6 +625,33 @@
     setAuxOut('<span class="ok">' + esc(a) + ' 完成</span>' + (m.text ? '：' + esc(m.text) : ''));
   }
   window.__auxKey = (k) => { auxSend('key', { code: k }); };
+
+  // 键盘直通：#kbPad 里敲一个字符就发一条 key，和 AKUN 的逐键通道一致。
+  // 需要 Shift 的符号由设备端自动补 Shift；中文/表情无法映射成 HID usage，
+  // 走 composition 结束后整体 input_text（剪贴板 + Cmd+V）。
+  const KB_NAMED = { Enter: 'enter', Backspace: 'backspace', Escape: 'escape', Tab: 'tab',
+                     Delete: 'delete', ArrowUp: 'up', ArrowDown: 'down',
+                     ArrowLeft: 'left', ArrowRight: 'right' };
+  (function initKbPad() {
+    const pad = document.getElementById('kbPad');
+    if (!pad) return;
+    pad.addEventListener('keydown', (ev) => {
+      if (ev.isComposing) return;                       // 中文输入中，交给 compositionend
+      const named = KB_NAMED[ev.key];
+      if (named) { ev.preventDefault(); auxSend('key', { code: named }); return; }
+      if (ev.key === ' ') { ev.preventDefault(); auxSend('key', { code: 'space' }); return; }
+      if (ev.key.length === 1 && ev.key.charCodeAt(0) < 128) {
+        ev.preventDefault();
+        auxSend('key', { char: ev.key });
+      }
+    });
+    pad.addEventListener('compositionend', (ev) => {
+      const t = ev.data || '';
+      if (t) auxSend('input_text', { text: t });
+    });
+    const clear = document.getElementById('kbClear');
+    if (clear) clear.onclick = () => { pad.value = ''; pad.focus(); };
+  })();
   window.__auxLaunch = (b) => { auxSend('launch_app', { bundle: b }); };
   window.__auxKill = (b) => { auxSend('kill_app', { bundle: b }); };
 

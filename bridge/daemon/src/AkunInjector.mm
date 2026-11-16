@@ -473,7 +473,25 @@ static double clamp01(double v) {
         return @{ @"success" : @(ok), @"deleted" : @(ok) };
     }
     if ([a isEqualToString:@"key"]) {
-        // 键盘通道：AKUN 的按键动作，走 STHIDEventGenerator 的 HID 键盘事件
+        // 键盘通道：和 AKUN 一样走 HID 键盘事件。三种入参都能用：
+        //   code  —— 具名键（enter/backspace/escape/tab/space/delete/up/down/left/right/home）
+        //   char  —— 单个字符（a~z A~Z 0~9 及常见符号，需要 Shift 的自动带 Shift）
+        //   text  —— 一串 ASCII，逐字符按下；中文/表情请用 input_text（走剪贴板粘贴）
+        NSString *ch = cmd[@"char"];
+        if (ch.length == 1) {
+            [gen keyPress:ch];
+            return @{ @"success" : @YES, @"char" : ch };
+        }
+        NSString *txt = cmd[@"text"];
+        if (txt.length) {
+            for (NSUInteger i = 0; i < txt.length; i++) {
+                unichar c = [txt characterAtIndex:i];
+                if (c > 0x7F) { continue; }   // 非 ASCII 交给 input_text
+                [gen keyPress:[NSString stringWithFormat:@"%C", c]];
+                usleep(15000);
+            }
+            return @{ @"success" : @YES, @"chars" : @(txt.length) };
+        }
         NSString *k = cmd[@"code"] ?: @"";
         NSDictionary *map = @{ @"enter" : @0x28, @"backspace" : @0x2A, @"escape" : @0x29,
                                @"tab" : @0x2B, @"space" : @0x2C, @"delete" : @0x4C,

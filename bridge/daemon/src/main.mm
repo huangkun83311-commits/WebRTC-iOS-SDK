@@ -12,6 +12,11 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <unistd.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <arpa/inet.h>
+#import <sys/socket.h>
+#import <UIKit/UIKit.h>
 #import "AkunCapture.h"
 #import "AkunInjector.h"
 #import "AkunRTC.h"
@@ -43,6 +48,92 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
 @property (nonatomic, assign) NSInteger cfgBitrate;
 // 单台硬上限（含突发窗口）：0 表示不限。用户要求"单台最高 1.2M/1.5M"时由中控下发 cap=…
 @property (nonatomic, assign) NSInteger cfgHardCap;
+@end
+
+// 与 AKUN 完全一致的 UDP 发现：19941 上收 13 字节探测包
+// （4 字节大端魔数 "AKUN" + 1 字节版本 + 8 字节 nonce），回一条 JSON。
+// 字段照抄 AKUN：m/u/n/p/c/s/v，另外多给 w（本机 WebRTC 信令的 HTTP 地址）
+// 与 r（协议类型），这样中控既能像以前那样按 19941 找到机器，也知道这次不是 RFB。
+static NSString *AkunLocalIPv4(void) {
+    NSString *best = nil;
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) != 0 || !list) { return nil; }
+    for (struct ifaddrs *it = list; it; it = it->ifa_next) {
+        if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) { continue; }
+        if (!(it->ifa_flags & IFF_UP) || (it->ifa_flags & IFF_LOOPBACK)) { continue; }
+        NSString *name = [NSString stringWithUTF8String:it->ifa_name];
+        struct sockaddr_in *sin = (struct sockaddr_in *)it->ifa_addr;
+        NSString *ip = [NSString stringWithUTF8String:inet_ntoa(sin->sin_addr)];
+        if (!ip.length) { continue; }
+        if ([name isEqualToString:@"en0"]) { best = ip; break; }
+        if (!best) { best = ip; }
+    }
+    freeifaddrs(list);
+    return best;
+}
+
+@interface AkunDiscoveryUDP : NSObject
+@end
+
+@implementation AkunDiscoveryUDP
+- (void)run {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { NSLog(@"[discovery] socket 创建失败"); return; }
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    int rcvBuf = 32 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, sizeof(rcvBuf));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(19941);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    int logged = 0;
+    while (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        // 19941 被 AKUN 的 VNC 插件占着时只能等：AKUN 停了或卸了，我们立刻接手，
+        // 同一台机器上两个插件不为同一个发现端口互相抢。
+        if (!logged++) { NSLog(@"[discovery] 19941 被占用（AKUN 在跑？）errno=%d，每 15 秒重试", errno); }
+        sleep(15);
+    }
+    NSLog(@"[discovery] 已在 UDP 19941 监听（与 AKUN 同协议）");
+
+    uint8_t packet[128];
+    while (1) {
+        struct sockaddr_in peer;
+        socklen_t peerLen = sizeof(peer);
+        ssize_t n = recvfrom(fd, packet, sizeof(packet), 0, (struct sockaddr *)&peer, &peerLen);
+        if (n < 13) { continue; }
+        uint32_t magic = 0;
+        memcpy(&magic, packet, sizeof(magic));
+        if (ntohl(magic) != 0x414B554Eu) { continue; }   // 不是 AKUN 协议，静默丢弃
+
+        @autoreleasepool {
+            NSString *udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+            NSString *name = [[UIDevice currentDevice] name];
+            NSDictionary *sysInfo = [NSDictionary dictionaryWithContentsOfFile:
+                @"/System/Library/CoreServices/SystemVersion.plist"];
+            NSString *sysVersion = sysInfo[@"ProductVersion"];
+            if (!sysVersion.length) { sysVersion = [[UIDevice currentDevice] systemVersion]; }
+
+            NSMutableDictionary *reply = [NSMutableDictionary dictionary];
+            reply[@"m"] = @"AKUN";          // 中控按 m 认设备，保持一致
+            if (udid.length) { reply[@"u"] = udid; }
+            if (name.length) { reply[@"n"] = name; }
+            reply[@"p"] = @0;               // 本插件没有 5901 RFB
+            reply[@"c"] = @0;               // 也没有 19940 裸 TCP，控制走下面的 w
+            reply[@"v"] = @"1.0.0";
+            reply[@"r"] = @"webrtc";
+            if (sysVersion.length) { reply[@"s"] = sysVersion; }
+            NSString *ip = AkunLocalIPv4();
+            if (ip.length) { reply[@"w"] = [NSString stringWithFormat:@"http://%@:8080", ip]; }
+
+            NSData *json = [NSJSONSerialization dataWithJSONObject:reply options:0 error:NULL];
+            if (json.length) {
+                sendto(fd, json.bytes, json.length, 0, (struct sockaddr *)&peer, sizeof(peer));
+            }
+        }
+    }
+}
 @end
 
 @implementation AkunDaemon
@@ -109,6 +200,10 @@ extern NSDictionary *AkunBridgeRtcMetrics(void);
     }
 
     self.discovering = YES;
+    // UDP 19941 发现应答（与 AKUN 同协议，中控不需要改扫描逻辑）
+    AkunDiscoveryUDP *udp = [[AkunDiscoveryUDP alloc] init];
+    [NSThread detachNewThreadSelector:@selector(run) toTarget:udp withObject:nil];
+
     NSLog(@"[daemon] 开始局域网自动发现");
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
