@@ -385,7 +385,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("embed web: %v", err)
 	}
-	mux.Handle("/", http.FileServer(http.FS(static)))
+	// 网页必须每次拿最新：档位/按钮改过之后，浏览器缓存旧页面会把旧参数
+	// 重新下发给设备（实测出现过 15fps/0.30 把画面拖回"越调越卡"的假象）。
+	fileServer := http.FileServer(http.FS(static))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		fileServer.ServeHTTP(w, r)
+	}))
 
 	srv := &http.Server{
 		Addr:              *addr,
