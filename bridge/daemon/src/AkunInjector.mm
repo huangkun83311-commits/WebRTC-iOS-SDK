@@ -9,6 +9,9 @@
 //  _unjailedReferenceBoundsInPixels（1080x1920）再喂 HID，所以网页来的 0~1 要先乘回来。
 
 #import "AkunInjector.h"
+
+// 全局：最后一次触摸注入的时刻（给抓屏侧算「点击→出帧」用）
+double gLastInputMono = 0.0;
 #import "AkunOrientation.h"
 
 #import <UIKit/UIKit.h>
@@ -133,6 +136,7 @@ static double clamp01(double v) {
         NSLog(@"[inject] tap 像素 (%f,%f)", p.x, p.y);
         // 不用 gen 的 tap: —— 它内部 _sendTaps 断言 delay>0 而自身传 0，带断言编译会 abort。
         // 走 touchDown/touchUp 两段，等价 AKUN 的 tap 行为。
+        gLastInputMono = CACurrentMediaTime();
         [gen touchDownAtPoints:&p touchCount:1];
         NSUInteger ms = cmd[@"ms"] ? [cmd[@"ms"] unsignedIntValue] : 120;
         if (ms < 30) { ms = 30; }
@@ -147,6 +151,7 @@ static double clamp01(double v) {
         _downTime = CACurrentMediaTime();
         CGPoint p = [self pointFromNormX:x y:y];
         NSLog(@"[inject] down (%f,%f)", p.x, p.y);
+        gLastInputMono = CACurrentMediaTime();
         [gen touchDownAtPoints:&p touchCount:1];
     } else if ([t isEqualToString:@"m"]) {
         if (_dragging) {

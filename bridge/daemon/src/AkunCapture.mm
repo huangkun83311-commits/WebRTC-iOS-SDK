@@ -13,6 +13,8 @@
 
 #import "AkunCapture.h"
 
+extern double gLastInputMono;   // AkunInjector.mm 里打点：最后一次触摸注入时刻
+
 #import <IOSurface/IOSurfaceRef.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
@@ -345,13 +347,14 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     BOOL timeOk = (now - _lastPushMono >= minGap - prep + _pacePadSec);
     BOOL keepaliveDue = (now - _lastPushTime >= 2.0);
     // 「唤醒即发」：长时间静止后画面第一次变化（= 用户点了、开了应用），
-    // 不排队等下一拍，只要流水线已经空出来就立刻出帧。
-    // 这一帧平均省掉半个帧间隔（30fps 下约 17ms），而持续动画仍按 fps 走，
-    // 所以平均帧率/发热几乎不变 —— 这才是「跟手」和「不卡」能同时成立的地方。
+    // 不排队等下一拍，只要流水线已经空出来就立刻出帧 —— 这一帧省掉最多半个帧间隔。
+    // 注意：静止期间允许按「流水线空闲」的节奏去查脏图（约 cost 一次，16ms），
+    // 但只有真的变了才插队出帧；没变就继续等，否则会变成静止画面也狂渲染（烧 CPU）。
+    double costSec = _costMsAvg / 1000.0 * 1.05;
+    BOOL pipelineFree = (now - _lastPushMono >= costSec);
     BOOL wasIdle = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) > 0.35);
-    BOOL wakeBurst = wasIdle && (now - _lastPushMono >= _costMsAvg / 1000.0 * 1.05);
-    if (!timeOk && !keepaliveDue && !wakeBurst) { return; }
-    if (wakeBurst && !timeOk) { _burstCount++; }
+    BOOL mayProbe = timeOk || keepaliveDue || (wasIdle && pipelineFree);
+    if (!mayProbe) { return; }
 
     BOOL changed = YES;
     if (_dirtyFrameCount) {
@@ -366,8 +369,11 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     if (idle) {
         if (now - _lastPushTime < 2.0) { return; }
     } else {
-        // 时间闸门（含 prep 提前量与闭环修正）已在函数开头判过，这里只保留语义分支。
-        if (!timeOk) { return; }
+        if (!timeOk) {
+            // 只有「从静止被唤醒并且真的变了」的那一帧才允许插队，持续动画仍受 fps 闸门管。
+            if (!(wasIdle && pipelineFree && changed)) { return; }
+            _burstCount++;
+        }
     }
 
     // 节拍闭环修正（在真正出帧前算，用的是上一帧的真实间隔）
@@ -397,6 +403,13 @@ static const uint32_t kPixelFormatBGRA = 0x42475241;   // 'BGRA'
     // 渲染服务器把主屏画进这块 surface。kIOSurfaceLock 不需要：渲染是同步完成的。
     _renderDisplay(0, CFSTR("LCD"), surface, 0, 0);
     NSTimeInterval t1 = CACurrentMediaTime();
+
+    // 设备侧延迟分段：从触摸注入到这一帧渲染完成（不含编码/网络/客户端上屏）
+    if (gLastInputMono > 0.0) {
+        double d = (CACurrentMediaTime() - gLastInputMono) * 1000.0;
+        gLastInputMono = 0.0;
+        if (d >= 0.0 && d < 2000.0) { NSLog(@"[lat] 点击→出帧 %.1fms", d); }
+    }
 
     // 推上一帧的槽位（双缓冲，交替）
     _cur = 1 - _cur;
