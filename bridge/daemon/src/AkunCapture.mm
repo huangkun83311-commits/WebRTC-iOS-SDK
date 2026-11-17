@@ -654,6 +654,10 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
 #pragma mark - 静帧截图（中控 screenshot 指令）
 
 - (NSData *)snapshotJPEGWithScale:(double)scale quality:(double)quality {
+    return [self snapshotDataWithScale:scale quality:quality asPNG:NO];
+}
+
+- (NSData *)snapshotDataWithScale:(double)scale quality:(double)quality asPNG:(BOOL)asPNG {
     if (!_renderDisplay) { return nil; }
     CGSize sp = [self screenPixelSize];
     NSUInteger w = (NSUInteger)sp.width, h = (NSUInteger)sp.height;
@@ -692,11 +696,11 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     CVPixelBufferRelease(pb);
     if (!cg) { return nil; }
     UIImage *ui = [UIImage imageWithCGImage:cg];
-    NSData *jpeg = UIImageJPEGRepresentation(ui, quality);
+    NSData *enc = asPNG ? UIImagePNGRepresentation(ui) : UIImageJPEGRepresentation(ui, quality);
     CGImageRelease(cg);
-    NSLog(@"[capture] 截图 %.0fx%.0f scale=%.2f q=%.2f %luB", ui.size.width, ui.size.height,
-          scale, quality, (unsigned long)jpeg.length);
-    return jpeg;
+    NSLog(@"[capture] 截图 %.0fx%.0f scale=%.2f q=%.2f %@ %luB", ui.size.width, ui.size.height,
+          scale, quality, (asPNG ? @"png" : @"jpeg"), (unsigned long)enc.length);
+    return enc;
 }
 
 @end

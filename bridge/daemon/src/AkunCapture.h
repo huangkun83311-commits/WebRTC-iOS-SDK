@@ -36,6 +36,8 @@
 /// 抓一张当前屏幕的静帧（JPEG）。scale=1 是屏幕原生像素，quality 0~1。
 /// 中控的截图指令走这里：独立建一块临时 surface 渲染，不干扰推流那条双缓冲。
 - (NSData *)snapshotJPEGWithScale:(double)scale quality:(double)quality;
+/// AKUN 对齐：format=jpeg/png。png 走同一块真实像素渲染，只是编码不同。
+- (NSData *)snapshotDataWithScale:(double)scale quality:(double)quality asPNG:(BOOL)asPNG;
 
 @end
 

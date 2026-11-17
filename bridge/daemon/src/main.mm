@@ -897,6 +897,11 @@ static void akun_run_dpkgd(int port) {
                 }
             } else if ([verb isEqualToString:@"DPKG_R"] && arg.length) {
                 rc = akun_root_exec(@[ @"dpkg", @"-r", arg ], &outp);
+            } else if ([verb isEqualToString:@"DELE"] && arg.length) {
+                // 装完清包：root 侧删，避免 mobile 无权删 root 属主的旧包
+                NSString *real = akun_expand_jb(arg);
+                if (unlink(real.UTF8String) == 0) { rc = 0; outp = [NSString stringWithFormat:@"deleted %@", real]; }
+                else { rc = errno == ENOENT ? 0 : -1; outp = [NSString stringWithFormat:@"unlink errno=%d %@", errno, real]; }
             } else if ([verb isEqualToString:@"KILLSB"]) {
                 // respring：root 侧用 sysctl 遍历进程表，按 p_comm 找 SpringBoard 再 SIGKILL。
                 int killed = 0, scanned = 0;
@@ -920,7 +925,36 @@ static void akun_run_dpkgd(int port) {
                 }
                 rc = killed > 0 ? 0 : 1;
                 outp = [NSString stringWithFormat:@"killed=%d scanned=%d", killed, scanned];
-                        } else if ([verb isEqualToString:@"TIPAQ"] && arg.length) {
+            } else if ([verb isEqualToString:@"ASSIST_ON"] || [verb isEqualToString:@"ASSIST_OFF"]) {
+                // 逐字照抄 AKUN rootd（trollvncserver.mm:6415-6483）：
+                //   开：bootstrap user/foreground <rootfs plist>（不看返回码）→ kickstart -kp user/501
+                //       → 只有 rc≠0 才补 kickstart -kp user/foreground
+                //   关：bootout system/com.apple.assistivetouchd，再由主进程 SIGTERM 那个进程
+                // 一条不多一条不少，别自己加域循环、别加 Accessib ilityUIServer 兜底。
+                BOOL wantOn = [verb isEqualToString:@"ASSIST_ON"];
+                NSString *plist = @"/rootfs/System/Library/LaunchDaemons/com.apple.assistivetouchd.plist";
+                NSString *o1 = @"", *o2 = @"", *o3 = @"", *o4 = @"";
+                if (wantOn) {
+                    int b  = akun_root_exec(@[ @"launchctl", @"bootstrap", @"user/foreground", plist ], &o1);
+                    int k1 = akun_root_exec(@[ @"launchctl", @"kickstart", @"-kp",
+                                               @"user/501/com.apple.assistivetouchd" ], &o2);
+                    rc = k1;
+                    int k2 = -1;
+                    if (rc != 0) {
+                        k2 = akun_root_exec(@[ @"launchctl", @"kickstart", @"-kp",
+                                               @"user/foreground/com.apple.assistivetouchd" ], &o3);
+                        rc = k2;
+                    }
+                    outp = [NSString stringWithFormat:@"bootstrap=%d(plist %s) kick501=%d kickfg=%d [%@][%@]",
+                            b, [fm fileExistsAtPath:plist] ? "存在" : "不存在", k1, k2,
+                            o2.length ? o2 : @"", o3.length ? o3 : @""];
+                } else {
+                    rc = akun_root_exec(@[ @"launchctl", @"bootout", @"system/com.apple.assistivetouchd" ], &o1);
+                    int sig = akun_root_exec(@[ @"killall", @"-TERM", @"assistivetouchd" ], &o4);
+                    outp = [NSString stringWithFormat:@"bootout=%d killall=%d [%@][%@]",
+                            rc, sig, o1.length ? o1 : @"", o4.length ? o4 : @""];
+                }
+            } else if ([verb isEqualToString:@"TIPAQ"] && arg.length) {
                 NSString *real = akun_expand_jb(arg);
                 if (![fm fileExistsAtPath:real]) { rc = -9; outp = [NSString stringWithFormat:@"文件不存在: %@ (展开 %@)", arg, real]; }
                 else {

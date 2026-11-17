@@ -9,6 +9,8 @@
 //  _unjailedReferenceBoundsInPixels（1080x1920）再喂 HID，所以网页来的 0~1 要先乘回来。
 
 #import "AkunInjector.h"
+#include <spawn.h>
+extern char **environ;
 #import "AkunCapture.h"
 
 // 全局：最后一次触摸注入的时刻（给抓屏侧算「点击→出帧」用）
@@ -19,6 +21,8 @@ extern void AkunBridgeNoteInteraction(void);
 #import "AkunOrientation.h"
 
 #import <UIKit/UIKit.h>
+#import <sys/sysctl.h>
+#import <sys/types.h>
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <spawn.h>
@@ -27,6 +31,7 @@ extern void AkunBridgeNoteInteraction(void);
 #import <unistd.h>
 #import <signal.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -62,6 +67,128 @@ static id akun_appWorkspace(void) {
         ws = akun_msg0(c, @"defaultWorkspace");
     });
     return ws;
+}
+
+// —— AKUN 对齐用的进程表工具 ——
+// AKUN 明确警告：mobile 身份下 SpringBoardServices/FrontBoard 的 XPC（terminateApplication:）
+// 会无限等、把 action 线程卡死。所以一律走 sysctl 进程表 + kill()，纯本地调用。
+static NSDictionary<NSString *, NSNumber *> *akun_proc_map(void) {
+    NSMutableDictionary *map = [NSMutableDictionary dictionary];
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return map;
+    struct kinfo_proc *kp = (struct kinfo_proc *)malloc(len);
+    if (!kp) return map;
+    if (sysctl(mib, 4, kp, &len, NULL, 0) == 0) {
+        int n = (int)(len / sizeof(struct kinfo_proc));
+        for (int i = 0; i < n; i++) {
+            pid_t pid = kp[i].kp_proc.p_pid;
+            if (pid <= 1) continue;
+            const char *comm = kp[i].kp_proc.p_comm;
+            if (!comm || !comm[0]) continue;
+            NSString *name = [NSString stringWithUTF8String:comm];
+            if (name.length && !map[name]) map[name] = @(pid);
+        }
+    }
+    free(kp);
+    return map;
+}
+
+static int akun_pid_for_exec(NSString *exec) {
+    if (!exec.length) return 0;
+    NSDictionary *map = akun_proc_map();
+    NSNumber *exact = map[exec];
+    if (exact) return exact.intValue;
+    // p_comm 只有 16 字节，长可执行名会被截断，退化到前缀匹配
+    if (exec.length > 16) {
+        NSString *prefix = [exec substringToIndex:16];
+        for (NSString *k in map) {
+            NSNumber *n = map[k];
+            if ([k hasPrefix:prefix]) return n.intValue;
+        }
+    }
+    return 0;
+}
+
+// bundle → 主可执行名（LSApplicationProxy.bundleExecutable，取不到读 Info.plist）
+static NSString *akun_bundle_exec(NSString *bundle) {
+    if (!bundle.length) return nil;
+    if ([bundle isEqualToString:@"com.apple.SpringBoard"]) return @"SpringBoard";
+    id proxy = nil;
+    Class pc = NSClassFromString(@"LSApplicationProxy");
+    SEL sel = NSSelectorFromString(@"applicationProxyForIdentifier:");
+    if (pc && [pc respondsToSelector:sel]) {
+        proxy = ((id (*)(id, SEL, id))objc_msgSend)(pc, sel, bundle);
+    }
+    NSString *ex = nil;
+    @try { ex = [proxy valueForKey:@"bundleExecutable"]; } @catch (__unused NSException *e) {}
+    if (!ex.length) {
+        NSString *bp = nil;
+        @try { bp = [[proxy valueForKey:@"bundleURL"] path]; } @catch (__unused NSException *e) {}
+        if (bp.length) {
+            NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:
+                                [bp stringByAppendingPathComponent:@"Info.plist"]];
+            ex = pl[@"CFBundleExecutable"];
+        }
+    }
+    return (ex.length) ? ex : nil;
+}
+
+// 真实显示名：<lang>.lproj/InfoPlist.strings 优先（daemon 没有语言偏好，localizedInfoDictionary
+// 会退回 Base 名，所以必须先读文件）
+static NSString *akun_app_localized_name(NSString *appPath, NSString *fallback) {
+    if (!appPath.length) return fallback;
+    for (NSString *lproj in @[ @"zh-Hans.lproj", @"zh-Hant.lproj", @"zh-Hans-CN.lproj",
+                                @"zh-Hans-HK.lproj", @"zh_CN.lproj" ]) {
+        NSString *p = [appPath stringByAppendingPathComponent:
+                       [lproj stringByAppendingPathComponent:@"InfoPlist.strings"]];
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        NSString *v = d[@"CFBundleDisplayName"];
+        if (![v isKindOfClass:[NSString class]] || !v.length) v = d[@"CFBundleName"];
+        if ([v isKindOfClass:[NSString class]] && v.length) return v;
+    }
+    NSDictionary *mainInfo = [NSDictionary dictionaryWithContentsOfFile:
+                              [appPath stringByAppendingPathComponent:@"Info.plist"]];
+    if ([mainInfo isKindOfClass:[NSDictionary class]]) {
+        NSString *dn = mainInfo[@"CFBundleDisplayName"];
+        if ([dn isKindOfClass:[NSString class]] && dn.length) return dn;
+    }
+    return fallback;
+}
+
+// 扫 App 容器目录补漏：TrollStore / 侧载 / 隐藏安装不会出现在 LS 里
+static void akun_scan_app_bundles(NSString *root, NSMutableDictionary *map) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:root isDirectory:&isDir] || !isDir) return;
+    for (NSString *entry in ([fm contentsOfDirectoryAtPath:root error:nil] ?: @[])) {
+        NSString *path = [root stringByAppendingPathComponent:entry];
+        BOOL d = NO;
+        if (![fm fileExistsAtPath:path isDirectory:&d] || !d) continue;
+        NSMutableArray *appPaths = [NSMutableArray array];
+        if ([entry hasSuffix:@".app"]) { [appPaths addObject:path]; }
+        else {
+            for (NSString *sub in ([fm contentsOfDirectoryAtPath:path error:nil] ?: @[])) {
+                if ([sub hasSuffix:@".app"]) [appPaths addObject:[path stringByAppendingPathComponent:sub]];
+            }
+        }
+        for (NSString *appPath in appPaths) {
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                                  [appPath stringByAppendingPathComponent:@"Info.plist"]];
+            if (![info isKindOfClass:[NSDictionary class]]) continue;
+            NSString *bid = info[@"CFBundleIdentifier"];
+            if (![bid isKindOfClass:[NSString class]] || !bid.length) continue;
+            NSMutableDictionary *exist = map[bid];
+            if (exist) { if (![exist[@"path"] length]) exist[@"path"] = appPath; continue; }
+            NSString *nm = info[@"CFBundleDisplayName"];
+            if (![nm isKindOfClass:[NSString class]] || !nm.length) nm = info[@"CFBundleName"];
+            nm = akun_app_localized_name(appPath, nm);
+            if (![nm isKindOfClass:[NSString class]] || !nm.length) nm = bid;
+            map[bid] = [NSMutableDictionary dictionaryWithObjectsAndKeys:
+                        bid, @"bundle", nm, @"name", appPath, @"path", nil];
+        }
+    }
 }
 
 
@@ -212,6 +339,81 @@ static int akun_stat_mode(NSString *p) {
     struct stat st;
     if (stat(p.UTF8String, &st) != 0) return -1;
     return (int)st.st_mode;
+}
+
+// ---------- device_info 用的探针（逐条对齐 AKUN TVNCDeviceInfo） ----------
+
+// MobileGestalt：用户改的设备名、ProductType、真 UDID、序列号都只能从这里拿。
+// [[UIDevice currentDevice] name] 在 daemon 里永远是出厂名 "iPhone"。
+static NSString *akun_mg_string(NSString *key) {
+    if (!key.length) return nil;
+    typedef CFTypeRef (*MGCopyAnswerFn)(CFStringRef);
+    static MGCopyAnswerFn fn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+        if (h) fn = (MGCopyAnswerFn)dlsym(h, "MGCopyAnswer");
+    });
+    if (!fn) return nil;
+    CFTypeRef v = fn((__bridge CFStringRef)key);
+    if (!v) return nil;
+    NSString *s = nil;
+    if (CFGetTypeID(v) == CFStringGetTypeID()) {
+        s = (__bridge_transfer NSString *)v;
+    } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+        s = [(__bridge_transfer NSNumber *)v stringValue];
+    } else {
+        CFRelease(v);
+    }
+    return s.length ? s : nil;
+}
+
+// roothide 的越狱根：/var/containers/Bundle/Application/.jbroot-XXXX
+static NSString *akun_jbroot_path(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *parent = @"/var/containers/Bundle/Application";
+        NSArray *es = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:parent error:nil];
+        for (NSString *e in es) {
+            if ([e hasPrefix:@".jbroot-"]) {
+                cached = [parent stringByAppendingPathComponent:e];
+                break;
+            }
+        }
+    });
+    return cached;
+}
+
+// 真写一个探针再删：查权限位不准（沙盒/ACL/sticky 位都盖不到）
+static BOOL akun_probe_writable(NSString *p) {
+    if (!p.length) return NO;
+    int fd = open(p.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return NO;
+    close(fd);
+    unlink(p.UTF8String);
+    return YES;
+}
+
+static BOOL akun_binary_has_setuid(NSString *p) {
+    if (!p.length) return NO;
+    struct stat st;
+    if (stat(p.UTF8String, &st) != 0) return NO;
+    return (st.st_mode & S_ISUID) != 0;
+}
+
+// 我方 root 通道是 dpkgd（127.0.0.1:19949），对应 AKUN 的 trollvnc-rootd socket 探测
+static BOOL akun_dpkgd_up(void) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return NO;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(19949);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    BOOL ok = (connect(s, (struct sockaddr *)&a, sizeof(a)) == 0);
+    close(s);
+    return ok;
 }
 
 static NSData *akun_fread_all(NSString *p) {
@@ -428,10 +630,103 @@ static double clamp01(double v) {
         }
     } else if ([t isEqualToString:@"hk"]) {
         unsigned int usage = [cmd[@"usage"] unsignedIntValue];
-        if (usage == 0xE9) { [gen volumeIncrementPress]; }
+        unsigned int mod = [cmd[@"mod"] unsignedIntValue];
+        unsigned int usagePage = [cmd[@"page"] unsignedIntValue];
+        if (usagePage == 0) { usagePage = 0x07; }   // 默认键盘页
+        if (mod) {
+            // 通用组合键：修饰键按住 → 主键按下/抬起 → 修饰键抬起（Cmd+L / Cmd+A / Cmd+V 等）
+            gLastInputMono = CACurrentMediaTime();
+            AkunBridgeNoteInteraction();
+            [gen _sendIOHIDKeyboardEvent:usagePage usage:mod isKeyDown:true];
+            usleep(20000);
+            [gen _sendIOHIDKeyboardEvent:usagePage usage:usage isKeyDown:true];
+            usleep(20000);
+            [gen _sendIOHIDKeyboardEvent:usagePage usage:usage isKeyDown:false];
+            usleep(20000);
+            [gen _sendIOHIDKeyboardEvent:usagePage usage:mod isKeyDown:false];
+            NSLog(@"[inject] hk mod=0x%X usage=0x%X", mod, usage);
+        }
+        else if (usage == 0xE9) { [gen volumeIncrementPress]; }
         else if (usage == 0xEA) { [gen volumeDecrementPress]; }
         else if (usage == 0x223) { [gen menuPress]; }
+        else if (usage) {
+            // 单键（不带修饰）
+            gLastInputMono = CACurrentMediaTime();
+            AkunBridgeNoteInteraction();
+            [gen _sendIOHIDKeyboardEvent:usagePage usage:usage isKeyDown:true];
+            usleep(30000);
+            [gen _sendIOHIDKeyboardEvent:usagePage usage:usage isKeyDown:false];
+            NSLog(@"[inject] hk key usage=0x%X", usage);
+        }
     }
+}
+
+
+// 亮度：AKUN 用 BrightnessSystemClient 的 setProperty:forKey:@"DisplayBrightness"。
+// UIScreen.brightness 在 daemon 进程里只是本地属性，改不动真实背光。
+static BOOL akun_set_brightness(CGFloat v) {
+    Class cls = NSClassFromString(@"BrightnessSystemClient");
+    if (!cls) {
+        dlopen("/System/Library/PrivateFrameworks/BrightnessControl.framework/BrightnessControl", RTLD_LAZY);
+        cls = NSClassFromString(@"BrightnessSystemClient");
+    }
+    if (cls) {
+        id client = [[cls alloc] init];
+        SEL sel = NSSelectorFromString(@"setProperty:forKey:");
+        if ([client respondsToSelector:sel]) {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(client, sel, @(v), @"DisplayBrightness");
+            return YES;
+        }
+    }
+    [UIScreen mainScreen].brightness = v;
+    return NO;
+}
+
+static CGFloat akun_get_brightness(void) {
+    Class cls = NSClassFromString(@"BrightnessSystemClient");
+    if (cls) {
+        id client = [[cls alloc] init];
+        SEL sel = NSSelectorFromString(@"copyPropertyForKey:");
+        if ([client respondsToSelector:sel]) {
+            id val = ((id (*)(id, SEL, id))objc_msgSend)(client, sel, @"DisplayBrightness");
+            if ([val respondsToSelector:@selector(doubleValue)]) return (CGFloat)[val doubleValue];
+        }
+    }
+    return [UIScreen mainScreen].brightness;
+}
+
+// 读当前系统音量（Audio/Video 类别）；读不到回 -1，便于调用方区分「0」和「失败」
+static CGFloat akun_get_volume(void) {
+    Class avsc = NSClassFromString(@"AVSystemController");
+    id shared = akun_msg0(avsc, @"sharedAVSystemController");
+    SEL s = NSSelectorFromString(@"getVolume:forCategory:");
+    if (shared && [shared respondsToSelector:s]) {
+        float v = -1.0f;
+        BOOL (*fn)(id, SEL, float *, id) = (BOOL (*)(id, SEL, float *, id))objc_msgSend;
+        if (fn(shared, s, &v, @"Audio/Video")) return (CGFloat)v;
+    }
+    return -1.0;
+}
+
+// 与 AKUN TVNCUploadPathAllowed 逐字一致：绝对路径、≤512、无 ".."、
+// 必须 /tmp/ 或 /var/mobile/ 前缀、后缀 .deb/.tipa/.ipa（不区分大小写）
+static BOOL akun_pkg_path_allowed(NSString *path) {
+    if (![path isKindOfClass:[NSString class]] || path.length == 0 || path.length > 512) return NO;
+    if (![path isAbsolutePath] || [path rangeOfString:@".."].location != NSNotFound) return NO;
+    if (!([path hasPrefix:@"/tmp/"] || [path hasPrefix:@"/var/mobile/"])) return NO;
+    NSString *lower = path.lowercaseString;
+    return [lower hasSuffix:@".deb"] || [lower hasSuffix:@".tipa"] || [lower hasSuffix:@".ipa"];
+}
+
+// 与 AKUN TVNCDeletePkgFile 等价：自己 unlink，失败再交 rootd（DELE）删；
+// mobile 身份删不掉 root 属主文件，这是必需的后备
+static BOOL akun_delete_pkg_file(NSString *path) {
+    if (path.length == 0) return NO;
+    if (unlink(path.UTF8String) == 0) return YES;
+    int rc = -1;
+    NSString *out = nil;
+    akun_root_cmd([NSString stringWithFormat:@"DELE %@", path], &rc, &out);
+    return (rc == 0);
 }
 
 
@@ -485,9 +780,11 @@ static Class akunAssistiveDetailClass(void) {
     return NSClassFromString(@"PSAssistiveTouchSettingsDetail");
 }
 
-// 照搬 AKUN TVNCApplyAssistiveTouch：偏好落盘 → AXSettings → Preferences detail → Darwin 广播。
-// iOS 16.7 上没有独立 assistivetouchd 守护（launchctl 里查不到），AKUN 那条 bootout 路在这代不适用，
-// 所以 SpringBoard 手里那份开关只能靠下面三条 Darwin 通知刷新。
+// 照搬 AKUN TVNCApplyAssistiveTouch 的五步：
+//   1) 偏好落盘  2) AXSettings（系统设置里那个开关走的就是它）  3) PSAssistiveTouchSettingsDetail
+//   4) 三条 Darwin 广播  5) rootd 摘掉/挂回 com.apple.assistivetouchd 的 launchd job
+// 第 5 步是关键：SpringBoard 的开关在内存里，只改偏好+发通知改不动它；job 摘掉后连触摸都拉不起来。
+// 设备上这个 job 的 plist 在 /rootfs/System/Library/LaunchDaemons/（roothide 视图），已实测存在。
 static NSDictionary *akunApplyAssistiveTouch(BOOL enable) {
     CFPreferencesSetAppValue(CFSTR("AssistiveTouchEnabled"),
                              (__bridge CFPropertyListRef)(@(enable)),
@@ -507,16 +804,42 @@ static NSDictionary *akunApplyAssistiveTouch(BOOL enable) {
     akunPostDarwin("com.apple.accessibility.axsettings.changed");
     akunPostDarwin("AXAssistiveTouchEnabledChanged");
 
+    // 5) root 侧 job：开 = bootstrap(user/foreground) + kickstart(-kp user/501)，
+    //    关 = bootout(system)，与 AKUN rootd 的 assistive_job_on/off 完全一致
+    int jobRc = -1;
+    NSString *jobOut = @"";
+    akun_root_cmd(enable ? @"ASSIST_ON" : @"ASSIST_OFF", &jobRc, &jobOut);
+
     BOOL now = enable;
     if (detail && [detail respondsToSelector:@selector(isEnabled)]) {
         now = ((BOOL (*)(id, SEL))objc_msgSend)((id)detail, @selector(isEnabled));
     }
-    NSLog(@"[aux] assistive touch enable=%d pref=%d ax=%d prefs=%d now=%d", enable, prefOk, axOk, prefsOk, now);
+    NSLog(@"[aux] assistive touch enable=%d pref=%d ax=%d prefs=%d job=%d now=%d out=%@",
+          enable, prefOk, axOk, prefsOk, jobRc, now, jobOut);
+    NSString *jobState = (jobRc == 0)
+        ? (enable ? @"bootstrap+kickstart" : @"bootout")
+        : [NSString stringWithFormat:@"failed(%d)%@", jobRc, jobOut.length ? jobOut : @""];
     return @{ @"success" : @YES,
               @"enabled" : @(now),
               @"action" : (enable ? @"assistive_touch_on" : @"assistive_touch_off"),
               @"via" : @{ @"pref" : @(prefOk), @"axsettings" : @(axOk),
-                          @"preferences" : @(prefsOk), @"job" : @"n/a(iOS16 无 assistivetouchd)" } };
+                          @"preferences" : @(prefsOk), @"job" : jobState },
+              @"effective" : @{ @"pref_written" : @(prefOk),
+                               @"axsettings_applied" : @(axOk),
+                               @"settings_detail" : @(prefsOk),
+                               @"runtime_enabled" : @(now),
+                               @"job_ok" : @(jobRc == 0) },
+              // 如实汇报：只有 job 真的起来了才说“已拉起”。
+              // 本机（iPhone10,2 / iOS 16.7.16 / roothide）实测 launchd 里没有 com.apple.assistivetouchd，
+              // 球由 LaunchAngel com.apple.AccessibilityUIServer 画，kickstart 不支持 LaunchAngel，
+              // 所以这里会回 job_ok=false，不会拿“接口通了”冒充“球出来了”。
+              @"note" : (enable
+                         ? (jobRc == 0
+                            ? @"偏好已写 true，assistivetouchd 已 bootstrap+kickstart"
+                            : [NSString stringWithFormat:@"偏好已写 true（设置里辅助触控显示为开），但本机无 assistivetouchd 服务可拉起：%@", jobOut])
+                         : (jobRc == 0
+                            ? @"偏好已写 false，assistivetouchd 已 bootout 并杀掉"
+                            : [NSString stringWithFormat:@"偏好已写 false，但本机无 assistivetouchd 服务：%@", jobOut])) };
 }
 
 static NSDictionary *akunGetAssistiveTouch(void) {
@@ -569,17 +892,95 @@ static NSDictionary *akunPostNotifications(id rawNames) {
     if (!a.length) { return @{ @"success" : @NO, @"error" : @"missing action" }; }
 
     if ([a isEqualToString:@"device_info"]) {
-        UIDevice *d = [UIDevice currentDevice];
-        NSString *name = d.name ?: @"iPhone";
-        NSString *udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
-        return @{ @"success" : @YES,
-                  @"device_name" : name,
-                  @"system_version" : d.systemVersion ?: @"",
-                  @"model" : d.model ?: @"",
-                  @"udid" : udid,
-                  @"udid_source" : @"idfv",
-                  @"form" : @"deb",
-                  @"version" : @"1.0.0" };
+        // 1:1 对齐 AKUN TVNCDeviceInfo：字段名、取值顺序、来源标记都逐条照抄
+        struct utsname si;
+        uname(&si);
+        NSString *machine = [NSString stringWithUTF8String:si.machine] ?: @"unknown";
+        NSString *kern = [NSString stringWithUTF8String:si.release] ?: @"unknown";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        info[@"machine"] = machine ?: @"unknown";
+        info[@"kernel"] = kern ?: @"unknown";
+        info[@"process"] = @"akund";
+        info[@"uid"] = @(getuid());
+
+        NSString *jbroot = akun_jbroot_path();
+        info[@"jailbreak_root"] = (jbroot.length || [fm fileExistsAtPath:@"/var/jb"]) ? @YES : @NO;
+        info[@"jbroot"] = jbroot.length ? jbroot : @"";
+        BOOL jbWritable = jbroot.length ? [fm isWritableFileAtPath:jbroot] : NO;
+        info[@"jbroot_writable"] = @(jbWritable);
+
+        NSString *dpkgBin = jbroot.length ? [jbroot stringByAppendingPathComponent:@"usr/bin/dpkg"]
+                                         : @"/var/jb/usr/bin/dpkg";
+        info[@"dpkg_present"] = @([fm isExecutableFileAtPath:dpkgBin]);
+        NSString *dpkgDebBin = jbroot.length ? [jbroot stringByAppendingPathComponent:@"usr/bin/dpkg-deb"]
+                                            : @"/var/jb/usr/bin/dpkg-deb";
+        info[@"dpkg_deb_present"] = @([fm isExecutableFileAtPath:dpkgDebBin]);
+
+        BOOL rootdUp = akun_dpkgd_up();
+        NSString *helperBin = jbroot.length ? [jbroot stringByAppendingPathComponent:@"usr/bin/akund"]
+                                           : @"/usr/bin/akund";
+        BOOL helperSetuid = akun_binary_has_setuid(helperBin);
+        info[@"rootd_socket"] = rootdUp ? @"up" : @"unreachable";
+        info[@"helper_setuid"] = @(helperSetuid);
+        NSString *form = (rootdUp || getuid() == 0) ? @"deb" : (jbWritable ? @"roothide" : @"tipa");
+        info[@"form"] = form;
+        info[@"can_install_deb"] = @(rootdUp || getuid() == 0 || helperSetuid || jbWritable);
+
+        info[@"can_write_tmp"] = @(akun_probe_writable(@"/tmp/.akun-write-probe"));
+        info[@"can_write_var_mobile"] = @(akun_probe_writable(@"/var/mobile/.akun-write-probe"));
+        info[@"tweak_version"] = @"1.0.0";
+
+        NSDictionary *sv = [NSDictionary dictionaryWithContentsOfFile:@"/System/Library/CoreServices/SystemVersion.plist"];
+        NSString *ver = [sv[@"ProductVersion"] isKindOfClass:[NSString class]] ? sv[@"ProductVersion"] : nil;
+        NSString *bld = [sv[@"ProductBuildVersion"] isKindOfClass:[NSString class]] ? sv[@"ProductBuildVersion"] : nil;
+        if (!ver.length) {
+            ver = [[UIDevice currentDevice] systemVersion];
+            bld = akun_mg_string(@"BuildVersion");
+        }
+        if (ver.length) info[@"system_version"] = ver;
+        if (bld.length) info[@"build"] = bld;
+
+        NSString *deviceName = akun_mg_string(@"UserAssignedDeviceName");
+        NSString *deviceNameSource = @"mobilegestalt";
+        if (!deviceName.length) {
+            deviceName = akun_mg_string(@"DeviceName");
+            deviceNameSource = @"mobilegestalt_default";
+        }
+        if (!deviceName.length) {
+            deviceName = [[UIDevice currentDevice] name];
+            deviceNameSource = @"uidevice";
+        }
+        if (deviceName.length) {
+            info[@"device_name"] = deviceName;
+            info[@"device_name_source"] = deviceNameSource;
+        }
+
+        NSString *productType = akun_mg_string(@"ProductType");
+        if (productType.length) info[@"product_type"] = productType;
+
+        NSString *udid = akun_mg_string(@"UniqueDeviceID");
+        if (udid.length) {
+            info[@"udid"] = udid;
+            info[@"udid_source"] = @"mobilegestalt";
+        } else {
+            NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+            if (idfv.length) {
+                info[@"idfv"] = idfv;
+                info[@"udid_source"] = @"idfv";
+            } else {
+                info[@"udid_source"] = @"none";
+            }
+        }
+
+        NSString *serial = akun_mg_string(@"SerialNumber");
+        if (serial.length) info[@"serial"] = serial;
+
+        NSDictionary *env = [[NSProcessInfo processInfo] environment];
+        NSString *bundle = env[@"__CFBundleIdentifier"];
+        if (bundle) info[@"bundle"] = bundle;
+
+        return info;
     }
     if ([a isEqualToString:@"go_home"]) {
         [gen menuPress];
@@ -616,6 +1017,40 @@ static NSDictionary *akunPostNotifications(id rawNames) {
     }
     if ([a isEqualToString:@"assistive_touch_on"]) { return akunApplyAssistiveTouch(YES); }
     if ([a isEqualToString:@"assistive_touch_off"]) { return akunApplyAssistiveTouch(NO); }
+    if ([a isEqualToString:@"ui_probe"]) {
+        // 调试用：iOS 16.7.16 上辅助触控的球是 LaunchAngel
+        // com.apple.AccessibilityUIServer 画的，launchctl kickstart 不支持 LaunchAngel（102）。
+        // 这里直接以 mobile 身份 spawn 它，看能不能跑起来并把球画出来。
+        NSMutableArray *cand = [NSMutableArray array];
+        NSArray *paths = @[ @"/System/Library/CoreServices/AccessibilityUIServer.app/AccessibilityUIServer",
+                            @"/rootfs/System/Library/CoreServices/AccessibilityUIServer.app/AccessibilityUIServer" ];
+        pid_t pid = -1;
+        int spawnRc = -1;
+        NSString *used = @"";
+        for (NSString *pth in paths) {
+            if (![[NSFileManager defaultManager] fileExistsAtPath:pth]) { continue; }
+            used = pth;
+            char *cp = strdup(pth.UTF8String);
+            char a1[] = "-NSDocumentRevisionsDebugMode";
+            char a2[] = "YES";
+            char *argv[] = { cp, a1, a2, NULL };
+            posix_spawnattr_t at; posix_spawnattr_init(&at);
+            posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+            posix_spawnattr_setpgroup(&at, 0);
+            spawnRc = posix_spawn(&pid, cp, NULL, &at, argv, environ);
+            posix_spawnattr_destroy(&at);
+            break;
+        }
+        BOOL alive = NO;
+        if (spawnRc == 0 && pid > 0) {
+            usleep(1500 * 1000);
+            alive = (kill(pid, 0) == 0);
+        }
+        [cand addObject:@{ @"path" : used.length ? used : @"(none)",
+                           @"spawnRc" : @(spawnRc), @"pid" : @(pid), @"alive" : @(alive) }];
+        NSLog(@"[aux] ui_probe %@ spawn=%d pid=%d alive=%d", used, spawnRc, (int)pid, alive);
+        return @{ @"success" : @(alive), @"cand" : cand };
+    }
     if ([a isEqualToString:@"get_assistive_touch"]) { return akunGetAssistiveTouch(); }
     if ([a isEqualToString:@"ax_notify"]) { return akunPostNotifications(cmd[@"names"]); }
     if ([a isEqualToString:@"respring"]) {
@@ -630,13 +1065,24 @@ static NSDictionary *akunPostNotifications(id rawNames) {
                   @"note" : @"SpringBoard 重启：画面黑一瞬后自己恢复，App 全部退出，重开是冷启动" };
     }
     if ([a isEqualToString:@"get_clipboard"]) {
-        NSString *s = [UIPasteboard generalPasteboard].string ?: @"";
-        return @{ @"success" : @YES, @"text" : s };
+        // AKUN 返回 text / changeCount / types；text 不是纯字符串时回 NSNull + note
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        NSString *s = nil;
+        @try { s = pb.string; } @catch (__unused NSException *e) { s = nil; }
+        NSInteger cc = pb.changeCount;
+        NSArray *types = pb.pasteboardTypes ?: @[];
+        if (![s isKindOfClass:[NSString class]]) {
+            return @{ @"success" : @YES, @"text" : [NSNull null], @"changeCount" : @(cc),
+                      @"types" : types, @"note" : @"no plain string on pasteboard" };
+        }
+        return @{ @"success" : @YES, @"text" : (s ?: @""), @"changeCount" : @(cc), @"types" : types };
     }
     if ([a isEqualToString:@"set_clipboard"]) {
         NSString *s = cmd[@"text"] ?: @"";
+        if (!s.length) { return @{ @"success" : @NO, @"error" : @"missing text" }; }
         [UIPasteboard generalPasteboard].string = s;
-        return @{ @"success" : @YES };
+        NSInteger cc = [UIPasteboard generalPasteboard].changeCount;
+        return @{ @"success" : @YES, @"changeCount" : @(cc), @"length" : @(s.length) };
     }
     if ([a isEqualToString:@"input_text"]) {
         NSString *s = cmd[@"text"] ?: @"";
@@ -658,14 +1104,24 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         [a isEqualToString:@"volume_up"] || [a isEqualToString:@"volume_down"] ||
         [a isEqualToString:@"toggle_mute"] || [a isEqualToString:@"brightness_up"] ||
         [a isEqualToString:@"brightness_down"]) {
-        if ([a isEqualToString:@"volume_up"]) { [gen volumeIncrementPress]; return @{ @"success" : @YES }; }
-        if ([a isEqualToString:@"volume_down"]) { [gen volumeDecrementPress]; return @{ @"success" : @YES }; }
+        if ([a isEqualToString:@"volume_up"]) {
+            // 与 AKUN 一致：HID 系统音量键（系统自己出 HUD、自己改音量）
+            [gen volumeIncrementPress];
+            usleep(200000);
+            return @{ @"success" : @YES, @"via" : @"HID volumeIncrementPress", @"volume" : @(akun_get_volume()) };
+        }
+        if ([a isEqualToString:@"volume_down"]) {
+            [gen volumeDecrementPress];
+            usleep(200000);
+            return @{ @"success" : @YES, @"via" : @"HID volumeDecrementPress", @"volume" : @(akun_get_volume()) };
+        }
         if ([a isEqualToString:@"brightness_up"] || [a isEqualToString:@"brightness_down"]) {
-            CGFloat cur = [UIScreen mainScreen].brightness;
-            CGFloat next = [a isEqualToString:@"brightness_up"] ? cur + 0.1 : cur - 0.1;
-            next = MAX(0.05, MIN(1.0, next));
-            [UIScreen mainScreen].brightness = next;
-            return @{ @"success" : @YES, @"brightness" : @(next) };
+            // 与 AKUN 一致：HID 系统亮度键，不做「读值 +0.1 再 setProperty」那套近似
+            if ([a isEqualToString:@"brightness_up"]) { [gen displayBrightnessIncrementPress]; }
+            else { [gen displayBrightnessDecrementPress]; }
+            usleep(250000);
+            return @{ @"success" : @YES, @"via" : @"HID brightnessPress",
+                      @"brightness" : @((double)akun_get_brightness()) };
         }
         if ([a isEqualToString:@"set_volume"] || [a isEqualToString:@"toggle_mute"]) {
             float v = [cmd[@"value"] floatValue];
@@ -676,31 +1132,84 @@ static NSDictionary *akunPostNotifications(id rawNames) {
             if (shared && [shared respondsToSelector:s]) {
                 BOOL (*fn)(id, SEL, float, id) = (BOOL (*)(id, SEL, float, id))objc_msgSend;
                 fn(shared, s, v, @"Audio/Video");
-                return @{ @"success" : @YES, @"volume" : @(v) };
+                usleep(250000);
+                CGFloat rb = akun_get_volume();
+                return @{ @"success" : @YES, @"volume" : @(v), @"readback" : @((double)rb),
+                          @"applied" : @(fabsf((float)rb - v) < 0.06f) };
             }
             return @{ @"success" : @NO, @"error" : @"AVSystemController 不可用" };
         }
-        CGFloat b = [cmd[@"value"] floatValue];
-        [UIScreen mainScreen].brightness = MAX(0.05, MIN(1.0, b));
-        return @{ @"success" : @YES, @"brightness" : @([UIScreen mainScreen].brightness) };
+        CGFloat b = MAX(0.0, MIN(1.0, [cmd[@"value"] floatValue]));
+        BOOL ok = akun_set_brightness(b);
+        usleep(250000);
+        CGFloat rb = akun_get_brightness();
+        return @{ @"success" : @(ok), @"brightness" : @((double)b), @"readback" : @((double)rb),
+                  @"applied" : @(fabs(rb - b) < 0.06),
+                  @"via" : (ok ? @"BrightnessSystemClient" : @"UIScreen") };
     }
     if ([a isEqualToString:@"list_apps"] || [a isEqualToString:@"find_app"]) {
+        // 1:1 对齐 AKUN TVNCAppListMatching：
+        //   LS 的 allApplications 与 allInstalledApplications 都查（两个集合不完全相同）
+        //   + 扫三个目录补漏 + 本地化名（InfoPlist.strings）+ type 只看 bundle 前缀 + 每项带 pid
         id ws = akun_appWorkspace();
-        if (!ws) { return @{ @"success" : @NO, @"error" : @"LSApplicationWorkspace 不可用" }; }
-        NSArray *apps = akun_msg0(ws, @"allInstalledApplications") ?: @[];
-        NSString *q = cmd[@"name"];
-        NSMutableArray *out = [NSMutableArray array];
-        for (id app in apps) {
-            NSString *bid = akun_msg0(app, @"applicationIdentifier");
-            NSString *nm = akun_msg0(app, @"localizedName");
-            if (!bid.length && !nm.length) { continue; }
-            if (q.length) {
-                BOOL hit = ([nm rangeOfString:q].location != NSNotFound) ||
-                           ([bid rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound);
-                if (!hit) { continue; }
+        NSMutableDictionary *map = [NSMutableDictionary dictionary];
+        if (ws) {
+            for (NSString *selName in @[ @"allApplications", @"allInstalledApplications" ]) {
+                SEL sel = NSSelectorFromString(selName);
+                if (![ws respondsToSelector:sel]) continue;
+                NSArray *proxies = ((id (*)(id, SEL))objc_msgSend)(ws, sel);
+                if (![proxies isKindOfClass:[NSArray class]]) continue;
+                for (id proxy in proxies) {
+                    NSString *bid = akun_msg0(proxy, @"applicationIdentifier");
+                    NSString *nm = akun_msg0(proxy, @"localizedName");
+                    if (!bid.length) continue;
+                    if (!nm.length) nm = bid;
+                    if (map[bid]) continue;
+                    map[bid] = [NSMutableDictionary dictionaryWithObjectsAndKeys:
+                                bid, @"bundle", nm, @"name", nil];
+                }
             }
-            [out addObject:@{ @"bundle" : bid ?: @"", @"name" : nm ?: @"" }];
-            if (out.count >= 400) { break; }
+        }
+        akun_scan_app_bundles(@"/var/containers/Bundle/Application", map);
+        akun_scan_app_bundles(@"/Applications", map);
+        akun_scan_app_bundles(@"/rootfs/Applications", map);
+        if (!map.count) { return @{ @"success" : @NO, @"error" : @"没有枚举到任何 App" }; }
+
+        NSString *q = [cmd[@"name"] isKindOfClass:[NSString class]] ? [cmd[@"name"] lowercaseString] : nil;
+        if ([a isEqualToString:@"find_app"] && !q.length) { return @{ @"success" : @NO, @"error" : @"missing name" }; }
+
+        NSDictionary *procs = akun_proc_map();
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSString *bid in [[map allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) {
+            NSMutableDictionary *item = [map[bid] mutableCopy];
+            NSString *appPath = item[@"path"];
+            [item removeObjectForKey:@"path"];
+            // type 只按 bundle 前缀判定：LA 的 applicationType 会把 Filza/TrollStore 这些误报成 System
+            item[@"type"] = [bid hasPrefix:@"com.apple."] ? @"System" : @"User";
+            // 非苹果 App 读本地化真名，真实名进 name、原名留 alias（find_app 两个都能搜到）
+            if (![bid hasPrefix:@"com.apple."] && appPath.length) {
+                NSString *loc = akun_app_localized_name(appPath, item[@"name"]);
+                if (loc.length && ![loc isEqualToString:item[@"name"]]) {
+                    item[@"alias"] = item[@"name"];
+                    item[@"name"] = loc;
+                }
+            }
+            if (q.length) {
+                NSString *nmLow = [(NSString *)item[@"name"] lowercaseString];
+                NSString *alLow = [(NSString *)item[@"alias"] lowercaseString];
+                BOOL hit = (nmLow.length && [nmLow rangeOfString:q].location != NSNotFound) ||
+                           (alLow.length && [alLow rangeOfString:q].location != NSNotFound) ||
+                           ([bid.lowercaseString rangeOfString:q].location != NSNotFound);
+                if (!hit) continue;
+            }
+            NSString *ex = akun_bundle_exec(bid);
+            NSNumber *pid = ex.length ? procs[ex] : nil;
+            if (!pid && ex.length > 16) {
+                NSString *pfx = [ex substringToIndex:16];
+                for (NSString *k in procs) { if ([k hasPrefix:pfx]) { pid = procs[k]; break; } }
+            }
+            item[@"pid"] = @(pid ? pid.intValue : 0);
+            [out addObject:item];
         }
         return @{ @"success" : @YES, @"apps" : out, @"count" : @(out.count) };
     }
@@ -709,6 +1218,11 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         NSString *bid = cmd[@"bundle"] ?: cmd[@"name"];
         if (!ws || !bid.length) { return @{ @"success" : @NO, @"error" : @"缺 bundle 或工作区不可用" }; }
         BOOL ok = akun_bool1(ws, @"openApplicationWithBundleID:", bid);
+        if (!ok && [ws respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:options:")]) {
+            SEL s2 = NSSelectorFromString(@"openApplicationWithBundleID:options:");
+            BOOL (*fn)(id, SEL, id, id) = (BOOL (*)(id, SEL, id, id))objc_msgSend;
+            ok = fn(ws, s2, bid, @{});
+        }
         return @{ @"success" : @(ok), @"bundle" : bid };
     }
     if ([a isEqualToString:@"open_url"]) {
@@ -717,60 +1231,44 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         NSURL *url = [NSURL URLWithString:u];
         if (!ws || !url) { return @{ @"success" : @NO, @"error" : @"缺 url 或工作区不可用" }; }
         BOOL ok = NO;
-        if ([ws respondsToSelector:NSSelectorFromString(@"openSensitiveURL:withOptions:")]) {
+        if ([ws respondsToSelector:NSSelectorFromString(@"openURL:")]) {
+            ok = akun_bool1(ws, @"openURL:", url);
+        }
+        if (!ok && [ws respondsToSelector:NSSelectorFromString(@"openSensitiveURL:withOptions:")]) {
             SEL s = NSSelectorFromString(@"openSensitiveURL:withOptions:");
             BOOL (*fn)(id, SEL, id, id) = (BOOL (*)(id, SEL, id, id))objc_msgSend;
             ok = fn(ws, s, url, @{});
-        } else {
-            ok = akun_bool1(ws, @"openURL:", url);
         }
-        return @{ @"success" : @(ok), @"url" : u };
+        return @{ @"success" : @(ok), @"url" : u, @"via" : (ok ? @"LSApplicationWorkspace" : @"none") };
     }
     if ([a isEqualToString:@"kill_app"]) {
         NSString *bid = cmd[@"bundle"] ?: @"";
         if (!bid.length) { return @{ @"success" : @NO, @"error" : @"缺 bundle" }; }
-        // iOS 16 上 SpringBoard 的 terminateApplicationForBundleIdentifier: 已不认（实测回 NO），
-        // 改走 FrontBoardServices 的 FBSSystemService：先拿 pid，再 terminateApplication:forReason:andContext:
-        int pid = -1;
-        id svc = nil;
-        @try {
-            void *h = dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
-            if (h) {
-                Class C = NSClassFromString(@"FBSSystemService");
-                if (C) { svc = [C performSelector:@selector(sharedService)]; }
+        // AKUN 手法：不用 FBSSystemService（mobile 身份下 XPC 会无限等待卡死线程），
+        // 直接按可执行名找 pid，SIGTERM → 0.5s 验 ESRCH → 不成再 SIGKILL → 0.2s 验
+        NSString *ex = akun_bundle_exec(bid);
+        if (!ex.length) { return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"拿不到 %@ 的可执行名", bid] }; }
+        int pid = akun_pid_for_exec(ex);
+        if (pid <= 0) { return @{ @"success" : @NO, @"error" : @"process not running (no pid)" }; }
+        errno = 0;
+        if (kill(pid, SIGTERM) == 0) {
+            usleep(500000);
+            errno = 0;
+            if (kill(pid, 0) != 0 && errno == ESRCH) {
+                NSLog(@"[aux] kill_app %@ -> SIGTERM(%d)", bid, pid);
+                return @{ @"success" : @YES, @"bundle" : bid, @"via" : @"SIGTERM", @"pid" : @(pid) };
             }
-        } @catch (NSException *e) { svc = nil; }
-        if (svc && [svc respondsToSelector:@selector(pidForApplication:)]) {
-            NSMethodSignature *sig = [svc methodSignatureForSelector:@selector(pidForApplication:)];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            [inv setTarget:svc];
-            [inv setSelector:@selector(pidForApplication:)];
-            [inv setArgument:&bid atIndex:2];
-            [inv invoke];
-            [inv getReturnValue:&pid];
         }
-        BOOL ok = (pid > 0);
-        if (ok && [svc respondsToSelector:@selector(terminateApplication:forReason:andContext:)]) {
-            @try {
-                SEL s = NSSelectorFromString(@"terminateApplication:forReason:andContext:");
-                NSMethodSignature *sig2 = [svc methodSignatureForSelector:s];
-                NSInvocation *inv2 = [NSInvocation invocationWithMethodSignature:sig2];
-                [inv2 setTarget:svc];
-                [inv2 setSelector:s];
-                int reason = 1;                 // FBSApplicationTerminationReasonUserTerminated
-                id ctx = nil;
-                [inv2 setArgument:&pid atIndex:2];
-                [inv2 setArgument:&reason atIndex:3];
-                [inv2 setArgument:&ctx atIndex:4];
-                [inv2 invoke];
-            } @catch (NSException *e) { ok = NO; }
-        } else if (!ok) {
-            // 兜底：SpringBoard 老选择器
-            id ws = akun_appWorkspace();
-            ok = akun_bool1(ws, @"terminateApplicationForBundleIdentifier:", bid);
+        errno = 0;
+        if (kill(pid, SIGKILL) == 0) {
+            usleep(200000);
+            errno = 0;
+            if (kill(pid, 0) != 0 && errno == ESRCH) {
+                NSLog(@"[aux] kill_app %@ -> SIGKILL(%d)", bid, pid);
+                return @{ @"success" : @YES, @"bundle" : bid, @"via" : @"SIGKILL", @"pid" : @(pid) };
+            }
         }
-        NSLog(@"[aux] kill_app %@ pid=%d -> %d", bid, pid, ok);
-        return @{ @"success" : @(ok), @"bundle" : bid, @"pid" : @(pid) };
+        return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"kill(%d) failed, errno=%d", pid, errno] };
     }
     if ([a isEqualToString:@"probe_path"]) {
         // 调试用：daemon 视角下某路径是否存在/可读，不存在就逐级回退列出父目录状态。
@@ -874,9 +1372,19 @@ static NSDictionary *akunPostNotifications(id rawNames) {
     }
     if ([a isEqualToString:@"delete_file"]) {
         NSString *p = cmd[@"path"] ?: @"";
-        if (![p hasPrefix:@"/"]) { return @{ @"success" : @NO, @"error" : @"需要绝对路径" }; }
-        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
-        return @{ @"success" : @(ok), @"deleted" : @(ok) };
+        if (![p isKindOfClass:[NSString class]] || p.length == 0) {
+            return @{ @"success" : @NO, @"error" : @"missing path" };
+        }
+        if (!akun_pkg_path_allowed(p)) {
+            return @{ @"success" : @NO, @"error" : @"path not allowed (only .deb/.tipa/.ipa under /tmp/ or /var/mobile/)" };
+        }
+        if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            return @{ @"success" : @YES, @"path" : p, @"deleted" : @NO, @"note" : @"file not exists" };
+        }
+        if (!akun_delete_pkg_file(p)) {
+            return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"delete failed: %@", p] };
+        }
+        return @{ @"success" : @YES, @"path" : p, @"deleted" : @YES };
     }
     if ([a isEqualToString:@"key"]) {
         // 键盘通道：和 AKUN 一样走 HID 键盘事件。三种入参都能用：
@@ -922,6 +1430,9 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         if (![path isKindOfClass:[NSString class]] || path.length == 0) {
             return @{ @"success" : @NO, @"error" : @"missing path" };
         }
+        if (!akun_pkg_path_allowed(path)) {
+            return @{ @"success" : @NO, @"error" : @"path must be an absolute .deb/.tipa/.ipa under /tmp/ or /var/mobile/" };
+        }
         NSString *b64 = cmd[@"data"];
         NSData *chunk = b64.length ? [[NSData alloc] initWithBase64EncodedString:b64 options:0] : nil;
         if (!chunk.length) {
@@ -951,7 +1462,9 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         unsigned long long want = [cmd[@"size"] unsignedLongLongValue];
         BOOL complete = (want > 0) ? (total >= want) : YES;
         NSLog(@"[aux] upload_file %@ 收到 %llu/%llu", path.lastPathComponent, total, want);
-        return @{ @"success" : @YES, @"path" : path, @"bytes" : @(total), @"complete" : @(complete) };
+        char rp[PATH_MAX]; NSString *real = @"";
+        if (realpath(path.fileSystemRepresentation, rp)) real = [NSString stringWithUTF8String:rp];
+        return @{ @"success" : @YES, @"path" : path, @"real" : real, @"bytes" : @(total), @"complete" : @(complete) };
     }
     if ([a isEqualToString:@"install_deb"]) {
         NSString *path = cmd[@"path"];
@@ -968,6 +1481,15 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         NSData *local = [NSData dataWithContentsOfFile:path];
         if (!local.length) {
             return @{ @"success" : @NO, @"error" : @"daemon 读不到该文件", @"path" : path };
+        }
+        if (cmd[@"size"]) {
+            unsigned long long want = [cmd[@"size"] unsignedLongLongValue];
+            if (want && want != (unsigned long long)local.length) {
+                return @{ @"success" : @NO,
+                          @"error" : [NSString stringWithFormat:@"size mismatch: expected %llu, got %lu（包可能没传完）",
+                                      want, (unsigned long)local.length],
+                          @"path" : path };
+            }
         }
         NSString *dest = @"@jb/var/mobile/Documents/akun_install.deb";
         const NSUInteger chunk = 8192;
@@ -989,8 +1511,27 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         if (!raw.length) { return @{ @"success" : @NO, @"error" : @"dpkgd 未响应（19949 不通）", @"path" : path }; }
         NSString *shortOut = (out.length > 400) ? [out substringToIndex:400] : (out ?: @"");
         NSLog(@"[aux] install_deb rc=%d out=%@", rc, shortOut);
-        return @{ @"success" : @(rc == 0), @"code" : @(rc),
-                  @"output" : (out ?: @""), @"path" : path, @"source" : @"root-dpkgd" };
+        NSMutableDictionary *res = [@{ @"success" : @(rc == 0), @"code" : @(rc),
+                                       @"output" : (out ?: @""), @"path" : path,
+                                       @"bytes" : @(local.length), @"via" : @"root-dpkgd",
+                                       @"form" : @"deb" } mutableCopy];
+        if (rc == 0) {
+            // AKUN 装完会 SIGTERM SpringBoard 让新插件/新 deb 立即生效（respring:false 可关）
+            BOOL wantRespring = (cmd[@"respring"] ? [cmd[@"respring"] boolValue] : YES);
+            if (wantRespring) {
+                int sbrc = -1; NSString *sbo = nil;
+                akun_root_cmd(@"KILLSB", &sbrc, &sbo);
+                res[@"respring"] = @(sbrc == 0);
+                res[@"respring_detail"] = (sbo ?: @"");
+            }
+            // 装完清掉设备上的包，避免换名后越堆越多（keep_file:true 可留）
+            BOOL keepFile = (cmd[@"keep_file"] ? [cmd[@"keep_file"] boolValue] : NO);
+            if (!keepFile) {
+                int drc = -1; NSString *dro = nil;
+                akun_root_cmd([NSString stringWithFormat:@"DELE %@", dest], &drc, &dro);
+            }
+        }
+        return res;
     }
     if ([a isEqualToString:@"uninstall_deb"]) {
         NSString *pkg = cmd[@"package"];
@@ -1043,21 +1584,35 @@ static NSDictionary *akunPostNotifications(id rawNames) {
                   @"note" : @"tipa 走 /Applications 解包 + uicache；未签名应用需设备本身允许（TrollStore/已签名）" };
     }
     if ([a isEqualToString:@"screenshot"]) {
-        // 与 AKUN 19940 对齐：{"action":"screenshot","quality":75}，回 base64 图片
-        double q = 0.6;
+        // 1:1 对齐 AKUN TVNCScreenshot：quality 是 0~100（默认 75），format = jpeg（默认）/ png，
+        // 默认出原分辨率（scale=1）——中控拿到的像素要和 AKUN 一致，否则坐标/图色比对会错。
+        double q = 75.0;
         if (cmd[@"quality"]) {
             q = [cmd[@"quality"] doubleValue];
-            if (q > 1.0) { q = q / 100.0; }   // AKUN 传 0~100，这里也认 0~1
+            if (q <= 1.0) { q = q * 100.0; }     // 兼容老客户端的 0~1 传法
         }
-        double sc = 0.5;
+        q = MAX(10.0, MIN(100.0, q));
+        double sc = 1.0;
         if (cmd[@"scale"]) { sc = [cmd[@"scale"] doubleValue]; }
+        BOOL asPNG = NO;
+        NSString *fmt = cmd[@"format"];
+        if ([fmt isKindOfClass:[NSString class]]) {
+            NSString *lower = [fmt lowercaseString];
+            if ([lower isEqualToString:@"png"] || [lower isEqualToString:@"lossless"]) asPNG = YES;
+        }
         AkunCapture *cap = self.capture;
         if (!cap) { return @{ @"success" : @NO, @"error" : @"screenshot: 采集未就绪" }; }
-        NSData *jpeg = [cap snapshotJPEGWithScale:sc quality:q];
-        if (!jpeg) { return @{ @"success" : @NO, @"error" : @"screenshot: 渲染失败" }; }
-        NSString *b64 = [jpeg base64EncodedStringWithOptions:0];
-        return @{ @"success" : @YES, @"format" : @"jpeg", @"data" : b64,
-                  @"bytes" : @(jpeg.length), @"scale" : @(sc) };
+        NSData *enc = [cap snapshotDataWithScale:sc quality:(q / 100.0) asPNG:asPNG];
+        if (!enc) { return @{ @"success" : @NO, @"error" : @"screenshot: 渲染失败" }; }
+        double pw = (double)cap.screenWidth * sc, ph = (double)cap.screenHeight * sc;
+        return @{ @"success" : @YES,
+                  @"format" : (asPNG ? @"png" : @"jpeg"),
+                  @"data" : [enc base64EncodedStringWithOptions:0],
+                  @"width" : @((int)pw),
+                  @"height" : @((int)ph),
+                  @"bytes" : @(enc.length),
+                  @"quality" : @(q),
+                  @"scale" : @(sc) };
     }
     return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"unhandled action: %@", a] };
 }
