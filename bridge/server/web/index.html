@@ -18,8 +18,10 @@
   .stage { display: flex; justify-content: center; align-items: flex-start; padding: 18px; }
   .screen { position: relative; background: #000; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 40px rgba(0,0,0,.6); max-width: 100%; }
   video { display: block; width: 100%; height: auto; }
+  /* 直绘通道：WebCodecs 解出来的帧直接画在 canvas 上，不进 <video> 的抖动缓冲 */
+  #rawCanvas { display: none; width: auto; height: auto; max-width: 100%; max-height: calc(100vh - 130px); }
   .stage.is-idle .screen { width: 360px; height: 640px; display: grid; place-items: center; }
-  .stage.is-idle video { display: none; }
+  .stage.is-idle video, .stage.is-idle #rawCanvas { display: none; }
   /* 画面到齐后把"未连接"这句话彻底拿掉，否则它会在视频下面多占一行，看着像画面没铺满 */
   .stage:not(.is-idle) .hint { display: none; }
   .hint { color: #6e7681; font-size: 12px; }
@@ -181,6 +183,7 @@
 <div class="stage is-idle" id="stage">
   <div class="screen" id="screen">
     <video id="video" autoplay playsinline muted></video>
+    <canvas id="rawCanvas"></canvas>
     <span class="hint">未连接</span>
   </div>
 </div>
@@ -204,6 +207,265 @@
   function setDot(el, on) { el.classList.toggle('on', !!on); }
 
   function log() { console.log('[bridge]', ...arguments); }
+
+  /* ================= 直绘通道：H.264 over WebSocket（真点对点） =================
+     为什么要这条：WebRTC 的媒体是 UDP，公网下必须有一方能被对方打进来；这条
+     宽带上浏览器的 ICE 打不进来，只能退回服务器中继（每多看一路就多一份带宽）。
+     WebSocket 是 TCP，天生能钻进 frp xtcp 已经打通的洞 —— 媒体也变成点对点，
+     服务器一个字节都不转。代价是 TCP 队头阻塞，弱网偶发停顿。 */
+  const RAW = {
+    ws: null, dec: null, cv: null, cx: null, room: '',
+    au: [], auTs: -1, auIdr: false, fuParts: null,
+    sps: null, pps: null, codec: '', cfgd: false,
+    seq: -1, drop: 0, got: 0, w: 0, h: 0,
+    tsOut: 0, fpsT: 0, fpsN: 0, fps: 0,
+    decSum: 0, decN: 0, decMs: 0,
+    timer: null, keyTimer: null, lastFrame: 0, txBytes: 0,
+  };
+
+  function rawUseCodec(fmtp) {
+    const m = /profile-level-id=([0-9a-fA-F]{6})/.exec(fmtp || '');
+    const codec = m ? ('avc1.' + m[1].toUpperCase()) : 'avc1.42E034';
+    if (RAW.dec && RAW.cfgd && RAW.codec === codec) return;
+    if (RAW.dec) { try { RAW.dec.close(); } catch (e) {} }
+    RAW.codec = codec;
+    RAW.sps = null; RAW.pps = null; RAW.cfgd = false;
+    RAW.dec = new VideoDecoder({
+      output: rawOnFrame,
+      error: (e) => { log('raw decoder error', e.message); RAW.cfgd = false; },
+    });
+    RAW.dec.configure({ codec: codec, optimizeForLatency: true, avc: { format: 'annexb' } });
+    RAW.cfgd = true;
+    log('直绘 codec', codec);
+  }
+
+  function rawOnFrame(frame) {
+    const w = frame.displayWidth || frame.codedWidth;
+    const h = frame.displayHeight || frame.codedHeight;
+    if (RAW.cv.width !== w || RAW.cv.height !== h) {
+      RAW.cv.width = w; RAW.cv.height = h;
+      RAW.w = w; RAW.h = h;
+    }
+    try { RAW.cx.drawImage(frame, 0, 0, w, h); } catch (e) {}
+    frame.close();
+    RAW.got++;
+    RAW.fpsN++;
+    RAW.lastFrame = performance.now();
+    if (RAW.cv.style.display !== 'block') {
+      RAW.cv.style.display = 'block';
+      video.style.display = 'none';
+      stage.classList.remove('is-idle');
+      setDot($('videoDot'), true);
+    }
+  }
+
+  function rawAddNALU(nalu) {
+    const t = nalu[0] & 0x1f;
+    if (t === 7) { RAW.sps = nalu.slice(); return; }
+    if (t === 8) { RAW.pps = nalu.slice(); return; }
+    if (t === 5) RAW.auIdr = true;
+    RAW.au.push(nalu);
+  }
+
+  function rawFlushAU() {
+    const au = RAW.au;
+    RAW.au = [];
+    if (!au.length || !RAW.cfgd || !RAW.dec) return;
+    const parts = [];
+    // IDR 前面补 SPS/PPS：编码器不是每帧都带参数集，缺了 WebCodecs 会直接拒解
+    if (RAW.auIdr && RAW.sps && RAW.pps) { parts.push(RAW.sps, RAW.pps); }
+    for (let i = 0; i < au.length; i++) parts.push(au[i]);
+    let total = 0;
+    for (let i = 0; i < parts.length; i++) total += 4 + parts[i].length;
+    const buf = new Uint8Array(total);
+    let o = 0;
+    for (let i = 0; i < parts.length; i++) {
+      buf[o] = 0; buf[o + 1] = 0; buf[o + 2] = 0; buf[o + 3] = 1; o += 4;
+      buf.set(parts[i], o); o += parts[i].length;
+    }
+    const tsUs = Math.round(RAW.auTs * 100 / 9);   // 90kHz → µs
+    RAW.tsOut = tsUs > RAW.tsOut ? tsUs : RAW.tsOut + 1000;
+    const t0 = performance.now();
+    try {
+      RAW.dec.decode(new EncodedVideoChunk({
+        type: RAW.auIdr ? 'key' : 'delta',
+        timestamp: RAW.tsOut,
+        data: buf,
+      }));
+      RAW.decSum += performance.now() - t0; RAW.decN++;
+      if (RAW.decN >= 30) { RAW.decMs = RAW.decSum / RAW.decN; RAW.decSum = 0; RAW.decN = 0; }
+    } catch (e) {
+      RAW.drop++;
+      rawAskKey();
+    }
+    RAW.auIdr = false;
+  }
+
+  function rawAskKey() {
+    if (RAW.ws && RAW.ws.readyState === 1) {
+      try { RAW.ws.send(JSON.stringify({ t: 'keyframe' })); } catch (e) {}
+    }
+  }
+
+  function rawOnBinary(buf) {
+    const u8 = new Uint8Array(buf);
+    RAW.txBytes += u8.length;
+    RAW.rateBytes = (RAW.rateBytes || 0) + u8.length;
+    if (u8.length < 13 || (u8[0] >> 6) !== 2) return;
+    const cc = u8[0] & 0x0f;
+    const hasExt = (u8[0] & 0x10) !== 0;
+    let off = 12 + cc * 4;
+    if (hasExt) {
+      if (u8.length < off + 4) return;
+      off += 4 + (((u8[off + 2] << 8) | u8[off + 3]) * 4);
+    }
+    if (off >= u8.length) return;
+    const marker = (u8[1] & 0x80) !== 0;
+    const seq = (u8[2] << 8) | u8[3];
+    const ts = ((u8[4] << 24) | (u8[5] << 16) | (u8[6] << 8) | u8[7]) >>> 0;
+    // 丢包就放弃当前分片和整个访问单元：残帧解出来只会花屏，等关键帧更干净
+    if (RAW.seq >= 0) {
+      const d = (seq - RAW.seq + 65536) % 65536;
+      if (d > 1) { RAW.drop += d - 1; RAW.fuParts = null; RAW.au = []; }
+    }
+    RAW.seq = seq;
+    const p = u8.subarray(off);
+    if (ts !== RAW.auTs) {
+      if (RAW.au.length) rawFlushAU();
+      RAW.auTs = ts;
+      RAW.auIdr = false;
+    }
+    const t = p[0] & 0x1f;
+    if (t === 24) {                         // STAP-A：一包里塞多个 NALU
+      let i = 1;
+      while (i + 2 <= p.length) {
+        const sz = (p[i] << 8) | p[i + 1]; i += 2;
+        if (i + sz > p.length) break;
+        rawAddNALU(p.subarray(i, i + sz));
+        i += sz;
+      }
+    } else if (t === 28) {                  // FU-A：一个 NALU 被切成多包
+      if (p.length < 3) return;
+      const fu = p[1];
+      if (fu & 0x80) { RAW.fuParts = []; }
+      if (!RAW.fuParts) return;
+      RAW.fuParts.push(p.subarray(2));
+      if (fu & 0x40) {
+        const parts = RAW.fuParts; RAW.fuParts = null;
+        let len = 1;
+        for (let i = 0; i < parts.length; i++) len += parts[i].length;
+        const out = new Uint8Array(len);
+        out[0] = (p[0] & 0xe0) | (fu & 0x1f);
+        let o = 1;
+        for (let i = 0; i < parts.length; i++) { out.set(parts[i], o); o += parts[i].length; }
+        rawAddNALU(out);
+      }
+    } else if (t >= 1 && t <= 23) {          // 单包 NALU
+      rawAddNALU(p);
+    }
+    if (marker) rawFlushAU();
+  }
+
+  function rawHudTick() {
+    const now = performance.now();
+    if (!RAW.fpsT) RAW.fpsT = now;
+    const dt = (now - RAW.fpsT) / 1000;
+    if (dt >= 0.9) { RAW.fps = Math.round(RAW.fpsN / dt); RAW.fpsN = 0; RAW.fpsT = now; }
+    // 码率单独走 1 秒窗口：原来和 fps 共用分母、又每 500ms 清零，会把码率算成实际的一半
+    if (!RAW.rateLast) { RAW.rateLast = now; RAW.rateBytes = 0; }
+    const rdt = (now - RAW.rateLast) / 1000;
+    if (rdt >= 1.0) {
+      RAW.lastKbps = Math.round(RAW.rateBytes * 8 / 1000 / rdt);
+      RAW.rateBytes = 0;
+      RAW.rateLast = now;
+    }
+    const kbps = RAW.lastKbps || 0;
+    setV('hRes', RAW.w && RAW.h ? (RAW.w + 'x' + RAW.h) : '--');
+    setV('hFps', RAW.fps ? (RAW.fps + ' fps') : '--');
+    setV('hKbps', kbps ? (kbps + ' kbps') : '--');
+    setV('hJit', '0');
+    setV('hBuf', RAW.got ? '0 ms（TCP 直绘）' : '--', 'ok');
+    setV('hDec', RAW.decMs ? (RAW.decMs.toFixed(1) + ' ms/帧') : '--');
+    setV('hFreeze', RAW.drop + ' 丢 / 0 冻', RAW.drop > 30 ? 'warn' : '');
+    setV('hNack', '0 / 0');
+    setV('hRtt', '直连');
+  }
+
+  function startRawVideo(room) {
+    RAW.room = room;
+    RAW.stopped = false;
+    RAW.cv = $('rawCanvas');
+    RAW.cx = RAW.cv.getContext('2d', { alpha: false, desynchronized: true });
+    RAW.seq = -1; RAW.au = []; RAW.auTs = -1; RAW.auIdr = false; RAW.fuParts = null;
+    RAW.drop = 0; RAW.got = 0; RAW.tsOut = 0; RAW.fpsN = 0; RAW.fpsT = 0;
+    const url = WS_BASE + '/ws?room=rtp-' + encodeURIComponent(room) + '&role=raw'
+      + (AUTH_K ? '&k=' + encodeURIComponent(AUTH_K) : '');
+    RAW.ws = new WebSocket(url);
+    RAW.ws.binaryType = 'arraybuffer';
+    RAW.ws.onopen = () => {
+      log('直绘通道 open');
+      RAW.retry = 0;
+      setDot($('videoDot'), true);
+      rawAskKey();
+      clearInterval(RAW.keyTimer);
+      // 3 秒没新帧就再要一次关键帧（手机刚重连 / 关键帧被丢时全靠它）
+      RAW.keyTimer = setInterval(() => {
+        if (!RAW.got || performance.now() - RAW.lastFrame > 3000) rawAskKey();
+      }, 3000);
+      clearInterval(RAW.timer);
+      RAW.timer = setInterval(rawHudTick, 500);
+    };
+    RAW.ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          const m = JSON.parse(ev.data);
+          if (m && m.type === 'info') { log('直绘 info', m.fmtp); rawUseCodec(m.fmtp); }
+        } catch (e) {}
+        return;
+      }
+      rawOnBinary(ev.data);
+    };
+    RAW.ws.onclose = () => {
+      log('直绘通道 closed');
+      setDot($('videoDot'), false);
+      // 断了就自己接回来：xtcp 一断一合、服务端重启都会走这里
+      if (RAW.stopped || !RAW.room) return;
+      RAW.retry = (RAW.retry || 0) + 1;
+      const delay = Math.min(1000 * Math.pow(2, RAW.retry - 1), 5000);
+      clearTimeout(RAW.rTimer);
+      RAW.rTimer = setTimeout(() => {
+        if (!RAW.stopped && RAW.room) {
+          log('直绘通道重连 第' + RAW.retry + '次');
+          startRawVideo(RAW.room);
+        }
+      }, delay);
+    };
+    RAW.ws.onerror = () => log('直绘通道 error');
+  }
+
+  function stopRawVideo() {
+    RAW.stopped = true;
+    clearTimeout(RAW.rTimer);
+    clearInterval(RAW.timer); RAW.timer = null;
+    clearInterval(RAW.keyTimer); RAW.keyTimer = null;
+    if (RAW.dec) { try { RAW.dec.close(); } catch (e) {} RAW.dec = null; }
+    RAW.cfgd = false; RAW.sps = null; RAW.pps = null;
+    if (RAW.ws) { RAW.ws.onclose = null; try { RAW.ws.close(); } catch (e) {} RAW.ws = null; }
+    if (RAW.cv) { RAW.cv.style.display = 'none'; RAW.cv.width = 0; RAW.cv.height = 0; }
+    video.style.display = '';
+    RAW.got = 0; RAW.w = 0; RAW.h = 0;
+  }
+
+  // 默认就走直绘（WS/TCP，真点对点）；浏览器没有 WebCodecs 时才回落 WebRTC
+  function startVideoAuto(room) {
+    if (typeof VideoDecoder === 'function' && !/m=rtc/.test(location.search)) {
+      log('媒体走 WS 直绘（TCP 隧道，点对点）');
+      startRawVideo(room);
+    } else {
+      log('媒体走 WebRTC（此浏览器无 WebCodecs 或被强制指定）');
+      startVideo(room);
+    }
+  }
 
   /* ---------------- 视频：WebSocket 信令 + WebRTC ---------------- */
   function startVideo(room) {
@@ -323,9 +585,15 @@
   }
 
   function ICE_SERVERS() {
-    // 同局域网 / 同公网可用 host 直连；跨 NAT 需要自建 coturn，填在下面。
+    // 纯打洞：只用实测可用的 VoIP 类 STUN（Google/Cloudflare 那类在这条线上不可用）。
+    // 测于 2026-11-16：aebc / voipraider / epygi / voipcheap 四台均返回 EasyNAT。
     const turn = window.__TURN__ || null;
-    const list = [{ urls: 'stun:stun.l.google.com:19302' }];
+    const list = [
+      { urls: 'stun:stun.voip.aebc.com:3478' },
+      { urls: 'stun:stun.voipraider.com:3478' },
+      { urls: 'stun:stun.epygi.com:3478' },
+      { urls: 'stun:stun.voipcheap.com:3478' }
+    ];
     if (turn) {
       list.push({
         urls: turn.urls,
@@ -695,6 +963,79 @@
     const clear = document.getElementById('kbClear');
     if (clear) clear.onclick = () => { pad.value = ''; pad.focus(); };
   })();
+  /* 全局键盘直通：不点任何输入框，鼠标停在画面上直接敲键盘就发到手机。
+     规则（对齐 AKUN「可在画面上直接打字」）：
+       - 可编辑元素（#kbPad、房间号输入框）里的按键照旧走它们自己的逻辑；
+       - Esc 保留「回桌面」，↑↓ 保留音量快捷键，其余具名键原样发给手机；
+       - 字母数字符号逐键发 key，按住 Cmd/Ctrl 时带 gui:true（Cmd+C/Cmd+V 之类）；
+       - 中文/表情走隐藏 sink 的 compositionend → input_text。 */
+  (function initKbGlobal() {
+    if (!document.body) return;
+    const sink = document.createElement('input');
+    sink.id = 'kbSink';
+    sink.setAttribute('autocomplete', 'off');
+    sink.setAttribute('autocorrect', 'off');
+    sink.setAttribute('autocapitalize', 'off');
+    sink.setAttribute('spellcheck', 'false');
+    sink.style.cssText = 'position:fixed;left:-300px;top:0;width:1px;height:1px;opacity:0;border:0;padding:0;';
+    document.body.appendChild(sink);
+
+    sink.addEventListener('compositionend', (ev) => {
+      const t = ev.data || '';
+      sink.value = '';
+      if (t) auxSend('input_text', { text: t });
+    });
+
+    const PASS_TAGS = { INPUT: 1, TEXTAREA: 1, SELECT: 1 };
+    function isEditable(el) {
+      if (!el) return false;
+      if (PASS_TAGS[el.tagName]) return true;
+      if (el.isContentEditable) return true;
+      return false;
+    }
+    // 这两个键留给页面自己的快捷键（音量），不发给手机
+    const PAGE_OWNS = { Escape: 1, ArrowUp: 1, ArrowDown: 1 };
+    const SKIP = { Shift: 1, Meta: 1, Control: 1, Alt: 1, CapsLock: 1, F1: 1, F2: 1, F3: 1,
+                   F4: 1, F5: 1, F6: 1, F7: 1, F8: 1, F9: 1, F10: 1, F11: 1, F12: 1 };
+
+    let guiDown = false;
+
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Meta' || ev.key === 'Control') { guiDown = true; return; }
+      if (isEditable(ev.target)) return;              // #kbPad / 房间号输入框：它们自己处理
+      if (ev.isComposing) return;                     // 中文输入中：交给 compositionend
+      if (SKIP[ev.key]) return;
+      if (PAGE_OWNS[ev.key]) return;
+
+      const named = KB_NAMED[ev.key];
+      if (named) {
+        ev.preventDefault();
+        auxSend('key', guiDown ? { code: named, gui: true } : { code: named });
+        return;
+      }
+      if (ev.key === ' ') { ev.preventDefault(); auxSend('key', { code: 'space' }); return; }
+      if (ev.key.length !== 1) return;                // Insert/PageUp 之类忽略
+      if (ev.key.charCodeAt(0) >= 128) return;        // 非 ASCII 单字符交给输入法
+      ev.preventDefault();
+      if (guiDown) auxSend('key', { char: ev.key.toLowerCase(), gui: true });
+      else auxSend('key', { char: ev.key });
+    }, true);
+
+    document.addEventListener('keyup', (ev) => {
+      if (ev.key === 'Meta' || ev.key === 'Control') guiDown = false;
+    }, true);
+    window.addEventListener('blur', () => { guiDown = false; });
+
+    // 点画面就把焦点交给隐藏 sink，中文输入法才有落点；点输入框时不抢
+    const cv = document.getElementById('rawCanvas') || document.querySelector('canvas') || document.body;
+    if (cv) {
+      cv.setAttribute('tabindex', '0');
+      cv.addEventListener('pointerdown', () => {
+        try { sink.focus({ preventScroll: true }); } catch (e) { sink.focus(); }
+      }, true);
+    }
+  })();
+
   window.__auxLaunch = (b) => { auxSend('launch_app', { bundle: b }); };
   window.__auxKill = (b) => { auxSend('kill_app', { bundle: b }); };
 
@@ -721,18 +1062,31 @@
   function toggleHud() { $('hud').classList.toggle('hide'); }
   $('hudBtn').onclick = toggleHud;
   window.addEventListener('keydown', (ev) => {
-    if (ev.key === 'd' || ev.key === 'D') toggleHud();
+    if (ev.key === 'D') toggleHud();   // 只认大写：小写 d 让给手机当打字用
   });
 
   /* ---------------- 按钮 ---------------- */
   $('connect').onclick = () => {
     const room = ($('room').value || 'dev001').trim();
     stopAll();
-    startVideo(room);
+    startVideoAuto(room);
     startControl(room);
   };
 
   $('disconnect').onclick = stopAll;
+
+  /* ---------------- 外部内嵌支持：?room=xxx&auto=1 ---------------- */
+  // 客户端（云控客户端）把这一页嵌进 WebView 时，用 URL 参数指定设备并自动连上，
+  // 省掉手动输 room、点连接的步骤。auto=1 只自动点一次，之后由页面自己的重连逻辑接管。
+  (function () {
+    const q = new URLSearchParams(location.search);
+    const qRoom = (q.get('room') || '').trim();
+    if (qRoom) { $('room').value = qRoom; }
+    if (q.get('hidehud') === '1') { $('hud').classList.add('hide'); }
+    if (q.get('auto') === '1' && qRoom) {
+      setTimeout(() => { try { $('connect').click(); } catch (e) { log('自动连接失败', e.message); } }, 200);
+    }
+  })();
 
   // 画质档位：直接打设备端配置接口，设备收到后立即重建编码参数，不重装、不断流
   $('quality').onchange = async (ev) => {
@@ -765,6 +1119,7 @@
   };
 
   function stopAll() {
+    stopRawVideo();
     if (videoRetry) { clearInterval(videoRetry); videoRetry = null; }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     try { pc && pc.close(); } catch (e) {}

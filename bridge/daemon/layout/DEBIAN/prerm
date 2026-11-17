@@ -27,4 +27,5 @@ fi
 
 command -v killall >/dev/null 2>&1 && killall akund >/dev/null 2>&1
 
+launchctl bootout system/com.akun.bridge.dpkgd >/dev/null 2>&1
 exit 0

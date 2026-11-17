@@ -29,7 +29,7 @@
 	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/var/jb/usr/bin/akund</string>
+		<string>/usr/bin/akund</string>
 		<string>-daemon</string>
 	</array>
 	<key>RunAtLoad</key>

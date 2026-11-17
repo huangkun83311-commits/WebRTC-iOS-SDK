@@ -34,6 +34,16 @@ find_plist() {
     return 1
 }
 
+find_plist_dpkgd() {
+    for base in /var/jb/Library/LaunchDaemons /Library/LaunchDaemons /private/var/jb/Library/LaunchDaemons; do
+        if [ -f "$base/$LABEL.dpkgd.plist" ]; then
+            echo "$base/$LABEL.dpkgd.plist"
+            return 0
+        fi
+    done
+    return 1
+}
+
 has_job() {
     [ -x "$LAUNCHCTL" ] && "$LAUNCHCTL" list 2>/dev/null | awk '{print $3}' | grep -qx "$LABEL"
 }
@@ -54,6 +64,30 @@ fi
 for b in /var/jb/usr/bin/akund /usr/bin/akund; do
     [ -f "$b" ] && chmod 0755 "$b" && log "chmod 0755 $b"
 done
+
+# —— 双环境二进制路径解析 ——
+# roothide：/usr/bin/akund（/var/jb 是指向 / 的软链，两者等价）
+# TrollStore / 无根巨魔：只有 /var/jb/usr/bin/akund，没有 /usr/bin/akund
+# 写死任何一种都会在另一套环境里起不来，所以这里探测后回写两个 plist。
+AKUND_BIN=""
+for b in /usr/bin/akund /var/jb/usr/bin/akund /private/var/jb/usr/bin/akund; do
+    if [ -x "$b" ]; then AKUND_BIN="$b"; break; fi
+done
+log "解析二进制=[$AKUND_BIN]"
+if [ -n "$AKUND_BIN" ]; then
+    for p in "$PLIST" "$(find_plist_dpkgd)"; do
+        [ -f "$p" ] || continue
+        if command -v plutil >/dev/null 2>&1; then
+            plutil -replace ProgramArguments.0 -string "$AKUND_BIN" "$p" >>"$LOG" 2>&1
+        else
+            sed -i "s|<string>/usr/bin/akund</string>|<string>$AKUND_BIN</string>|" "$p" >>"$LOG" 2>&1
+            sed -i "s|<string>/var/jb/usr/bin/akund</string>|<string>$AKUND_BIN</string>|" "$p" >>"$LOG" 2>&1
+        fi
+        log "plist 已回写 $p -> $AKUND_BIN"
+    done
+else
+    log "!! 两种路径都没找到 akund，plist 保持默认"
+fi
 for f in /var/jb/usr/lib/WebRTC.framework/WebRTC; do
     [ -f "$f" ] && log "found $f"
 done
@@ -107,5 +141,25 @@ fi
 
 log "--- akund-stderr.log 尾部 ---"
 tail -15 /tmp/akund-stderr.log >> "$LOG" 2>&1
+
+# --- 给 daemon 准备 dpkg 快照 ---
+# daemon 以 mobile(501) 身份跑，/var/lib 是 700 root:wheel，mobile 连目录都列不出来，
+# 所以由 root 在这里导出一份到 mobile 可读的位置，list_packages 读它。
+# --- root 侧 dpkg 数据助手（com.akun.bridge.dpkgd）---
+# RootHide 下 daemon（注入进程）与 root 的 /var/mobile 是两套视图，写文件 daemon 读不到，
+# 所以改成 root 小助手监听回环 TCP 19949，daemon 连它取 dpkg status 原文。
+DPKGD_PLIST="/Library/LaunchDaemons/com.akun.bridge.dpkgd.plist"
+[ -f "$DPKGD_PLIST" ] || DPKGD_PLIST="/var/jb/Library/LaunchDaemons/com.akun.bridge.dpkgd.plist"
+chown root:wheel "$DPKGD_PLIST" 2>/dev/null
+chmod 644 "$DPKGD_PLIST" 2>/dev/null
+launchctl bootout system/com.akun.bridge.dpkgd >/dev/null 2>&1
+sleep 2
+launchctl bootstrap system "$DPKGD_PLIST" >/dev/null 2>&1 || launchctl load -w "$DPKGD_PLIST" >/dev/null 2>&1
+sleep 2
+# 关键：KeepAlive 进程在二进制被替换后不会自己换映像，必须 kickstart -k 强制重启，
+# 否则 dpkgd 一直跑旧代码（实测 TIPAQ 布局修正不生效就是这个原因）
+launchctl kickstart -k system/com.akun.bridge.dpkgd >/dev/null 2>&1
+sleep 1
+log "dpkgd($DPKGD_PLIST) 已 bootstrap + kickstart"
 
 exit 0

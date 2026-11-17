@@ -16,7 +16,19 @@
 #import <net/if.h>
 #import <arpa/inet.h>
 #import <sys/socket.h>
+#import <netinet/in.h>
+#import <errno.h>
+#import <dirent.h>
+#import <sys/stat.h>
+#import <spawn.h>
+#import <sys/wait.h>
+#import <signal.h>
 #import <UIKit/UIKit.h>
+extern char **environ;
+#import <sys/sysctl.h>
+// 注意：不要 extern 声明 proc_listpids/proc_pidpath —— 链接期绑定会在 iOS 上
+// 报 "dyld: missing symbol called" 直接把 dpkgd 打死（已实测踩过）。
+// 找 SpringBoard 改用 sysctl(KERN_PROC_ALL) 遍历进程表，零外部依赖。
 #import "AkunCapture.h"
 extern void AkunBridgeNoteInteraction(void);   // 抓屏层：进交互窗口，下一拍强制出帧
 #import "AkunInjector.h"
@@ -138,6 +150,37 @@ static NSString *AkunLocalIPv4(void) {
 }
 @end
 
+// 轻量 TCP 探测：给自动发现做「上次地址还活着吗」的判断，不建连接池
+static BOOL akun_tcp_reachable(NSString *host, int port, double timeoutSec) {
+    if (host.length == 0 || port <= 0) return NO;
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = inet_addr(host.UTF8String);
+    if (sa.sin_addr.s_addr == INADDR_NONE) return NO;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NO;
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) { close(fd); return YES; }
+    if (errno != EINPROGRESS) { close(fd); return NO; }
+    struct timeval tv;
+    tv.tv_sec = (time_t)timeoutSec;
+    tv.tv_usec = (int)((timeoutSec - (double)tv.tv_sec) * 1000000);
+    fd_set ws, es;
+    FD_ZERO(&ws); FD_SET(fd, &ws);
+    FD_ZERO(&es); FD_SET(fd, &es);
+    BOOL ok = NO;
+    if (select(fd + 1, &ws, NULL, &es, &tv) > 0) {
+        int err = 0; size_t elen = sizeof(err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, (socklen_t *)&elen);
+        ok = (err == 0);
+    }
+    close(fd);
+    return ok;
+}
+
 @implementation AkunDaemon
 
 - (NSArray<NSString *> *)statePaths {
@@ -156,7 +199,8 @@ static NSString *AkunLocalIPv4(void) {
 }
 
 - (void)saveState {
-    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    // 先读回现有内容再合并 —— 否则会把 lastServer 这类字段一起覆盖掉
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[self loadState]];
     d[@"scale"] = @(self.cfgScale);
     d[@"fps"] = @(self.cfgFps);
     d[@"bitrate"] = @(self.cfgBitrate);
@@ -201,6 +245,27 @@ static NSString *AkunLocalIPv4(void) {
         return;
     }
 
+    // 0) 先试上次成功过的地址：重启 daemon 后 1~2 秒就能连回来，不用等扫网段
+    NSString *last = [self loadState][@"lastServer"];
+    if (last.length) {
+        NSString *h = last;
+        if ([h hasPrefix:@"http://"]) h = [h substringFromIndex:7];
+        else if ([h hasPrefix:@"https://"]) h = [h substringFromIndex:8];
+        NSString *ip = h;
+        int port = 8080;
+        NSRange c = [h rangeOfString:@":"];
+        if (c.location != NSNotFound) {
+            ip = [h substringToIndex:c.location];
+            port = [[h substringFromIndex:c.location + 1] intValue];
+        }
+        if (akun_tcp_reachable(ip, port, 1.2)) {
+            self.serverBase = last;
+            NSLog(@"[daemon] 上次地址仍可用，直接复用：%@", last);
+            return;
+        }
+        NSLog(@"[daemon] 上次地址 %@ 不通，转入扫描", last);
+    }
+
     self.discovering = YES;
     // UDP 19941 发现应答（与 AKUN 同协议，中控不需要改扫描逻辑）
     AkunDiscoveryUDP *udp = [[AkunDiscoveryUDP alloc] init];
@@ -216,6 +281,21 @@ static NSString *AkunLocalIPv4(void) {
         if (found.length) {
             self.serverBase = found;
             NSLog(@"[daemon] 自动发现成功：%@", found);
+            // 记下来：下次重启（含 restart_daemon）直接复用，不再扫网段
+            NSDictionary *st = [self loadState];
+            if (![st[@"lastServer"] isEqualToString:found]) {
+                self.cfgHardCap = self.cfgHardCap;   // 保持参数不变
+                [self saveState];
+                NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[self loadState]];
+                d[@"lastServer"] = found;
+                for (NSString *p in [self statePaths]) {
+                    if ([d writeToFile:p atomically:YES] &&
+                        [[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                        NSLog(@"[daemon] 记住服务端地址 %@", found);
+                        break;
+                    }
+                }
+            }
         } else {
             NSLog(@"[daemon] 自动发现失败，等下一轮重试");
         }
@@ -570,6 +650,355 @@ static void AkunRaiseJetsamLimit(void) {
     NSLog(@"[jetsam] 抬到 400MB: highWaterMark rc=%d taskLimit rc=%d", rcHigh, rcTask);
 }
 
+
+// root 侧 dpkg 数据助手：以 root 身份跑（launchd job com.akun.bridge.dpkgd），
+// 监听回环 TCP，把 root 视图里的 dpkg status 原文吐给 daemon。
+// 为什么不走文件共享：RootHide 下 daemon（注入进程）与 root ssh 的 /var/mobile
+// 是两套视图，postinst 写的快照 daemon 一律看不到；回环 TCP 不受这个影响。
+// root 侧执行助手：daemon 是注入进程（mobile），posix_spawn 起不来外部二进制（ENOENT），
+// 所以 dpkg/unzip/uicache 这类必须由 uid=0 的 dpkgd 代跑。用 popen 走 /bin/sh。
+__attribute__((unused)) static NSString *akun_sh_quote(NSString *s) {
+    return [NSString stringWithFormat:@"'%@'", [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+// jbroot 前缀：dpkgd 自身就在 .jbroot-XXXX 视图里，真机 dpkg/unzip/uicache 在 <jbroot>/usr/bin，
+// 也可能在 /var/jb/usr/bin。PATH 一起给上，由 sh 自己找，不再靠绝对路径猜。
+static NSString *akun_jb_prefix(void) {
+    NSString *hm = NSHomeDirectory();
+    NSRange r = [hm rangeOfString:@"/var/root" options:NSBackwardsSearch];
+    if (r.location != NSNotFound && r.location > 1) return [hm substringToIndex:r.location];
+    return @"";
+}
+
+// RootHide 下 dpkgd 里 popen()（= fork+/bin/sh）拿不到 shell，实测直接 rc=127 且无输出，
+// 所以改成 posix_spawn + 管道：不依赖 sh，绝对路径直接 exec。
+// dpkg 是 rootless 兼容二进制（libiosexec），会把 /var/mobile 自己映射进 jbroot；
+// 而 dpkgd 是普通进程，看到的是真实 /var。约定 "@jb/<相对>"：落盘按 jbroot 展开，
+// 传给 dpkg 时还原成 /<相对>，让 dpkg 自己去重定向。
+static NSString *akun_expand_jb(NSString *p) {
+    if ([p hasPrefix:@"@jb/"]) {
+        return [[akun_jb_prefix() stringByAppendingString:@"/"] stringByAppendingString:[p substringFromIndex:4]];
+    }
+    return p;
+}
+static NSString *akun_strip_jb(NSString *p) {
+    if ([p hasPrefix:@"@jb/"]) return [@"/" stringByAppendingString:[p substringFromIndex:4]];
+    return p;
+}
+
+// ipa 解包后是 /Applications/Payload/<X>.app，多一层 Payload，SpringBoard 扫不到。
+// 这里把 Payload 下的 *.app 搬到 /Applications 根，再删掉 Payload。
+// ipa 解包后落在 /Applications/Payload/<X>.app，多一层 Payload，SpringBoard 扫不到。
+// RootHide 下 unzip 写的是"真实" /Applications，而 dpkgd（注入进程）把它看成
+// <jbroot>/Applications —— 实测 opendir("/Applications/Payload") MISS，
+// opendir("<jbroot>/Applications/Payload") OK，所以这里统一用 jbroot 前缀定位。
+static void akun_fix_tipa_layout(void) {
+    NSString *jbp = akun_jb_prefix();
+    char pay[640], appdir[640], src[768], dst[768];
+    snprintf(pay, sizeof(pay), "%s/Applications/Payload", jbp.UTF8String);
+    snprintf(appdir, sizeof(appdir), "%s/Applications", jbp.UTF8String);
+
+    DIR *d = opendir(pay);
+    if (!d) {
+        printf("[tipa] payload 目录不存在: %s\n", pay);
+        fflush(stdout);
+        return;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        size_t n = strlen(e->d_name);
+        if (n < 4 || strcmp(e->d_name + n - 4, ".app") != 0) continue;
+        snprintf(src, sizeof(src), "%s/%s", pay, e->d_name);
+        snprintf(dst, sizeof(dst), "%s/%s", appdir, e->d_name);
+        if (rename(src, dst) == 0) printf("[tipa] moved -> %s\n", dst);
+        else printf("[tipa] rename fail %s errno=%d\n", src, errno);
+    }
+    closedir(d);
+    rmdir(pay);
+    printf("[tipa] done\n");
+    fflush(stdout);
+}
+
+static NSString *akun_which(NSString *name) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *pfx = akun_jb_prefix();
+    for (NSString *c in @[ [NSString stringWithFormat:@"%@/usr/bin/%@", pfx, name],
+                            [NSString stringWithFormat:@"%@/var/jb/usr/bin/%@", pfx, name],
+                            [NSString stringWithFormat:@"/var/jb/usr/bin/%@", name],
+                            [NSString stringWithFormat:@"/usr/bin/%@", name],
+                            [NSString stringWithFormat:@"/usr/sbin/%@", name],
+                            [NSString stringWithFormat:@"/bin/%@", name] ]) {
+        if ([fm fileExistsAtPath:c]) return c;
+        if (access(c.UTF8String, X_OK) == 0) return c;
+    }
+    return nil;
+}
+
+static int akun_root_exec(NSArray *argv, NSString **outStr) {
+    if (!argv.count) { *outStr = @"empty argv"; return -1; }
+    NSString *bin = akun_which(argv.firstObject);
+    if (!bin) { *outStr = [NSString stringWithFormat:@"找不到可执行文件: %@", argv.firstObject]; return -127; }
+
+    NSMutableArray *cstrs = [NSMutableArray array];
+    for (NSString *a in argv) {
+        const char *c = a.UTF8String;
+        [cstrs addObject:[NSData dataWithBytes:c length:strlen(c) + 1]];
+    }
+    char **args = (char **)calloc(cstrs.count + 1, sizeof(char *));
+    for (NSUInteger i = 0; i < cstrs.count; i++) {
+        args[i] = (char *)[cstrs[i] bytes];
+    }
+    args[cstrs.count] = NULL;
+
+    int pfd[2] = { -1, -1 };
+    if (pipe(pfd) != 0) { free(args); *outStr = @"pipe 失败"; return -1; }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&fa, pfd[0]);
+    posix_spawn_file_actions_addclose(&fa, pfd[1]);
+
+    pid_t pid = 0;
+    int prc = posix_spawn(&pid, bin.UTF8String, &fa, NULL, args, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    free(args);
+    close(pfd[1]);
+    if (prc != 0) {
+        close(pfd[0]);
+        *outStr = [NSString stringWithFormat:@"posix_spawn 失败 %@ : errno=%d", bin, prc];
+        NSLog(@"[dpkgd] posix_spawn %@ 失败 %d", bin, prc);
+        return -1;
+    }
+    NSMutableData *buf = [NSMutableData data];
+    char b[4096];
+    ssize_t n = 0;
+    while ((n = read(pfd[0], b, sizeof(b))) > 0) {
+        [buf appendBytes:b length:n];
+        if (buf.length > 262144) break;
+    }
+    close(pfd[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    NSString *o = [[NSString alloc] initWithData:buf encoding:NSUTF8StringEncoding];
+    if (!o.length) o = [[NSString alloc] initWithData:buf encoding:NSISOLatin1StringEncoding];
+    *outStr = o ?: @"";
+    NSLog(@"[dpkgd] spawn %@ rc=%d", bin, rc);
+    return rc;
+}
+
+__attribute__((unused)) static NSString *akun_pick_bin(NSArray *cands) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *c in cands) { if ([fm fileExistsAtPath:c]) return c; }
+    return cands.lastObject;
+}
+
+static void akun_run_dpkgd(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { NSLog(@"[dpkgd] socket 失败"); return; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        NSLog(@"[dpkgd] bind 失败 errno=%d", errno);
+        return;
+    }
+    if (listen(fd, 8) != 0) { NSLog(@"[dpkgd] listen 失败"); return; }
+    NSLog(@"[dpkgd] 监听 127.0.0.1:%d uid=%d", port, getuid());
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0) { continue; }
+        // 首行读必须有超时：客户端可能（像原来的 LIST）不带换行直接发一段就等回包，
+        // 没有超时这里会把单线程 accept 循环永久堵死。
+        struct timeval rtv; rtv.tv_sec = 2; rtv.tv_usec = 0;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+        // 首行协议：Open字节流读首行（\n 分隔）。PUTA 还要继续读固定长度的 base64 正文，
+        // 因为 RootHide 下注入进程与 root/dpkg 的文件视图不共享，包必须由 dpkgd 自己落盘。
+        NSMutableData *acc = [NSMutableData data];
+        NSString *firstLine = nil;
+        NSUInteger bodyStart = 0;
+        char rb0[4096];
+        while (!firstLine) {
+            ssize_t n = read(c, rb0, sizeof(rb0));
+            if (n <= 0) break;
+            [acc appendData:[NSData dataWithBytes:rb0 length:(NSUInteger)n]];
+            NSRange nl = [acc rangeOfData:[NSData dataWithBytes:"\n" length:1]
+                                   options:0 range:NSMakeRange(0, acc.length)];
+            if (nl.location != NSNotFound) {
+                NSData *hd = [acc subdataWithRange:NSMakeRange(0, nl.location)];
+                firstLine = [[NSString alloc] initWithData:hd encoding:NSUTF8StringEncoding] ?: @"";
+                bodyStart = nl.location + 1;
+            } else if (acc.length > 65536) {
+                break;
+            }
+        }
+        if (!firstLine) { firstLine = [[NSString alloc] initWithData:acc encoding:NSUTF8StringEncoding] ?: @""; bodyStart = acc.length; }
+        NSString *reqStr = [firstLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![reqStr isEqualToString:@"LIST"] && reqStr.length) {
+            // 写库类动作统一走这里：DPKG_I <path> / DPKG_R <pkg> / TIPAQ <path>
+            NSArray *parts = [reqStr componentsSeparatedByString:@" "];
+            NSString *verb = parts.firstObject ?: @"";
+            NSString *arg = ([parts count] > 1) ? [reqStr substringFromIndex:verb.length + 1] : @"";
+            NSString *outp = @"";
+            int rc = -1;
+            NSFileManager *fm = [NSFileManager defaultManager];
+
+            if ([verb isEqualToString:@"PUTA"]) {
+                // arg: "<path> <offset> <b64len>"
+                NSArray *ap = [arg componentsSeparatedByString:@" "];
+                if (ap.count < 3) { outp = @"PUTA 参数不足"; rc = -2; }
+                else {
+                    NSString *dp = akun_expand_jb(ap[0]);
+                    long long off = [ap[1] longLongValue];
+                    NSUInteger want = (NSUInteger)[ap[2] longLongValue];
+                    NSMutableData *body = [NSMutableData data];
+                    NSUInteger have = acc.length > bodyStart ? acc.length - bodyStart : 0;
+                    if (have) [body appendData:[acc subdataWithRange:NSMakeRange(bodyStart, have)]];
+                    char rb1[8192];
+                    while (body.length < want) {
+                        ssize_t n = read(c, rb1, sizeof(rb1));
+                        if (n <= 0) break;
+                        [body appendBytes:rb1 length:(NSUInteger)n];
+                    }
+                    if (body.length < want) {
+                        outp = [NSString stringWithFormat:@"正文不足 %lu/%lu", (unsigned long)body.length, (unsigned long)want];
+                        rc = -3;
+                    } else {
+                        NSData *raw = [[NSData alloc] initWithBase64EncodedData:body options:0];
+                        if (!raw.length) { outp = @"base64 解码为空"; rc = -4; }
+                        else {
+                            FILE *fp = (off == 0) ? fopen(dp.UTF8String, "wb") : fopen(dp.UTF8String, "r+b");
+                            if (!fp) {
+                                outp = [NSString stringWithFormat:@"fopen 失败 errno=%d path=%@", errno, dp];
+                                rc = -5;
+                            } else {
+                                if (off != 0) fseek(fp, (long)off, SEEK_SET);
+                                size_t wr = fwrite(raw.bytes, 1, raw.length, fp);
+                                fclose(fp);
+                                chmod(dp.UTF8String, 0644);
+                                outp = [NSString stringWithFormat:@"written=%zu off=%lld total=%lld path=%@",
+                                        wr, off, off + (long long)raw.length, dp];
+                                rc = (wr == raw.length) ? 0 : -6;
+                            }
+                        }
+                    }
+                }
+            } else if ([verb isEqualToString:@"DPKG_I"] && arg.length) {
+                NSString *real = akun_expand_jb(arg);
+                if (![fm fileExistsAtPath:real]) { rc = -9; outp = [NSString stringWithFormat:@"文件不存在: %@ (展开 %@)", arg, real]; }
+                else {
+                    rc = akun_root_exec(@[ @"dpkg", @"-i", akun_strip_jb(arg) ], &outp);
+                }
+            } else if ([verb isEqualToString:@"DPKG_R"] && arg.length) {
+                rc = akun_root_exec(@[ @"dpkg", @"-r", arg ], &outp);
+            } else if ([verb isEqualToString:@"KILLSB"]) {
+                // respring：root 侧用 sysctl 遍历进程表，按 p_comm 找 SpringBoard 再 SIGKILL。
+                int killed = 0, scanned = 0;
+                int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+                size_t len = 0;
+                if (sysctl(mib, 4, NULL, &len, NULL, 0) == 0 && len > 0) {
+                    struct kinfo_proc *kp = (struct kinfo_proc *)malloc(len);
+                    if (kp && sysctl(mib, 4, kp, &len, NULL, 0) == 0) {
+                        int n = (int)(len / sizeof(struct kinfo_proc));
+                        for (int i = 0; i < n; i++) {
+                            pid_t pid = kp[i].kp_proc.p_pid;
+                            if (pid <= 1) continue;
+                            scanned++;
+                            const char *comm = kp[i].kp_proc.p_comm;
+                            if (comm && strstr(comm, "SpringBoard")) {
+                                if (kill(pid, SIGKILL) == 0) killed++;
+                            }
+                        }
+                    }
+                    if (kp) free(kp);
+                }
+                rc = killed > 0 ? 0 : 1;
+                outp = [NSString stringWithFormat:@"killed=%d scanned=%d", killed, scanned];
+                        } else if ([verb isEqualToString:@"TIPAQ"] && arg.length) {
+                NSString *real = akun_expand_jb(arg);
+                if (![fm fileExistsAtPath:real]) { rc = -9; outp = [NSString stringWithFormat:@"文件不存在: %@ (展开 %@)", arg, real]; }
+                else {
+                    rc = akun_root_exec(@[ @"unzip", @"-o", akun_strip_jb(arg), @"-d", @"/Applications" ], &outp);
+                    if (rc == 0) {
+                        akun_fix_tipa_layout();
+                        NSString *o2 = @""; akun_root_exec(@[ @"uicache", @"-a" ], &o2);
+                        outp = [outp stringByAppendingString:o2];
+                    }
+                }
+            } else {
+                outp = [NSString stringWithFormat:@"未知指令: %@", reqStr];
+                rc = -1;
+            }
+            NSLog(@"[dpkgd] %@ rc=%d", verb, rc);
+            if (rc == 127) {
+                outp = [NSString stringWithFormat:@"[PATH 里没有该命令 prefix=%@] %@", akun_jb_prefix(), (outp ?: @"")];
+            }
+            NSString *resp = [NSString stringWithFormat:@"OK %d\n%@", rc, (outp ?: @"")];
+            NSData *rd = [resp dataUsingEncoding:NSUTF8StringEncoding];
+            const char *rb = (const char *)rd.bytes;
+            NSUInteger rl = rd.length;
+            while (rl > 0) {
+                ssize_t w = write(c, rb, rl);
+                if (w <= 0) break;
+                rb += w; rl -= (NSUInteger)w;
+            }
+            close(c);
+            continue;
+        }
+        NSData *out = nil;
+        NSMutableString *diag = [NSMutableString string];
+        // RootHide/roothide：/var/lib/dpkg 是指向 .jbroot/Library/dpkg 的相对软链，
+        // 注入进程的 /var 已被重定向到 .jbroot-*/var（里面没有 dpkg），真实数据库在 /Library/dpkg/status。
+        NSMutableArray *cands = [NSMutableArray arrayWithObjects:
+            @"/Library/dpkg/status",
+            @"/var/jb/Library/dpkg/status",
+            @"/var/jb/var/lib/dpkg/status",
+            @"/var/lib/dpkg/status",
+            @"/var/lib/dpkg/status-old", nil];
+        NSString *hm = NSHomeDirectory();
+        NSRange rr = [hm rangeOfString:@"/var/root" options:NSBackwardsSearch];
+        if (rr.location != NSNotFound && rr.location > 1) {
+            NSString *prefix = [hm substringToIndex:rr.location];   // .../.jbroot-XXXXXXXX
+            [cands insertObject:[prefix stringByAppendingString:@"/Library/dpkg/status"] atIndex:0];
+        }
+        for (NSString *p in cands) {
+            FILE *f = fopen(p.UTF8String, "rb");
+            if (!f) {
+                [diag appendFormat:@"miss %@ errno=%d\n", p, errno];
+                continue;
+            }
+            NSMutableData *d = [NSMutableData data];
+            char b[8192];
+            size_t n = 0;
+            while ((n = fread(b, 1, sizeof(b), f)) > 0) { [d appendBytes:b length:n]; }
+            fclose(f);
+            [diag appendFormat:@"read %@ %lu\n", p, (unsigned long)d.length];
+            if (d.length > 100) { out = d; break; }
+        }
+        [diag appendFormat:@"uid=%d home=%@\n", getuid(), NSHomeDirectory()];
+        NSLog(@"[dpkgd] %@", diag);
+        NSMutableData *all = [NSMutableData data];
+        NSString *head = [NSString stringWithFormat:@"DIAG:\n%@---STATUS---\n", diag];
+        [all appendData:[head dataUsingEncoding:NSUTF8StringEncoding]];
+        if (out.length) { [all appendData:out]; NSLog(@"[dpkgd] 提供 %lu B", (unsigned long)out.length); }
+        const char *bytes = (const char *)all.bytes;
+        NSUInteger left = all.length;
+        while (left > 0) {
+            ssize_t w = write(c, bytes, left);
+            if (w <= 0) break;
+            bytes += w;
+            left -= (NSUInteger)w;
+        }
+        close(c);
+    }
+}
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         // 调试入口：`akund --tap 0.5 0.5` / `akund --key 233`，直接调注入器并退出。
@@ -591,6 +1020,11 @@ int main(int argc, char *argv[]) {
             [inj handleCommand:@{@"t" : @"hk", @"usage" : @(usage)}];
             sleep(2);
             NSLog(@"[cli] key 返回（没崩溃）");
+            return 0;
+        }
+        if (argc >= 2 && strcmp(argv[1], "--dpkgd") == 0) {
+            int port = (argc > 2) ? atoi(argv[2]) : 19949;
+            akun_run_dpkgd(port);
             return 0;
         }
         NSLog(@"[daemon] 启动 argc=%d", argc);

@@ -391,8 +391,12 @@ func main() {
 	// 并把这个 UDP 端口在公网上的地址作为额外候选播给浏览器（frp udp 映射）。
 	iceUDP := flag.Int("iceudp", 0, "固定 ICE UDP 端口（0=随机，局域网用法保持不变）")
 	pubIP := flag.String("publicip", "", "ICE 公网播报地址，例如 106.52.43.129；留空不播")
+	// -fallback：默认关闭 = 纯打洞（只发 srflx 直连候选，一条中继都不发）。
+	// 带上它才会额外发一条 frp 中继候选，打洞打不通时才有画面。
+	fb := flag.Bool("fallback", false, "打洞失败时额外播 frp 中继候选（默认关，纯打洞）")
 	flag.Parse()
 	authSecret = *key
+	relayCandidate = *fb
 	initICE(*iceUDP, *pubIP)
 
 	h := newHub()
@@ -530,14 +534,16 @@ func main() {
 			}
 			perConcKbps := uplink * 1000 * 0.9 / float64(conc)
 			cap = int(perConcKbps * 1000)
-			scale = 0.35
+			// 授权档也要看清字：0.35 在 1242x2208 上只有 434x772，中文小字必糊。
+			// 0.40 给到 497x883，cap 上限放宽到 3M（base=cap*3/5=1.8M 稳态）。
+			scale = 0.40
 			fps = 30
 			if cap < 1000000 {
-				scale = 0.32
+				scale = 0.35
 				fps = 24
 			}
-			if cap > 1500000 {
-				cap = 1500000
+			if cap > 3000000 {
+				cap = 3000000
 			}
 			if cap < 500000 {
 				cap = 500000

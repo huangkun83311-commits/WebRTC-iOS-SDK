@@ -400,8 +400,10 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     double prep = MIN(_prepMsAvg / 1000.0, minGap * 0.9);
     // prep 抵扣让流水线能提前开跑，但会让实际帧率超过声明值（实测 45fps 档跑到 54fps，
     // 多出来的帧既不加手感，只是在加热机器）。这里给超发封顶 +2fps。
+    // 注意：封顶必须也减掉 prep，否则「等待 31.25ms + 处理 13.9ms」= 实际周期 45ms，
+    // prep 抵扣被吃掉 → 30fps 档实测只有 24.6fps（帧距 40.7ms，2026-11-17 实测）。
     double minGapClamp = 1.0 / (double)(fpsNow + 2);
-    double gapNeed = MAX(minGap - prep, minGapClamp);
+    double gapNeed = MAX(minGap - prep, minGapClamp - prep);
     BOOL timeOk = (now - _lastPushMono >= gapNeed + _pacePadSec);
     // 心跳帧：原来静止 2 秒才保活一帧，接收端浏览器会把"帧不来了"记成 freeze
     // （freezeCount + totalFreezesDuration），jitter buffer 也会被养到 50ms+；

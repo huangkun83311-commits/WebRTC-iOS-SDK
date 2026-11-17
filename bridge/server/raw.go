@@ -23,6 +23,7 @@ import (
 type rawSub struct {
 	conn    *websocket.Conn
 	ch      chan []byte
+	txt     chan string
 	dropped uint64
 	mu      sync.Mutex
 	closed  bool
@@ -54,6 +55,19 @@ func (rs *rawSub) push(b []byte) {
 	}
 }
 
+// pushInfo 推送编码参数（手机晚于观看端上线时用）
+func (rs *rawSub) pushInfo(fmtp string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.closed {
+		return
+	}
+	select {
+	case rs.txt <- `{"type":"info","fmtp":` + jsonString(fmtp) + `}`:
+	default:
+	}
+}
+
 func (s *sfu) requestKeyframe(rm *sfuRoom) {
 	rm.mu.RLock()
 	pub := rm.pub
@@ -74,7 +88,7 @@ func (s *sfu) handleRaw(w http.ResponseWriter, r *http.Request, room string) {
 	}
 	rm := s.room(room)
 
-	rs := &rawSub{conn: conn, ch: make(chan []byte, 256)}
+	rs := &rawSub{conn: conn, ch: make(chan []byte, 256), txt: make(chan string, 8)}
 	rm.mu.Lock()
 	rm.raws = append(rm.raws, rs)
 	info := rm.h264Info
@@ -89,19 +103,54 @@ func (s *sfu) handleRaw(w http.ResponseWriter, r *http.Request, room string) {
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"info","fmtp":""}`))
 	}
 
-	// 写：把 RTP 包原样下发
+	// 写：二进制下发 RTP，文本下发控制（编码参数变化等）；单协程写，避免并发写 panic
 	go func() {
-		for b := range rs.ch {
-			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			if err := conn.WriteMessage(websocket.BinaryMessage, b); err != nil {
-				return
+		for {
+			select {
+			case b, ok := <-rs.ch:
+				if !ok {
+					return
+				}
+				_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if err := conn.WriteMessage(websocket.BinaryMessage, b); err != nil {
+					return
+				}
+			case s, ok := <-rs.txt:
+				if !ok {
+					return
+				}
+				_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(s)); err != nil {
+					return
+					}
 			}
 		}
 	}()
 
+	// 保活：画面对端在有空闲的时候一个上行字节都不会发，光靠读超时会每 60 秒
+	// 把自己踢一次（页面上就是灯红一下）。这里补 15 秒一次 ping，浏览器自动回 pong。
+	stopPing := make(chan struct{})
+	go func() {
+		tk := time.NewTicker(15 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(2*time.Second)); err != nil {
+					return
+				}
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	})
+
 	// 读：只接受控制消息（要关键帧、心跳）
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		mt, data, err := conn.ReadMessage()
 		if err != nil {
 			break
@@ -120,6 +169,7 @@ func (s *sfu) handleRaw(w http.ResponseWriter, r *http.Request, room string) {
 		}
 	}
 
+	close(stopPing)
 	rs.close()
 	rm.mu.Lock()
 	for i, v := range rm.raws {
