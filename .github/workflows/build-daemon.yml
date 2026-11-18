@@ -53,15 +53,18 @@ jobs:
           cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
           # theos 仓库不自带 Linux 交叉工具链，按约定在 toolchain/linux/iphone/bin 建软链指向系统工具
           mkdir -p "$THEOS/toolchain/linux/iphone/bin"
-          for t in clang clang++ ar nm strip ranlib; do
-            if src=$(command -v "$t"); then
-              ln -sf "$src" "$THEOS/toolchain/linux/iphone/bin/$t"
-            else
-              echo "警告：系统没有 $t"
-            fi
-          done
-          ln -sf "$(command -v ld.lld)" "$THEOS/toolchain/linux/iphone/bin/ld"
-          ln -sf "$(command -v ld.lld)" "$THEOS/toolchain/linux/iphone/bin/ld.lld"
+          BIN="$THEOS/toolchain/linux/iphone/bin"
+          ln -sf "$(command -v clang)"   "$BIN/clang"
+          ln -sf "$(command -v clang++)" "$BIN/clang++"
+          # ar/nm/strip/ranlib 必须是 LLVM 版：GNU binutils 不认识 arm64 Mach-O，
+          # 会直接报 "file format not recognized" 把 make 打断（上一版 CI 就死在这）
+          ln -sf "$(command -v llvm-ar-14     || command -v llvm-ar)"     "$BIN/ar"
+          ln -sf "$(command -v llvm-nm-14     || command -v llvm-nm)"     "$BIN/nm"
+          ln -sf "$(command -v llvm-strip-14  || command -v llvm-strip)"  "$BIN/strip"
+          ln -sf "$(command -v llvm-ranlib-14 || command -v llvm-ranlib)" "$BIN/ranlib"
+          ln -sf "$(command -v ld.lld)" "$BIN/ld"
+          ln -sf "$(command -v ld.lld)" "$BIN/ld.lld"
+          ls -l "$BIN"
           # theos 仓库里没有 bin/ldid（上一版 CI 就死在 `ls $THEOS/bin/ldid` 这一行，
           # ls 找不到文件退出码正好是 2，跟报的 exit code 2 对得上）。Linux 版只能自己编。
           git clone --depth 1 --recursive https://github.com/ProcursusTeam/ldid.git /tmp/ldid-src
