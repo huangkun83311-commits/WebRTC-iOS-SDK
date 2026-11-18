@@ -14,23 +14,30 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # 原来跑 macos-latest：GitHub 免费 macOS arm64 runner 常年排队，15 分钟拿不到机器直接判 failed
+    # （日志原文 "The job was not acquired by Runner of type hosted even after multiple attempts"）。
+    # theos 在 Linux 上同样能出 arm64 deb 与 tipa（本地已实测跑通），换 ubuntu-latest 绕开排队。
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tooling
+      - name: Install tooling (Linux)
         run: |
           set -e
-          brew install ldid dpkg xz || brew install ldid dpkg
-          echo "ldid: $(command -v ldid)"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld llvm-14 \
+            dpkg dpkg-dev xz-utils zip unzip \
+            libplist3 libssl-dev
+          clang --version | head -1
 
       - name: Set up Go (服务端交叉编译)
         uses: actions/setup-go@v5
         with:
           go-version: "1.23"
 
-      - name: Install Theos + SDK
+      - name: Install Theos + SDK (Linux 工具链)
         run: |
           set -e
           export THEOS=$HOME/theos
@@ -39,8 +46,16 @@ jobs:
           git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks /tmp/theos-sdks
           cd /tmp/theos-sdks && git sparse-checkout set iPhoneOS16.5.sdk
           cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
-          mkdir -p "$THEOS/bin"
-          cp "$(command -v ldid)" "$THEOS/bin/ldid" && chmod +x "$THEOS/bin/ldid"
+          # theos 仓库不自带 Linux 交叉工具链，按约定在 toolchain/linux/iphone/bin 建软链指向系统工具
+          mkdir -p "$THEOS/toolchain/linux/iphone/bin"
+          for t in clang clang++ ar nm strip ranlib; do
+            src=$(command -v "$t") && ln -sf "$src" "$THEOS/toolchain/linux/iphone/bin/$t"
+          done
+          ln -sf "$(command -v ld.lld)" "$THEOS/toolchain/linux/iphone/bin/ld"
+          ln -sf "$(command -v ld.lld)" "$THEOS/toolchain/linux/iphone/bin/ld.lld"
+          # theos 自带 Linux 版 ldid（ELF，依赖 libplist-2.0.so.3 → apt libplist3）
+          ls -l "$THEOS/bin/ldid"
+          "$THEOS/bin/ldid" 2>&1 | head -1
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           ls "$THEOS/sdks"
 
@@ -80,7 +95,7 @@ jobs:
             echo "| 文件 | 大小 | sha256 |"
             echo "|---|---|---|"
             for f in out/*; do
-              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) | \`$(shasum -a 256 "$f" | cut -d' ' -f1)\` |"
+              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
           echo "count=$(ls out | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
@@ -140,4 +155,3 @@ jobs:
             - `bridge-server-windows-amd64.exe` / `bridge-server-linux-amd64`：信令+SFU 中继服务端（手机只推一路，多人观看不卡）
           files: out/*
           prerelease: true
-          draft: false

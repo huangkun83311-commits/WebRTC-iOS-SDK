@@ -36,6 +36,8 @@ extern void AkunBridgeNoteInteraction(void);
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 // ---- 私有 API 的轻量调用助手（辅助功能用）----
 static id akun_msg0(id obj, NSString *sel) {
@@ -884,6 +886,97 @@ static NSDictionary *akunPostNotifications(id rawNames) {
     return @{ @"success" : @YES, @"posted" : posted };
 }
 
+// ---- tipa：逐字照抄 AKUN TVNCTipaServeClient / TVNCTipaServerEnsureStarted ----
+// TrollStore 的 apple-magnifier://install?url= 只认它能自己下载到的地址：
+// file:// 被沙盒拦（-1100），http:// 实测可用。所以 127.0.0.1 起一个只服务当前这一个文件的
+// 极简 HTTP，把地址交给 TrollStore，由它回环下载 → 签名 → 弹安装确认框。
+// 关键点：签名是 TrollStore 做的，我们绝不能自己 unzip 到 /Applications（未签名必闪退）。
+static int gTipaFD = -1;
+static uint16_t gTipaPort = 0;
+static dispatch_queue_t gTipaQueue = nil;
+static dispatch_source_t gTipaSource = nil;
+static NSString *gTipaPath = nil;
+
+static void akun_tipa_serve(int cfd, NSString *path) {
+    char head[4096];
+    ssize_t n = recv(cfd, head, sizeof(head) - 1, 0);
+    if (n <= 0) { close(cfd); return; }
+    head[n] = '\0';
+    // 流式下发：只开 fd 按 64KB 读，不把整包读进内存（大包会顶到几百 MB）
+    int fd = path ? open(path.UTF8String, O_RDONLY) : -1;
+    long long fileSize = -1;
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) fileSize = (long long)st.st_size;
+    }
+    BOOL ok = (fd >= 0 && fileSize >= 0);
+    char hdr[384];
+    snprintf(hdr, sizeof(hdr),
+             "HTTP/1.1 %s\r\nContent-Type: application/octet-stream\r\n"
+             "Content-Length: %lld\r\nConnection: close\r\n\r\n",
+             ok ? "200 OK" : "404 Not Found", ok ? fileSize : 0LL);
+    size_t hl = strlen(hdr), sent = 0;
+    while (sent < hl) {
+        ssize_t w = send(cfd, hdr + sent, hl - sent, 0);
+        if (w <= 0) { if (errno == EINTR) continue; goto done; }
+        sent += (size_t)w;
+    }
+    if (ok && fileSize > 0) {
+        const size_t B = 65536;
+        uint8_t *buf = (uint8_t *)malloc(B);
+        if (buf) {
+            ssize_t r;
+            while ((r = read(fd, buf, B)) > 0) {
+                size_t off = 0;
+                while (off < (size_t)r) {
+                    ssize_t w = send(cfd, buf + off, (size_t)r - off, 0);
+                    if (w <= 0) { if (errno == EINTR) continue; free(buf); goto done; }
+                    off += (size_t)w;
+                }
+            }
+            free(buf);
+        }
+    }
+done:
+    if (fd >= 0) close(fd);
+    close(cfd);
+}
+
+static BOOL akun_tipa_server_ensure(void) {
+    if (gTipaFD >= 0) return YES;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NO;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;                              // 内核分配，避免撞端口
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 8) < 0) {
+        close(fd);
+        return NO;
+    }
+    struct sockaddr_in bound;
+    socklen_t bl = sizeof(bound);
+    if (getsockname(fd, (struct sockaddr *)&bound, &bl) < 0) { close(fd); return NO; }
+    gTipaPort = ntohs(bound.sin_port);
+    gTipaFD = fd;
+    gTipaQueue = dispatch_queue_create("com.akun.bridge.tipa-http", DISPATCH_QUEUE_SERIAL);
+    gTipaSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, gTipaQueue);
+    dispatch_source_set_event_handler(gTipaSource, ^{
+        int cfd = accept(fd, NULL, NULL);
+        if (cfd < 0) return;
+        NSString *p = gTipaPath;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            akun_tipa_serve(cfd, p);
+        });
+    });
+    dispatch_resume(gTipaSource);
+    NSLog(@"[aux] tipa http server on 127.0.0.1:%u", (unsigned)gTipaPort);
+    return YES;
+}
+
 #pragma mark - 辅助功能（对标 AKUN 19940 指令集，传输仍走我们自己的 WS）
 
 - (NSDictionary *)handleAux:(NSDictionary *)cmd {
@@ -1546,42 +1639,66 @@ static NSDictionary *akunPostNotifications(id rawNames) {
         return @{ @"success" : @(rc == 0), @"code" : @(rc), @"output" : (out ?: @""), @"package" : pkg, @"source" : @"root-dpkgd" };
     }
     if ([a isEqualToString:@"install_tipa"]) {
+        // 1:1 对齐 AKUN TVNCInstallTipa：不自己解包，交给 TrollStore（它负责签名）
         NSString *path = cmd[@"path"];
         if (![path isKindOfClass:[NSString class]] || path.length == 0) {
             return @{ @"success" : @NO, @"error" : @"missing path" };
         }
-        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"文件不存在: %@", path] };
+        if (![path isAbsolutePath] || [path rangeOfString:@".."].location != NSNotFound) {
+            return @{ @"success" : @NO, @"error" : @"invalid path" };
         }
-        // tipa 是 zip 包（内含 Payload/xxx.app）：由 root dpkgd 解到 /Applications 再 uicache 刷图标
-        NSString *out = nil;
-        int rc = -1;
-        NSData *local = [NSData dataWithContentsOfFile:path];
-        if (!local.length) {
-            return @{ @"success" : @NO, @"error" : @"daemon 读不到该文件", @"path" : path };
+        if (!([path hasPrefix:@"/tmp/"] || [path hasPrefix:@"/var/mobile/"])) {
+            return @{ @"success" : @NO, @"error" : @"path must be under /tmp/ or /var/mobile/" };
         }
-        NSString *dest = @"@jb/var/mobile/Documents/akun_install.ipa";
-        const NSUInteger chunk = 8192;
-        long long off = 0;
-        while (off < (long long)local.length) {
-            NSUInteger n = (NSUInteger)MIN((long long)chunk, (long long)local.length - off);
-            NSData *piece = [local subdataWithRange:NSMakeRange((NSUInteger)off, n)];
-            NSString *b64 = [piece base64EncodedStringWithOptions:0];
-            NSString *head = [NSString stringWithFormat:@"PUTA %@ %lld %lu\n", dest, off, (unsigned long)b64.length];
-            int prc = -1; NSString *po = nil;
-            akun_root_cmd_body(head, [b64 dataUsingEncoding:NSUTF8StringEncoding], &prc, &po);
-            if (prc != 0) {
-                return @{ @"success" : @NO, @"error" : @"推送包到 root 侧失败", @"offset" : @(off),
-                          @"detail" : (po ?: @""), @"path" : path };
+        NSString *lowerPath = path.lowercaseString;
+        if (!([lowerPath hasSuffix:@".tipa"] || [lowerPath hasSuffix:@".ipa"])) {
+            return @{ @"success" : @NO, @"error" : @"only .tipa/.ipa are accepted" };
+        }
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) {
+            return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"file not found: %@", path] };
+        }
+        if (cmd[@"size"]) {
+            long long want = [cmd[@"size"] longLongValue];
+            long long have = (long long)[[fm attributesOfItemAtPath:path error:nil] fileSize];
+            if (want > 0 && have != want) {
+                return @{ @"success" : @NO,
+                          @"error" : [NSString stringWithFormat:@"size mismatch: have %lld want %lld", have, want] };
             }
-            off += (long long)n;
         }
-        NSData *raw = akun_root_cmd([NSString stringWithFormat:@"TIPAQ %@", dest], &rc, &out);
-        if (!raw.length) { return @{ @"success" : @NO, @"error" : @"dpkgd 未响应（19949 不通）", @"path" : path }; }
-        NSLog(@"[aux] install_tipa rc=%d", rc);
-        return @{ @"success" : @(rc == 0), @"code" : @(rc), @"output" : (out ?: @""),
-                  @"source" : @"root-dpkgd",
-                  @"note" : @"tipa 走 /Applications 解包 + uicache；未签名应用需设备本身允许（TrollStore/已签名）" };
+        if (!akun_tipa_server_ensure()) {
+            return @{ @"success" : @NO, @"error" : @"cannot start local http server on 127.0.0.1" };
+        }
+        gTipaPath = path;
+
+        NSString *ext = path.pathExtension.lowercaseString;
+        // URL 里统一用 ASCII 占位名：中文名 percent-encode 后交给 TrollStore 有二次解码风险，
+        // 本机 HTTP 只服务"当前这一个文件"、不校验请求路径，叫什么无所谓，扩展名保住即可
+        NSString *serveName = [NSString stringWithFormat:@"package.%@", ext.length ? ext : @"tipa"];
+        NSString *u = [NSString stringWithFormat:@"apple-magnifier://install?url=http://127.0.0.1:%u/%@",
+                       (unsigned)gTipaPort, serveName];
+
+        id ws = akun_appWorkspace();
+        NSURL *url = [NSURL URLWithString:u];
+        BOOL ok = NO;
+        if (ws && url) {
+            if ([ws respondsToSelector:NSSelectorFromString(@"openURL:")]) {
+                ok = akun_bool1(ws, @"openURL:", url);
+            }
+            if (!ok && [ws respondsToSelector:NSSelectorFromString(@"openSensitiveURL:withOptions:")]) {
+                SEL s = NSSelectorFromString(@"openSensitiveURL:withOptions:");
+                BOOL (*fn)(id, SEL, id, id) = (BOOL (*)(id, SEL, id, id))objc_msgSend;
+                ok = fn(ws, s, url, @{});
+            }
+        }
+        NSLog(@"[aux] install_tipa -> %@ opened=%d", u, ok);
+        if (!ok) {
+            return @{ @"success" : @NO, @"path" : path, @"url" : u,
+                      @"error" : @"TrollStore unavailable: apple-magnifier:// 没人接管（未装巨魔？）" };
+        }
+        return @{ @"success" : @YES, @"path" : path, @"url" : u, @"port" : @(gTipaPort),
+                  @"via" : @"TrollStore(apple-magnifier)",
+                  @"note" : @"已在设备上交给 TrollStore，会弹安装确认框，需人工点一次 Install" };
     }
     if ([a isEqualToString:@"screenshot"]) {
         // 1:1 对齐 AKUN TVNCScreenshot：quality 是 0~100（默认 75），format = jpeg（默认）/ png，
