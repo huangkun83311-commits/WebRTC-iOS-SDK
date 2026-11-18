@@ -185,6 +185,9 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
         base = [@"ws://" stringByAppendingString:[base substringFromIndex:7]];
     } else if ([base hasPrefix:@"https://"]) {
         base = [@"wss://" stringByAppendingString:[base substringFromIndex:8]];
+    } else if (base.length && ![base hasPrefix:@"ws://"] && ![base hasPrefix:@"wss://"]) {
+        // 允许直接写 "192.168.1.18:8080" 这种裸 host:port
+        base = [@"ws://" stringByAppendingString:base];
     }
     while ([base hasSuffix:@"/"]) {
         base = [base substringToIndex:base.length - 1];
@@ -246,13 +249,23 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
         NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
         self.session = [NSURLSession sessionWithConfiguration:cfg];
     }
-    NSURL *url = [NSURL URLWithString:[self wsURLString]];
-    if (!url) {
-        NSLog(@"[rtc] 信令地址不合法: %@", [self wsURLString]);
+    NSString *wsString = [self wsURLString];
+    NSURL *url = [NSURL URLWithString:wsString];
+    // 硬校验：scheme 必须是 ws/wss 且有 host，否则 NSURLSession 会抛
+    // NSGenericException（未捕获直接整进程崩），这是装完默认 auto 配置时的崩因。
+    if (!url || !url.host.length ||
+        !([[url.scheme lowercaseString] isEqualToString:@"ws"] ||
+          [[url.scheme lowercaseString] isEqualToString:@"wss"])) {
+        NSLog(@"[rtc] 信令地址不合法，暂不连接: %@", wsString);
         return;
     }
     NSLog(@"[rtc] 连接信令 %@", url);
-    self.ws = [self.session webSocketTaskWithURL:url];
+    @try {
+        self.ws = [self.session webSocketTaskWithURL:url];
+    } @catch (NSException *e) {
+        NSLog(@"[rtc] 建 WebSocket 失败（已捕获，不崩）: %@", e.reason);
+        return;
+    }
     [self.ws resume];
     [self receiveLoop];
     [self startStatTimer];

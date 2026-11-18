@@ -308,6 +308,8 @@ static BOOL akun_tcp_reachable(NSString *host, int port, double timeoutSec) {
         base = [@"ws://" stringByAppendingString:[base substringFromIndex:7]];
     } else if ([base hasPrefix:@"https://"]) {
         base = [@"wss://" stringByAppendingString:[base substringFromIndex:8]];
+    } else if (base.length && ![base hasPrefix:@"ws://"] && ![base hasPrefix:@"wss://"]) {
+        base = [@"ws://" stringByAppendingString:base];
     }
     while ([base hasSuffix:@"/"]) {
         base = [base substringToIndex:base.length - 1];
@@ -319,7 +321,10 @@ static BOOL akun_tcp_reachable(NSString *host, int port, double timeoutSec) {
 
 - (void)start {
     NSDictionary *prefs = [self loadPrefs];
-    self.serverBase = prefs[@"ServerBase"] ?: @"";
+    NSString *rawBase = prefs[@"ServerBase"] ?: @"";
+    // "auto" 是「留空自动发现」的写法，绝不能当成 host 直接拼进 ws URL
+    if ([[rawBase lowercaseString] isEqualToString:@"auto"]) rawBase = @"";
+    self.serverBase = rawBase;
     self.deviceId = prefs[@"DeviceId"] ?: @"dev001";
 
     // 输出参数默认值：scale 跟 AKUN 出厂一致（0.35，字体清晰度等同 AKUN），
