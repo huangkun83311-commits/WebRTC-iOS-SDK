@@ -17,7 +17,7 @@ jobs:
     # 原来跑 macos-latest：GitHub 免费 macOS arm64 runner 常年排队，15 分钟拿不到机器直接判 failed
     # （日志原文 "The job was not acquired by Runner of type hosted even after multiple attempts"）。
     # theos 在 Linux 上同样能出 arm64 deb 与 tipa（本地已实测跑通），换 ubuntu-latest 绕开排队。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -29,8 +29,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang lld llvm-14 \
             dpkg dpkg-dev xz-utils zip unzip \
-            libplist3 libssl-dev
+            libssl-dev
+          # libplist 在 22.04 叫 libplist3、24.04 起改叫 libplist-2.0-3（提供同一个 soname
+          # libplist-2.0.so.3），写成 fallback，避免 runner 换版本时 apt 直接 exit 100
+          sudo apt-get install -y --no-install-recommends libplist3 \
+            || sudo apt-get install -y --no-install-recommends libplist-2.0-3
           clang --version | head -1
+          ldconfig -p | grep libplist | head -2
 
       - name: Set up Go (服务端交叉编译)
         uses: actions/setup-go@v5
