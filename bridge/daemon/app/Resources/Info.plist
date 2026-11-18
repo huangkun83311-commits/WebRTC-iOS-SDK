@@ -4,10 +4,10 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
 	<key>CFBundleExecutable</key><string>akunbridge</string>
-	<key>CFBundleIdentifier</key><string>com.akun.bridge.manager</string>
+	<key>CFBundleIdentifier</key><string>com.akun.bridge.app</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>AKUNBridge</string>
-	<key>CFBundleDisplayName</key><string>AKUN 远控</string>
+	<key>CFBundleDisplayName</key><string>AKUN Bridge</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>1.0.0</string>
 	<key>CFBundleVersion</key><string>1</string>
