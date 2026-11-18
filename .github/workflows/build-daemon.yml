@@ -29,7 +29,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang lld llvm-14 \
             dpkg dpkg-dev xz-utils zip unzip \
-            libssl-dev
+            libssl-dev libplist-dev
           # libplist 在 22.04 叫 libplist3、24.04 起改叫 libplist-2.0-3（提供同一个 soname
           # libplist-2.0.so.3），写成 fallback，避免 runner 换版本时 apt 直接 exit 100
           sudo apt-get install -y --no-install-recommends libplist3 \
@@ -54,12 +54,21 @@ jobs:
           # theos 仓库不自带 Linux 交叉工具链，按约定在 toolchain/linux/iphone/bin 建软链指向系统工具
           mkdir -p "$THEOS/toolchain/linux/iphone/bin"
           for t in clang clang++ ar nm strip ranlib; do
-            src=$(command -v "$t") && ln -sf "$src" "$THEOS/toolchain/linux/iphone/bin/$t"
+            if src=$(command -v "$t"); then
+              ln -sf "$src" "$THEOS/toolchain/linux/iphone/bin/$t"
+            else
+              echo "警告：系统没有 $t"
+            fi
           done
           ln -sf "$(command -v ld.lld)" "$THEOS/toolchain/linux/iphone/bin/ld"
           ln -sf "$(command -v ld.lld)" "$THEOS/toolchain/linux/iphone/bin/ld.lld"
-          # theos 自带 Linux 版 ldid（ELF，依赖 libplist-2.0.so.3 → apt libplist3）
-          ls -l "$THEOS/bin/ldid"
+          # theos 仓库里没有 bin/ldid（上一版 CI 就死在 `ls $THEOS/bin/ldid` 这一行，
+          # ls 找不到文件退出码正好是 2，跟报的 exit code 2 对得上）。Linux 版只能自己编。
+          git clone --depth 1 --recursive https://github.com/ProcursusTeam/ldid.git /tmp/ldid-src
+          ( cd /tmp/ldid-src && make -j"$(nproc)" )
+          mkdir -p "$THEOS/bin"
+          cp /tmp/ldid-src/ldid "$THEOS/bin/ldid"
+          chmod +x "$THEOS/bin/ldid"
           "$THEOS/bin/ldid" 2>&1 | head -1
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           ls "$THEOS/sdks"
