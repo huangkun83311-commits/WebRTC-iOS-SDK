@@ -131,6 +131,23 @@ jobs:
             done
           done
 
+      - name: 上传编译日志（失败时，公开可下载）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          mkdir -p /tmp/logs
+          for f in /tmp/deb.log /tmp/tipa.log /tmp/server.log; do
+            [ -f "$f" ] && cp "$f" /tmp/logs/ || true
+          done
+          ls -l /tmp/logs || true
+          for f in /tmp/logs/*; do
+            tail -c 200000 "$f" > "$f.tail" && mv "$f.tail" "$f"
+            gh release upload daemon-latest "$f" --clobber --repo "$GITHUB_REPOSITORY" \
+              && echo "已上传 $(basename $f)" || echo "上传失败 $(basename $f)"
+          done
+
       - name: Upload deb
         if: always()
         uses: actions/upload-artifact@v4
