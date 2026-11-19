@@ -13,7 +13,7 @@ export PATH
 
 exec 3>&1 >/dev/null 2>&1
 
-LABEL="com.akun.bridge"
+LABEL="com.akun.akund"
 LOG="/tmp/akun-bridge-postinst.log"
 
 log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
@@ -139,27 +139,28 @@ else
     log "结果：daemon 未登记（看上面日志与 /tmp/akund-stderr.log）"
 fi
 
+# --- 清理旧 label（com.akun.bridge 与 App bundle id 冲突，roothide 会报 109）---
+for OLD in com.akun.bridge com.akun.bridge.dpkgd; do
+    launchctl bootout system/$OLD >/dev/null 2>&1
+    launchctl unload -w /Library/LaunchDaemons/$OLD.plist >/dev/null 2>&1
+    rm -f /Library/LaunchDaemons/$OLD.plist /var/jb/Library/LaunchDaemons/$OLD.plist 2>/dev/null
+done
+log "旧 label 已清理"
+
 log "--- akund-stderr.log 尾部 ---"
 tail -15 /tmp/akund-stderr.log >> "$LOG" 2>&1
 
 # --- 给 daemon 准备 dpkg 快照 ---
 # daemon 以 mobile(501) 身份跑，/var/lib 是 700 root:wheel，mobile 连目录都列不出来，
 # 所以由 root 在这里导出一份到 mobile 可读的位置，list_packages 读它。
-# --- root 侧 dpkg 数据助手（com.akun.bridge.dpkgd）---
-# RootHide 下 daemon（注入进程）与 root 的 /var/mobile 是两套视图，写文件 daemon 读不到，
-# 所以改成 root 小助手监听回环 TCP 19949，daemon 连它取 dpkg status 原文。
-DPKGD_PLIST="/Library/LaunchDaemons/com.akun.bridge.dpkgd.plist"
-[ -f "$DPKGD_PLIST" ] || DPKGD_PLIST="/var/jb/Library/LaunchDaemons/com.akun.bridge.dpkgd.plist"
-chown root:wheel "$DPKGD_PLIST" 2>/dev/null
-chmod 644 "$DPKGD_PLIST" 2>/dev/null
+# --- root 侧 dpkg 助手已并入主 daemon ---
+# 白巨魔(roothide) 的 launchd 同一时刻只接受第一个 bootstrap，第二个 job 报 109，
+# 因此不再下发独立 dpkgd plist：-daemon 进程自己在内部起线程监听 19949。
+# 这里只负责把历史上遗留的 dpkgd job 清掉，避免端口被旧进程占住。
 launchctl bootout system/com.akun.bridge.dpkgd >/dev/null 2>&1
+rm -f /Library/LaunchDaemons/com.akun.bridge.dpkgd.plist /var/jb/Library/LaunchDaemons/com.akun.bridge.dpkgd.plist 2>/dev/null
+killall -9 akund 2>/dev/null
 sleep 2
-launchctl bootstrap system "$DPKGD_PLIST" >/dev/null 2>&1 || launchctl load -w "$DPKGD_PLIST" >/dev/null 2>&1
-sleep 2
-# 关键：KeepAlive 进程在二进制被替换后不会自己换映像，必须 kickstart -k 强制重启，
-# 否则 dpkgd 一直跑旧代码（实测 TIPAQ 布局修正不生效就是这个原因）
-launchctl kickstart -k system/com.akun.bridge.dpkgd >/dev/null 2>&1
-sleep 1
-log "dpkgd($DPKGD_PLIST) 已 bootstrap + kickstart"
+log "dpkgd 已并入主 daemon（19949 由 -daemon 进程内提供）"
 
 exit 0

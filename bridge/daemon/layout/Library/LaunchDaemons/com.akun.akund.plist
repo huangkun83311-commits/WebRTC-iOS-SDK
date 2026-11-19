@@ -2,15 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleIdentifier</key>
-	<string>com.akun.bridge.dpkgd</string>
 	<key>Label</key>
-	<string>com.akun.bridge.dpkgd</string>
+	<string>com.akun.akund</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/bin/akund</string>
-		<string>--dpkgd</string>
-		<string>19949</string>
+		<string>-daemon</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -18,9 +15,14 @@
 	<true/>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>DISABLE_TWEAKS</key>
+		<string>1</string>
+	</dict>
 	<key>StandardErrorPath</key>
-	<string>/tmp/akun-dpkgd.log</string>
+	<string>/tmp/akund-stderr.log</string>
 	<key>StandardOutPath</key>
-	<string>/tmp/akun-dpkgd-out.log</string>
+	<string>/tmp/akund-stdout.log</string>
 </dict>
 </plist>

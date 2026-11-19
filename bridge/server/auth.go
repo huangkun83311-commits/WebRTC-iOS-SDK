@@ -80,7 +80,7 @@ func authOK(r *http.Request) bool {
 func handleAuth(w http.ResponseWriter, r *http.Request) {
 	if !authEnabled() {
 		writeJSON(w, map[string]interface{}{
-			"ok": false,
+			"ok":   false,
 			"note": "服务端没开授权（启动参数没给 -key）。局域网直接用 http://<ip>:8080/?room=dev001 即可",
 		})
 		return
@@ -104,11 +104,11 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	link := fmt.Sprintf("%s://%s/?room=%s&k=%s", scheme, host, dev, tok)
 	writeJSON(w, map[string]interface{}{
-		"ok":     true,
-		"device": dev,
-		"key":    tok,
-		"expire": expire,
+		"ok":       true,
+		"device":   dev,
+		"key":      tok,
+		"expire":   expire,
 		"expireAt": time.Unix(expire, 0).Format("2006-01-02 15:04"),
-		"url":    link,
+		"url":      link,
 	})
 }

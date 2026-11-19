@@ -23,6 +23,7 @@ extern double gLastInputMono;   // AkunInjector.mm 里打点：最后一次触�
 #import <CoreImage/CoreImage.h>
 #import <Metal/Metal.h>
 #import <dlfcn.h>
+#import <mach/mach_time.h>
 
 #import "vendor/UIScreen+Private.h"
 
@@ -47,7 +48,10 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
 
 @implementation AkunCapture {
     dispatch_queue_t _queue;
+    dispatch_queue_t _paceQueue;     // 节拍专用队列：定时器只在这里排队，绝不被抓帧耗时拖住
+    dispatch_semaphore_t _frameGate;// 抓帧门：上一帧还没跑完就丢掉这一拍（不排队、不追帧）
     dispatch_source_t _timer;
+    BOOL _loopRunning;               // 自驱动节拍循环开关（见 frameTick）
     RenderDisplayFn _renderDisplay;
     GetDirtyFrameCountFn _dirtyFrameCount;
     CFIndex _lastDirtyCount;
@@ -74,7 +78,9 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     double _prepMsAvg;            // 准备一帧（渲染+缩图+推帧）的滑窗平均耗时，闸门提前量用
     double _costMsAvg;            // 单帧总耗时的跨窗口平均，「唤醒即发」用它判断流水线是否已空出来
     int _burstCount;              // 本窗口内「唤醒即发」的次数（用于验证这一帧真的没排队）
-    double _pacePadSec;
+    double _pacePadSec;          // 已废弃（保留仅日志兼容）：节拍改由 _nextDeadline 累积
+    NSTimeInterval _nextDeadline;// 下一帧应出的绝对时刻，保证平均帧率精确等于设定值
+    int _idleTicks;              // 连续「画面没变」的拍数，够了才判静止
     double _dirtyMsSum;
     double _scaleGpuMsSum;       // 缩图里「GPU 那一段」的耗时合计
     int    _scaleGpuFrames;      // 走 GPU 成功的帧数
@@ -99,6 +105,13 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
 - (instancetype)init {
     if ((self = [super init])) {
         _queue = dispatch_queue_create("com.akun.capture", DISPATCH_QUEUE_SERIAL);
+        _paceQueue = dispatch_queue_create("com.akun.capture.pace", DISPATCH_QUEUE_SERIAL);
+        // ★ 后台 launchd 进程默认是低 QoS，dispatch 定时器会被系统合并（实测 30 档帧距 44.9ms、
+        //   60 档 40ms，跟设定值完全无关 —— 申请 2ms 实际只给 ~40ms 的闹钟）。
+        //   两个队列都挂到 USER_INTERACTIVE，定时器才按申请值触发、抓帧也不被降频。
+        dispatch_set_target_queue(_queue, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
+        dispatch_set_target_queue(_paceQueue, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
+        _frameGate = dispatch_semaphore_create(1);
         _fps = kDefaultFPS;
         _renderDisplay = (RenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
         _dirtyFrameCount = (GetDirtyFrameCountFn)dlsym(RTLD_DEFAULT, "CARenderServerGetDirtyFrameCount");
@@ -387,115 +400,20 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
 
     NSTimeInterval now = CACurrentMediaTime();
 
-    // 「跟手升帧」：用户正在操作的那 1.2 秒里把帧率临时抬到 40。
-    // 30fps 的最大问题是「点了以后还得等下一帧」，平均白等 17ms、最坏 33ms；
-    // 抬手期间 40fps 把这段压到 25ms 满格 —— 只在操作瞬间生效，停手立刻回落，
-    // 所以不会像常驻 45fps 那样两分钟就热降频。
-    int fpsNow = _activeFps;
-    if ((now - gInteractMono) < 1.2 && fpsNow < 40) { fpsNow = 40; }
-
-    // 先做「该不该出帧」的时间判断，再查脏图：_dirtyFrameCount 是系统调用，
-    // 2ms 轮询下每秒 500 次会把渲染拖慢（实测 6ms → 19ms）。时间没到就绝不查脏。
-    double minGap = 1.0 / (double)MAX(1, fpsNow);
-    double prep = MIN(_prepMsAvg / 1000.0, minGap * 0.9);
-    // prep 抵扣让流水线能提前开跑，但会让实际帧率超过声明值（实测 45fps 档跑到 54fps，
-    // 多出来的帧既不加手感，只是在加热机器）。这里给超发封顶 +2fps。
-    // 注意：封顶必须也减掉 prep，否则「等待 31.25ms + 处理 13.9ms」= 实际周期 45ms，
-    // prep 抵扣被吃掉 → 30fps 档实测只有 24.6fps（帧距 40.7ms，2026-11-17 实测）。
-    double minGapClamp = 1.0 / (double)(fpsNow + 2);
-    double gapNeed = MAX(minGap - prep, minGapClamp - prep);
-    BOOL timeOk = (now - _lastPushMono >= gapNeed + _pacePadSec);
-    // 心跳帧：原来静止 2 秒才保活一帧，接收端浏览器会把"帧不来了"记成 freeze
-    // （freezeCount + totalFreezesDuration），jitter buffer 也会被养到 50ms+；
-    // 而且静止时画面最多滞后 2 秒。改成 0.15s 一帧"重复上一帧"的极小 P 帧：
-    // 接收端永远有帧、缓冲收窄、画面永远新鲜，代价只有编码器空跑（无抓屏无缩图）。
+    // ★ 口径：设多少就跑多少。这里先做「无条件满速」：
+    //   实测这台机器 CARenderServer 的 _dirtyFrameCount 喂回来的值不可靠 ——
+    //   画面明明在滑，判定却一直是「没变」，于是被 idle 节流卡到 100ms 一拍（滑动期间 10fps）。
+    //   所以这一步先把脏图/idle/心跳全部绕开，只按 deadline 出帧，先证明「节拍本身能跑满」；
+    //   静止降帧再用可靠手段单独补，不跟满速验证混在一起。
+    int fpsNow = (_activeFps > 0) ? _activeFps : _fps;
+    double interval = 1.0 / (double)MAX(1, fpsNow);
+    if (_nextDeadline <= 0.0) { _nextDeadline = now; }
+    if (now + 1e-4 < _nextDeadline) { return; }
+    BOOL heartbeat = NO;
     const double kHeartbeatSec = 0.150;
-    BOOL keepaliveDue = (now - _lastPushTime >= kHeartbeatSec);
-    // 「唤醒即发」：长时间静止后画面第一次变化（= 用户点了、开了应用），
-    // 不排队等下一拍，只要流水线已经空出来就立刻出帧 —— 这一帧省掉最多半个帧间隔。
-    // 注意：静止期间允许按「流水线空闲」的节奏去查脏图（约 cost 一次，16ms），
-    // 但只有真的变了才插队出帧；没变就继续等，否则会变成静止画面也狂渲染（烧 CPU）。
-    // 探测间隔必须省着用：实测 _dirtyFrameCount(NULL) 单次 3~7ms（perf 里的「脏图」列），
-    // 按 2~8ms 节奏查一次等于每秒烧掉 400~800ms CPU，渲染会从 10ms 掉到 19ms 且把机器烧热。
-    // 所以：静止期 100ms 一查（10 次/秒 ≈ 90ms/s，约 5% 一个核）；点下去那一刻走
-    // forceNow 强制出帧，不再依赖探测频率。
-    // 用户正在操作（1.5s 内有过点击/滑动）：不再等脏图，直接出帧。
-    // 触摸必然改变画面，等探测只是白等；交互期强制出帧后，
-    // 静止期的脏图探测就可以放心放慢，CPU 从半个核降到 5% 以下。
-    BOOL forceNow = (gInteractMono > 0.0) && ((now - gInteractMono) < 1.5) && (gInteractMono > 0.0);
-    // 交互期允许插队，但必须封顶：原来只要 1.5s 内有触摸就无条件出帧，
-    // 实测连续点击会跑到 113fps（渲染 5.2ms + 缩图 3.0ms + 编码 7ms ≈ 单核打满），
-    // 而跟手已经到 10~17ms 的单帧级别，再快手感不会更好，只会发热降频。
-    // 交互期按 fps+4 硬闸；静止唤醒的第一帧不受影响（那帧间隔本来远超闸门）。
-    if (forceNow && (now - _lastPushMono) < 1.0 / (double)(fpsNow + 4)) { return; }
-    // 关键：静止时不能再走 timeOk。timeOk 在静止期永远成立（距上次推帧已经 2 秒），
-    // 结果每个 2ms 轮询都去查一次脏图 —— 实测 2 秒烧掉 900ms CPU（半个核），
-    // 机器持续发热，十几分钟后热降频，正是"越用越卡"的来源。
-    // 静止时按 100ms 节奏探测；用户一动手 forceNow 直接出帧，不依赖探测频率。
-    const double kIdleProbeSec = 0.100;
-    BOOL idleish = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) > 0.35);
-    BOOL mayProbe = forceNow || keepaliveDue ||
-                    (idleish ? ((now - _lastProbeMono) >= kIdleProbeSec) : timeOk);
-    if (!mayProbe) { return; }
-    _lastProbeMono = now;
 
-    BOOL changed = YES;
-    // 画面显然在动的时候（0.45s 内刚变过）不必每帧都去查脏图 —— 那是在白烧 CPU。
-    // 每 4 帧校准一次足够把「动→静」判出来，实测省掉约 75% 的脏图调用。
-    BOOL recentlyActive = (_lastChangeMono > 0.0) && ((now - _lastChangeMono) < 0.45);
-    BOOL skipDirty = NO;
-    if (_dirtyFrameCount && recentlyActive) {
-        _dirtySkipTick++;
-        if ((_dirtySkipTick & 3) != 0) { skipDirty = YES; }
-    }
-    if (forceNow) { changed = YES; _lastChangeMono = now; }
-    if (!forceNow && _dirtyFrameCount && !skipDirty) {
-        NSTimeInterval d0 = CACurrentMediaTime();
-        CFIndex c = _dirtyFrameCount(NULL);
-        _dirtyMsSum += (CACurrentMediaTime() - d0) * 1000.0;   // 脏图检测自身开销，算进 perf
-        changed = (c != _lastDirtyCount);
-        if (changed) {
-            _lastChangeMono = now;
-            // 设备侧细分：从触摸注入到「发现画面变了」（含 Safari 重绘 + 我们的探测等待）
-            if (gLastInputMono > 0.0) {
-                double d = (now - gLastInputMono) * 1000.0;
-                if (d >= 0.0 && d < 2000.0) { NSLog(@"[lat] 注入→检测 %.1fms", d); }
-            }
-        }
-        _lastDirtyCount = c;
-    }
-    // 判定「正在动」还是「静止」：最近 0.5s 内变过就算在动（视频/游戏里某一 tick 恰好没变不算静止）。
-    // 在动 -> 按 fps 闸门满速推；静止 -> 只保留 2s 一帧保活，上行几乎归零。
-    BOOL idle = (!changed && (now - _lastChangeMono) > 0.5);
-    BOOL heartbeat = idle;
-    if (idle) {
-        if (now - _lastPushTime < kHeartbeatSec) { return; }
-    } else {
-        if (!timeOk) {
-            // 只有「从静止被唤醒并且真的变了」的那一帧才允许插队，持续动画仍受 fps 闸门管。
-            // 交互期（forceNow）允许插队；其余只有「刚刚真的变了」这一帧可以插队。
-            if (!(changed && (forceNow || (idleish && (now - _lastProbeMono) < kIdleProbeSec * 1.5)))) { return; }
-            _burstCount++;
-        }
-    }
-
-    // 节拍闭环修正（在真正出帧前算，用的是上一帧的真实间隔）
-    {
-        double gap = now - _lastPushMono; // 上一帧到本帧的间隔
-        double target = 1.0 / (double)MAX(1, _activeFps);
-        if (gap > 0 && gap < 1.0) {
-            // 只做小幅修正：上限 15% 周期（约 5ms@30fps），回落按超时的 30% 一次扣到底。
-            // 老实现上限 70%（23ms）且每帧只降 1ms，会把 pad 卡在 15ms 以上，
-            // 出帧周期从 33ms 被拖到 48~150ms（实测帧距 149.6ms，perf 仅 6.7fps）。
-            double padMax = target * 0.15;
-            if (gap < target - 0.001) {
-                _pacePadSec = MIN(_pacePadSec + (target - gap) * 0.5, padMax);
-            } else if (gap > target + 0.001) {
-                double over = gap - target;
-                _pacePadSec = MAX(_pacePadSec - MIN(_pacePadSec, over * 0.3), 0.0);
-            }
-        }
-    }
+    // ★ 节拍闭环修正已删除：改由 _nextDeadline 绝对累积（见函数开头的 timeOk 与出帧后的推进）。
+    //   老 pad 修正是「距上次推帧结束的时间」，把每帧处理耗时重复计进周期，是 20fps 的病根。
 
     // 心跳帧：画面没变，直接把上一帧缩放结果再送一次编码器。
     // 抓屏(surface 渲染) + 缩图 一帧要 20ms，静止期每秒 6 次就是 120ms CPU；
@@ -506,6 +424,9 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
         if (again) { CVPixelBufferRelease(again); }
         _lastPushTime = CACurrentMediaTime();
         _lastPushMono = _lastPushTime;
+        // 静止期下一拍就是心跳时刻（不再清 0）：自驱动循环靠这个值算该睡多久，
+        // 清 0 会让它每 1ms 醒一次空转。
+        _nextDeadline = _lastPushTime + kHeartbeatSec;
         _perfFrames++;              // 心跳也计一次，但下面只累加推帧耗时（其它列保持原值）
         _pushMsSum += (CACurrentMediaTime() - _lastPushTime) * 1000.0;
         [self finishPerfWindowIfNeeded:_lastPushTime];
@@ -533,6 +454,16 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     _cur = 1 - _cur;
     _lastPushTime = CACurrentMediaTime();
     _lastPushMono = _lastPushTime;
+
+    // 节拍推进（必须在渲染之后、缩图之前算）：deadline 按固定 interval 累加，
+    // 与这一帧花掉多少处理时间无关 → 平均帧率精确等于设定值（设 45 就跑 45）。
+    // 若已经落后一整个周期（被系统卡住/主线程抢），重定基准，宁可丢帧也不连发追帧——
+    // 追帧会让画面忽快忽慢，比少一帧更伤观感。
+    {
+        NSTimeInterval nn = CACurrentMediaTime();
+        _nextDeadline += interval;
+        if (_nextDeadline < nn) { _nextDeadline = nn + interval; }
+    }
 
     CVPixelBufferRef out = [self scaleFrame:pbuf];
     NSTimeInterval t2 = CACurrentMediaTime();
@@ -598,28 +529,57 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
     _scaleGpuMsSum = 0; _scaleGpuFrames = 0; _scaleCpuFrames = 0;
     _perfWindowStart = now;
 
-    // 降档只用于「真的跑不动」：单帧耗时明显超过帧预算才会持续掉帧。
-    // 以前用 cost>budget*0.85 判，导致 45fps 下每窗口都判超，一路砍到 12fps（延迟暴涨到 149ms）。
-    // 抓屏帧率本身就是延迟的主要来源，所以保底 24fps，宁可轻微掉帧也不牺牲手感。
-    int fpsFloor = MIN(24, _fps);
-    if (costMs > budgetMs * 1.15) {
+    // ★ 不降帧：口径是「设 45 就跑满 45」，掉帧本身就是「顿」的来源。
+    //   只有单帧耗时超过预算 3 倍且连续 6 个窗口（机器真的扛不住）才小幅降，
+    //   且不低于 _fps*0.8，杜绝老实现「30 档一路掉到 20」。
+    int fpsFloor = MAX(8, (int)(_fps * 0.8));
+    if (costMs > budgetMs * 3.0) {
         _lowStreak++; _highStreak = 0;
-        if (_lowStreak >= 3 && _activeFps > fpsFloor) {
-            int v = MAX(fpsFloor, _activeFps - 4);
+        if (_lowStreak >= 6 && _activeFps > fpsFloor) {
+            int v = MAX(fpsFloor, _activeFps - 2);
             _activeFps = v; _lowStreak = 0;
             [self applyTimerFps:v];
-            NSLog(@"[perf] 单帧耗时 %.1fms 超预算 %.1fms，抓屏降到 %d fps（防掉帧）", costMs, budgetMs, v);
+            NSLog(@"[perf] 单帧耗时 %.1fms 超预算 3 倍 %.1fms，抓屏临时降到 %d fps（真扛不住才降）", costMs, budgetMs, v);
         }
     } else if (costMs < budgetMs * 0.75) {
         _highStreak++; _lowStreak = 0;
         if (_highStreak >= 2 && _activeFps < _fps) {
-            int v = MIN(_fps, _activeFps + 3);
+            int v = MIN(_fps, _activeFps + 2);
             _activeFps = v; _highStreak = 0;
             [self applyTimerFps:v];
-            NSLog(@"[perf] 余量充足，抓屏升回 %d fps", v);
+            NSLog(@"[perf] 余量充足，抓屏升回设定 %d fps", v);
         }
     } else {
         _lowStreak = 0; _highStreak = 0;
+    }
+}
+
+- (void)frameTick {
+    // ★ 节拍：自旋等到 deadline，不再依赖任何「睡到某时刻」。
+    //   本机实测（同一套抓屏/编码链路，仅换节拍手段）：
+    //     dispatch_source 周期定时器：申请 2ms → 实际 ~40ms（30/60 档帧距几乎一样）
+    //     dispatch_after 一次性定时：请求 150ms → 实际 ~100ms
+    //     mach_wait_until：请求 33ms → 实际 1173ms（这台 rootless 设备上 timebase 换算异常）
+    //     nanosleep：请求 ~19ms → 实际 ~85ms（后台 daemon 的睡眠被系统按 ~100ms 粒度合并）
+    //   →「睡到某时刻」在这里全部不可靠，只能用相对距离判断 + 末段自旋补齐。
+    //   策略：离 deadline 还远（>2ms）就粗睡一次 2ms 让出 CPU；进入末段就自旋等到点。
+    //   若一次粗睡就睡过了 deadline，就直接出帧（由 grabOneFrame 的 deadline 重基准把节奏拉回），
+    //   绝不连发补帧（会卡死）。
+    while (_loopRunning) {
+        @autoreleasepool {
+            [self grabOneFrame];
+            if (!_loopRunning) { break; }
+            int guard = 0;
+            while (_loopRunning && (++guard) < 4000) {
+                NSTimeInterval rest = _nextDeadline - CACurrentMediaTime();
+                if (rest <= 0.0) { break; }
+                if (rest > 0.002) {
+                    // 让出 CPU 但保持 runnable：sched_yield 会立即被重新调度，
+                    // 不像 nanosleep 那样被系统按 ~50ms 粒度抬（实测请求 2ms 实际 ~50ms）。
+                    sched_yield();
+                }
+            }
+        }
     }
 }
 
@@ -630,18 +590,20 @@ NSDictionary *AkunBridgeCaptureMetrics(void) { return gLastMetrics; }
         return NO;
     }
     _running = YES;
-    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
-    dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
-                              (uint64_t)(kPollSec * NSEC_PER_SEC), 0);
+    // 自驱动：起一条专用线程跑节拍循环（mach_wait_until 会阻塞该线程，所以不能占用 _queue）。
+    _loopRunning = YES;
     __weak typeof(self) weakSelf = self;
-    dispatch_source_set_event_handler(_timer, ^{ [weakSelf grabOneFrame]; });
-    dispatch_resume(_timer);
-    NSLog(@"[capture] 已启动：8ms 轮询抓变化，fps 上限 %d", _activeFps > 0 ? _activeFps : _fps);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        __strong typeof(weakSelf) s = weakSelf;
+        if (s) { [s frameTick]; }
+    });
+    NSLog(@"[capture] 已启动：自旋节拍（末段自旋补齐），满速（%d fps 上限）", _activeFps > 0 ? _activeFps : _fps);
     return YES;
 }
 
 - (void)stop {
     _running = NO;
+    _loopRunning = NO;
     if (_timer) { dispatch_source_cancel(_timer); _timer = nil; }
     if (_vTemp) { free(_vTemp); _vTemp = NULL; _vTempSize = 0; }
     for (int i = 0; i < 2; i++) {

@@ -60,6 +60,9 @@ type hub struct {
 	// 每个房间最近一次生效的画质档（授权档 / 中控档）：设备重连或换机时自动套用，
 	// 不用每次人工重下参数。key 是设备房间名（dev001），value 是 cfg 报文。
 	profiles map[string]map[string]interface{}
+	// 最近一个中控台页面连的房间（ctrl-xxx）。全局 Ctrl+V 只发这里，
+	// 页面关掉了就不发，避免在别的地方打字也往手机上塞。
+	lastPCRoom string
 }
 
 func newHub() *hub {
@@ -87,6 +90,34 @@ func (h *hub) pushRoom(room string, payload []byte) int {
 	return n
 }
 
+// pushClip 把电脑剪贴板里的文字送进设备：走设备既有的 input_text
+// （写设备剪贴板 + Cmd+V 粘贴，中文可用），并通知中控页面弹提示。
+func (h *hub) pushClip(text string) int {
+	dev, _ := json.Marshal(map[string]interface{}{
+		"t": "aux", "a": "input_text", "id": 9100, "text": text,
+	})
+	tip, _ := json.Marshal(map[string]interface{}{"t": "clipkey", "n": len([]rune(text))})
+	h.mu.RLock()
+	room := h.lastPCRoom
+	set := h.rooms[room]
+	h.mu.RUnlock()
+	if room == "" || len(set) == 0 {
+		return -1
+	}
+	n := 0
+	for c := range set {
+		switch c.role {
+		case "subscriber":
+			if err := c.send(dev); err == nil {
+				n++
+			}
+		case "pc":
+			_ = c.send(tip)
+		}
+	}
+	return n
+}
+
 func (h *hub) join(c *client) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -96,6 +127,9 @@ func (h *hub) join(c *client) int {
 		h.rooms[c.room] = set
 	}
 	set[c] = struct{}{}
+	if c.role == "pc" && strings.HasPrefix(c.room, "ctrl-") {
+		h.lastPCRoom = c.room
+	}
 	return len(set)
 }
 
@@ -401,6 +435,15 @@ func main() {
 
 	h := newHub()
 	h.profiles = map[string]map[string]interface{}{}
+	// 全局快捷键粘贴：电脑上按 Ctrl+V（前台是浏览器时），服务端直接读剪贴板下发设备。
+	startClipHotkey(func(text string) {
+		n := h.pushClip(text)
+		if n <= 0 {
+			log.Printf("[clip] 下发失败：没有中控页面在连（%d 字）", len([]rune(text)))
+			return
+		}
+		log.Printf("[clip] 已下发 %d 路设备（%d 字）", n, len([]rune(text)))
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
@@ -445,7 +488,7 @@ func main() {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 	// 在线调画质：/api/config?room=dev001&scale=0.35&fps=24&bitrate=3000000
@@ -481,7 +524,7 @@ func main() {
 			h.profiles[room][k] = v
 		}
 		h.mu.Unlock()
-		log.Printf("config room=%s sent=%d %s", room, n, payload)
+		log.Printf("config room=%s sent=%d from=%s %s", room, n, r.RemoteAddr, payload)
 		writeJSON(w, map[string]interface{}{"sent": n, "payload": string(payload)})
 	})
 
@@ -510,18 +553,18 @@ func main() {
 		// perDevKbps 是"每台可用峰值"，单位 kbps：上行 50M 走 10% 余量后按台数摊
 		perDevKbps := uplink * 1000 * 0.9 / float64(devices)
 		var scale float64
-		fps := 30
+		fps := 60
 		cap := int(perDevKbps * 1000) // bps
 		// 局域网档：流量不出局域网，不吃外网上行，所以 cap 不按 uplink/台数算，
 		// 只受 Wi-Fi 总带宽与电脑转发能力约束。几百台的瓶颈在 AP 与 CPU，不在 50M。
 		if mode == "lan" {
 			scale = 0.40
-			fps = 30
+			fps = 60
 			cap = 4000000
 		} else if mode == "grid" {
 			// 巡检缩略档：几百台同屏、每台只出一点点，点开的那台再切 lan
 			scale = 0.20
-			fps = 8
+			fps = 60
 			cap = 400000
 		} else if mode == "auth" {
 			// 授权档：授权出去几十台，但同时被看的只有 10-20 路。
@@ -534,16 +577,16 @@ func main() {
 			}
 			perConcKbps := uplink * 1000 * 0.9 / float64(conc)
 			cap = int(perConcKbps * 1000)
-			// 授权档也要看清字：0.35 在 1242x2208 上只有 434x772，中文小字必糊。
-			// 0.40 给到 497x883，cap 上限放宽到 3M（base=cap*3/5=1.8M 稳态）。
-			scale = 0.40
-			fps = 30
+			// 授权档按 11-16 那版口径（用户指定回滚，不要 0.40/3M 激进档）：
+			// cap 上限 1.5M、scale 0.35 / 30fps，基线 = cap*3/5 = 900k。
+			scale = 0.35
+			fps = 60
 			if cap < 1000000 {
-				scale = 0.35
-				fps = 24
+				scale = 0.32
+				fps = 60
 			}
-			if cap > 3000000 {
-				cap = 3000000
+			if cap > 1500000 {
+				cap = 1500000
 			}
 			if cap < 500000 {
 				cap = 500000
@@ -557,7 +600,7 @@ func main() {
 				scale = 0.35
 			default:
 				scale = 0.30
-				fps = 24
+				fps = 60
 			}
 			if cap > 4000000 {
 				cap = 4000000
@@ -604,8 +647,8 @@ func main() {
 			h.mu.Unlock()
 			p["sent"] = n
 			p["payload"] = string(payload)
-			log.Printf("preset room=%s mode=%s devices=%d perDev=%.0fkbps cap=%d scale=%.2f sent=%d",
-				room, mode, devices, perDevKbps, cap, scale, n)
+			log.Printf("preset room=%s mode=%s devices=%d perDev=%.0fkbps cap=%d scale=%.2f sent=%d from=%s",
+				room, mode, devices, perDevKbps, cap, scale, n, r.RemoteAddr)
 		}
 		writeJSON(w, p)
 	})

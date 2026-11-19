@@ -572,8 +572,10 @@ static BOOL akun_tcp_reachable(NSString *host, int port, double timeoutSec) {
                               completionHandler:^(NSError *e) {}];
                 } else {
                     NSString *ct = cmd[@"t"];
+                    // AKUN 在按下/抬起时不做额外的「连发一帧 + 抬码率」，画面是静的。
+                    // 我们原来在 d/u 上也挂了这个突发，结果是点一下画面抽一下、码率抖一下。
+                    // 现在只保留真正「整屏换页」的动作（原生的 tap/dtap/swipe/hk/home）。
                     if ([ct isEqualToString:@"tap"] || [ct isEqualToString:@"dtap"] ||
-                        [ct isEqualToString:@"d"] || [ct isEqualToString:@"u"] ||
                         [ct isEqualToString:@"swipe"] || [ct isEqualToString:@"hk"] ||
                         ([ct isEqualToString:@"k"] && [cmd[@"code"] isEqualToString:@"home"])) {
                         [self kickBurstForInteraction];
@@ -1065,6 +1067,18 @@ int main(int argc, char *argv[]) {
             int port = (argc > 2) ? atoi(argv[2]) : 19949;
             akun_run_dpkgd(port);
             return 0;
+        }
+        // 单进程兼顾 root 助手：roothide(白巨魔) 的 launchd 同一时刻只认一个 bootstrap，
+        // 第二个 job 必报 "Invalid property list"/109（实测复现两轮，成功方永远是第一个）。
+        // 所以不再单独下发 dpkgd plist，由 -daemon 进程自己起一个线程监听 19949。
+        // 前提是主 job 以 root 拉起（plist 不写 UserName 即为 root），
+        // 若以 mobile 跑，bind 后仍能服务但 dpkg/unzip 会因权限不足返回非 0，功能自然降级。
+        if (argc >= 2 && strcmp(argv[1], "-daemon") == 0) {
+            dispatch_queue_t dpkgq = dispatch_queue_create("akun.dpkgd", DISPATCH_QUEUE_SERIAL);
+            dispatch_async(dpkgq, ^{
+                akun_run_dpkgd(19949);
+            });
+            NSLog(@"[daemon] 并在本进程内起 dpkgd(19949) uid=%d", getuid());
         }
         NSLog(@"[daemon] 启动 argc=%d", argc);
         AkunRaiseJetsamLimit();

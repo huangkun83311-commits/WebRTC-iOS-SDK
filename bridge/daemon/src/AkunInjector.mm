@@ -731,6 +731,27 @@ static BOOL akun_delete_pkg_file(NSString *path) {
     return (rc == 0);
 }
 
+// 数值兜底：中控可能把 offset/size 传成字符串（"102400"），也可能传成 NSNumber。
+// 原来直接对字典值调 unsignedLongLongValue，遇到 NSTaggedPointerString 会抛
+// NSInvalidArgumentException 把 daemon 打崩（2026-11-18 10:08 实测崩溃），这里统一收口。
+static unsigned long long akun_u64(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v unsignedLongLongValue];
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)v;
+        return strtoull(s.UTF8String ?: "", NULL, 10);
+    }
+    return 0ULL;
+}
+
+static long long akun_i64(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v longLongValue];
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)v;
+        return strtoll(s.UTF8String ?: "", NULL, 10);
+    }
+    return 0LL;
+}
+
 
 #pragma mark - AKUN 对齐补充：辅助触控 / 守护重启 / Darwin 通知
 
@@ -984,6 +1005,21 @@ static BOOL akun_tipa_server_ensure(void) {
     NSString *a = cmd[@"a"] ?: cmd[@"action"];   // 兼容 AKUN 19940 风格 {"action":"xxx"}
     if (!a.length) { return @{ @"success" : @NO, @"error" : @"missing action" }; }
 
+    // 触摸三件套也挂到 aux 上：AKUN 的 19940 接口里 tap/swipe 就是动作名，
+    // 中控既可能发 {"t":"tap"}（控制通道）也可能发 {"t":"aux","a":"tap"}，两条都要通。
+    if ([a isEqualToString:@"tap"] || [a isEqualToString:@"dtap"] || [a isEqualToString:@"swipe"] ||
+        [a isEqualToString:@"d"] || [a isEqualToString:@"u"] || [a isEqualToString:@"m"]) {
+        NSMutableDictionary *c = [NSMutableDictionary dictionaryWithDictionary:cmd];
+        c[@"t"] = a;
+        if (!c[@"x"] && c[@"nx"]) { c[@"x"] = c[@"nx"]; }
+        if (!c[@"y"] && c[@"ny"]) { c[@"y"] = c[@"ny"]; }
+        if (!c[@"x2"] && c[@"nx2"]) { c[@"x2"] = c[@"nx2"]; }
+        if (!c[@"y2"] && c[@"ny2"]) { c[@"y2"] = c[@"ny2"]; }
+        [self handleCommand:c];
+        return @{ @"success" : @YES, @"action" : a, @"via" : @"HID",
+                  @"note" : @"已发出（触摸无回读，验证看画面）" };
+    }
+
     if ([a isEqualToString:@"device_info"]) {
         // 1:1 对齐 AKUN TVNCDeviceInfo：字段名、取值顺序、来源标记都逐条照抄
         struct utsname si;
@@ -1073,6 +1109,8 @@ static BOOL akun_tipa_server_ensure(void) {
         NSString *bundle = env[@"__CFBundleIdentifier"];
         if (bundle) info[@"bundle"] = bundle;
 
+        // AKUN 各动作统一带 success；device_info 原来只回字段，中控按 success 判会当成失败
+        info[@"success"] = @YES;
         return info;
     }
     if ([a isEqualToString:@"go_home"]) {
@@ -1421,8 +1459,22 @@ static BOOL akun_tipa_server_ensure(void) {
             }
         }
         if (!sd.length) {
+            // roothide 的真实 dpkg 库在 /Library/dpkg/status（/var/jb 软链到 /，所以 /var/jb/Library/dpkg/status 也试一遍）；
+            // tipa 形态没有 dpkgd，只能走文件读取，因此候选路径要覆盖 /Library 与 .jbroot-*/Library 两种落地。
+            NSMutableArray *cands = [NSMutableArray arrayWithArray:@[
+                @"/var/mobile/Documents/akun_dpkg_status.txt",
+                @"/tmp/akun_dpkg_status.txt",
+                @"/var/jb/var/lib/dpkg/status",
+                @"/var/lib/dpkg/status",
+                @"/Library/dpkg/status",
+                @"/var/jb/Library/dpkg/status" ]];
+            for (NSString *sub in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil]) {
+                if ([sub hasPrefix:@".jbroot-"]) {
+                    [cands addObject:[NSString stringWithFormat:@"/var/containers/Bundle/Application/%@/Library/dpkg/status", sub]];
+                }
+            }
             statusPath = nil;
-            for (NSString *p in @[ @"/var/mobile/Documents/akun_dpkg_status.txt", @"/tmp/akun_dpkg_status.txt", @"/var/jb/var/lib/dpkg/status", @"/var/lib/dpkg/status" ]) {
+            for (NSString *p in cands) {
                 NSData *d = akun_fread_all(p);
                 if (d.length) { sd = d; statusPath = p; break; }
             }
@@ -1531,7 +1583,7 @@ static BOOL akun_tipa_server_ensure(void) {
         if (!chunk.length) {
             return @{ @"success" : @NO, @"error" : @"missing data (base64)" };
         }
-        NSInteger off = [cmd[@"offset"] integerValue];
+        NSInteger off = (NSInteger)akun_i64(cmd[@"offset"]);
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *dir = [path stringByDeletingLastPathComponent];
         if (dir.length) { [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil]; }
@@ -1551,8 +1603,8 @@ static BOOL akun_tipa_server_ensure(void) {
             }
         }
         if (err) { return @{ @"success" : @NO, @"error" : err.localizedDescription ?: @"write failed" }; }
-        unsigned long long total = [[[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize] unsignedLongLongValue];
-        unsigned long long want = [cmd[@"size"] unsignedLongLongValue];
+        unsigned long long total = akun_u64([[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize]);
+        unsigned long long want = akun_u64(cmd[@"size"]);
         BOOL complete = (want > 0) ? (total >= want) : YES;
         NSLog(@"[aux] upload_file %@ 收到 %llu/%llu", path.lastPathComponent, total, want);
         char rp[PATH_MAX]; NSString *real = @"";
@@ -1576,7 +1628,7 @@ static BOOL akun_tipa_server_ensure(void) {
             return @{ @"success" : @NO, @"error" : @"daemon 读不到该文件", @"path" : path };
         }
         if (cmd[@"size"]) {
-            unsigned long long want = [cmd[@"size"] unsignedLongLongValue];
+            unsigned long long want = akun_u64(cmd[@"size"]);
             if (want && want != (unsigned long long)local.length) {
                 return @{ @"success" : @NO,
                           @"error" : [NSString stringWithFormat:@"size mismatch: expected %llu, got %lu（包可能没传完）",
@@ -1659,7 +1711,7 @@ static BOOL akun_tipa_server_ensure(void) {
             return @{ @"success" : @NO, @"error" : [NSString stringWithFormat:@"file not found: %@", path] };
         }
         if (cmd[@"size"]) {
-            long long want = [cmd[@"size"] longLongValue];
+            long long want = akun_i64(cmd[@"size"]);
             long long have = (long long)[[fm attributesOfItemAtPath:path error:nil] fileSize];
             if (want > 0 && have != want) {
                 return @{ @"success" : @NO,

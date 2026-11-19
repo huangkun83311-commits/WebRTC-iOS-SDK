@@ -1,0 +1,76 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>AKUN 压力测试源</title>
+<style>
+html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%}
+canvas{display:block;position:fixed;inset:0;width:100vw;height:100vh}
+#hud{position:fixed;left:8px;top:8px;color:#0f0;font:13px/1.4 monospace;z-index:9;text-shadow:0 0 4px #000;pointer-events:none}
+.a{position:fixed;left:0;right:0;bottom:0;height:46px;display:flex;gap:3px;z-index:9;background:#000a}
+button{flex:1;font:12px monospace;background:#222;color:#eee;border:1px solid #555}
+button.on{background:#e01;color:#fff}
+</style></head><body>
+<canvas id="c"></canvas><div id="hud"></div>
+<div class="a">
+ <button data-m="flash">全屏闪变</button>
+ <button data-m="grid">随机色块</button>
+ <button data-m="scroll">彩条滚动</button>
+ <button data-h="30">30Hz</button>
+ <button data-h="60">60Hz</button>
+</div>
+<script>
+const c=document.getElementById('c');
+c.addEventListener('contextmenu',e=>e.preventDefault());
+const g=c.getContext('2d',{alpha:false});
+let W=0,H=0,DPR=1;
+function fit(){DPR=Math.max(1,Math.min(devicePixelRatio||1,2));W=c.width=Math.floor(innerWidth*DPR);H=c.height=Math.floor(innerHeight*DPR);g.imageSmoothingEnabled=false;}
+addEventListener('resize',fit);fit();
+const q=new URLSearchParams(location.search);
+let mode=q.get('mode')||'grid';
+let hz=Math.max(1,Math.min(60,+(q.get('hz')||60)));
+const CELL=Math.max(8,+(q.get('cell')||40));
+let n=0,lastMs=0,phase=0,maxGap=0,lastT=0;
+const hud=document.getElementById('hud');
+
+function btns(){
+  document.querySelectorAll('[data-m]').forEach(b=>b.classList.toggle('on',b.dataset.m===mode));
+  document.querySelectorAll('[data-h]').forEach(b=>b.classList.toggle('on',+b.dataset.h===hz));
+}
+document.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>{mode=b.dataset.m;btns()});
+document.querySelectorAll('[data-h]').forEach(b=>b.onclick=()=>{hz=+b.dataset.h;btns()});
+btns();
+
+function draw(){
+  const t=performance.now();
+  if(lastT){const gap=t-lastT;if(gap>maxGap)maxGap=gap;}
+  lastT=t;
+  if(t-lastMs >= 1000/hz){
+    lastMs=t;n++;phase+=0.35;
+    if(mode==='flash'){
+      const k=n%3;
+      g.fillStyle=k===0?'#ff0040':(k===1?'#00ff80':'#0040ff');
+      g.fillRect(0,0,W,H);
+      g.fillStyle='#fff';g.fillRect((n*53)%Math.max(1,W-W/6),H/2-Math.round(H/16),Math.round(W/6),Math.round(H/8));
+      const bw=Math.round(W/4),bh=Math.round(H/24);
+      g.fillStyle='#000';g.fillRect(0,0,bw,bh);
+    } else if(mode==='grid'){
+      const cols=Math.ceil(W/CELL),rows=Math.ceil(H/CELL);
+      for(let y=0;y<rows;y++)for(let x=0;x<cols;x++){
+        const v=Math.random()*255;
+        g.fillStyle='rgb('+(((x*7+v)%255)|0)+','+(((y*11+v)%255)|0)+','+(((v*3)%255)|0)+')';
+        g.fillRect(x*CELL,y*CELL,CELL-1,CELL-1);
+      }
+    } else {
+      const grad=g.createLinearGradient(0,0,W,0);
+      for(let i=0;i<=6;i++){const o=i/6;grad.addColorStop(o,'hsl('+(((phase*60+i*60)%360)|0)+',100%,'+(i%2?35:65)+'%)');}
+      g.fillStyle=grad;g.fillRect(0,0,W,H);
+      g.strokeStyle='#fff';g.lineWidth=Math.max(4,Math.round(DPR*4));
+      for(let i=0;i<20;i++){const x=((phase*140+i*W/20)%Math.max(1,W));g.beginPath();g.moveTo(x,0);g.lineTo(x+H,H);g.stroke();}
+    }
+    hud.textContent=mode+' '+hz+'Hz  n='+n+'  maxGap='+Math.round(maxGap)+'ms  '+W+'x'+H;
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script></body></html>

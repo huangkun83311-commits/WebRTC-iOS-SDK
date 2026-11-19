@@ -5,7 +5,7 @@ export PATH
 
 exec 3>&1 >/dev/null 2>&1
 
-LABEL="com.akun.bridge"
+LABEL="com.akun.akund"
 
 case "$1" in
     upgrade|failed-upgrade)

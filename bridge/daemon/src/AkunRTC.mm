@@ -125,10 +125,15 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
     }
 
     if (self.maxBitrateBps > 0 && self.pc) {
-        // 下限给足：默认起始码率很低，会先糊一阵再爬上来，局域网里没必要
-        NSNumber *minRate = @(MAX(300000, (NSInteger)(self.maxBitrateBps * 0.5)));
+        // 起始码率给上限的 40%（不低于 400k）：一上来就要满码率会把编码器瞬间打满
+        // （A11 上 1722x968@60fps 跑 4Mbps 单帧要 21ms，直接超 16.7ms 预算掉帧），
+        // 交给 BWE 从 40% 慢慢爬，动态画面才稳。
+        NSInteger startRate = (NSInteger)(self.maxBitrateBps * 0.4);
+        if (startRate < 400000) { startRate = 400000; }
+        if (startRate > self.maxBitrateBps) { startRate = self.maxBitrateBps; }
+        NSNumber *minRate = @(MAX(300000, (NSInteger)(startRate * 0.5)));
         BOOL ok = [self.pc setBweMinBitrateBps:minRate
-                             currentBitrateBps:@(self.maxBitrateBps)
+                             currentBitrateBps:@(startRate)
                                  maxBitrateBps:@(self.maxBitrateBps)];
         NSLog(@"[rtc] 码率 %ld~%ld bps 设置%@", (long)minRate.integerValue,
               (long)self.maxBitrateBps, ok ? @"成功" : @"失败");
@@ -195,12 +200,37 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
     return [NSString stringWithFormat:@"%@/ws?room=video-%@&role=publisher", base, self.deviceId];
 }
 
+#pragma mark - H264 硬编限定
+
+// 之前一直落到 VP8 软编：A11 上 VP8 只能用 CPU 编码，同码率下画质差、
+// 滑动时糊成一片，观感就是"拖/抖"。这里把编码器工厂的 supportedCodecs
+// 过滤成只有 H264，逼 answer 里只出现 video/H264，让它走 VideoToolbox 硬件编码。
+// 若本机 libwebrtc 真的没有 H264 编码器，则自动回退原始列表（不硬性失败）。
+@interface AkunH264EncoderFactory : RTCDefaultVideoEncoderFactory
+@end
+
+@implementation AkunH264EncoderFactory
+- (NSArray<RTCVideoCodecInfo *> *)supportedCodecs {
+    NSMutableArray<RTCVideoCodecInfo *> *only = [NSMutableArray array];
+    for (RTCVideoCodecInfo *c in [super supportedCodecs]) {
+        if ([c.name isEqualToString:@"H264"]) { [only addObject:c]; }
+    }
+    if (only.count == 0) {
+        NSLog(@"[codec] 本机 libwebrtc 无 H264 编码器，回退原列表");
+        return [super supportedCodecs];
+    }
+    NSLog(@"[codec] 编码器限定 H264，profile 数=%lu 参数=%@",
+          (unsigned long)only.count, [only valueForKey:@"parameters"]);
+    return only;
+}
+@end
+
 #pragma mark - WebRTC 初始化
 
 - (void)setupPeerConnection {
     RTCInitializeSSL();
 
-    RTCDefaultVideoEncoderFactory *encoder = [[RTCDefaultVideoEncoderFactory alloc] init];
+    RTCDefaultVideoEncoderFactory *encoder = [[AkunH264EncoderFactory alloc] init];
     RTCDefaultVideoDecoderFactory *decoder = [[RTCDefaultVideoDecoderFactory alloc] init];
     self.factory = [[RTCPeerConnectionFactory alloc] initWithEncoderFactory:encoder decoderFactory:decoder];
 
@@ -210,8 +240,17 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
     self.videoTrack = [self.factory videoTrackWithSource:self.videoSource trackId:@"screen0"];
 
     RTCConfiguration *config = [[RTCConfiguration alloc] init];
-    // 局域网直连：不配 STUN/TURN，靠 host candidate 打洞。
-    config.iceServers = @[];
+    // 局域网直连靠 host candidate；跨网(公网/跨网段)必须补 STUN，
+    // 只做地址发现、不中继流量，媒体仍是两端 UDP 直连（纯点对点）。
+    // 与观看页内嵌的 ICE_SERVERS 保持一致，多台轮换提高成功率。
+    config.iceServers = @[
+        [[RTCIceServer alloc] initWithURLStrings:@[@"stun:stun.miwifi.com:3478"]],
+        [[RTCIceServer alloc] initWithURLStrings:@[@"stun:stun.nextcloud.com:3478"]],
+        [[RTCIceServer alloc] initWithURLStrings:@[@"stun:stun.voip.aebc.com:3478"]],
+        [[RTCIceServer alloc] initWithURLStrings:@[@"stun:stun.l.google.com:19302"]],
+        [[RTCIceServer alloc] initWithURLStrings:@[@"stun:stun.epygi.com:3478"]]
+    ];
+    config.iceTransportPolicy = RTCIceTransportPolicyAll;
     config.sdpSemantics = RTCSdpSemanticsUnifiedPlan;
     config.bundlePolicy = RTCBundlePolicyMaxBundle;
     config.continualGatheringPolicy = RTCContinualGatheringPolicyGatherContinually;
@@ -431,14 +470,13 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
     // 没有远端反馈（还没收到 RTCP）时不做判断
     if (fractionLost < 0 && rttSeconds < 0 && framesEncoded < 0) { return; }
 
+    // 只看网络侧（丢包/时延）。编码耗时是本机 CPU 指标，绝不能当拥塞信号：
+    // 码率给高 → 编码慢 → 判"拥塞" → 降 scale → 输出分辨率变 → H264 的 SPS 变
+    // → 对端解码器必须重建（黑屏）→ 对端狂发 PLI → 每帧都吐 IDR 更慢 → 又判拥塞。
+    // 这条正反馈会把画面锁死在黑屏，56 帧的卡死就是这么来的。
     BOOL congested = NO;
     if (fractionLost > 0.05) { congested = YES; }        // 丢包 >5% 就是网络扛不住了
     if (rttSeconds > 0.25) { congested = YES; }          // 时延 >250ms，手感已经明显拖
-    // 编码跟不上（单帧编码时间 > 12ms，A11 上意味着渲染→编码这条链在排队）
-    if (framesEncoded > 0 && totalEncodeTime > 0) {
-        double avgMs = (totalEncodeTime / framesEncoded) * 1000.0;
-        if (avgMs > 12.0) { congested = YES; }
-    }
 
     if (congested) {
         self.badStreak++;
@@ -493,32 +531,30 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
 }
 
 - (void)stepDown {
-    double ns = self.adaptScale - 0.03;
-    if (ns < 0.30) { ns = 0.30; }          // 字体可读下限，不再往下掉
+    // 只降码率，绝不动 scale：scale 一变输出分辨率就变，H264 的 SPS 也跟着变，
+    // 对端解码器必须按新 SPS 重建 —— 表现是黑屏 + PLI 轰炸，代价远大于降码率。
+    // 分辨率一旦定下就固定，一次会话内不再变。
     NSInteger nb = (NSInteger)(self.adaptBitrateBps * 0.8);
     if (nb < 350000) { nb = 350000; }      // 再省也要留够动态画面的码率
-    if (fabs(ns - self.adaptScale) < 0.001 && nb == self.adaptBitrateBps) { return; }
-    self.adaptScale = ns;
+    if (nb == self.adaptBitrateBps) { return; }
     self.adaptBitrateBps = nb;
     self.goodStreak = 0;
     [self applyAdaptiveValues];
-    NSLog(@"[adapt] 网络拥塞 → 降档 scale=%.2f bitrate=%ld（保帧率优先）", ns, (long)nb);
+    NSLog(@"[adapt] 网络拥塞 → 降码率 bitrate=%ld（分辨率固定 scale=%.2f）", (long)nb, self.adaptScale);
 }
 
 - (void)stepUp {
-    double ns = self.adaptScale + 0.02;
-    if (ns > self.baseScale) { ns = self.baseScale; }     // 不超过用户/中控设的上限
+    // 同样只动码率，分辨率固定
     NSInteger nb = (NSInteger)(self.adaptBitrateBps * 1.15);
     if (nb > self.baseBitrateBps) { nb = self.baseBitrateBps; }
-    if (fabs(ns - self.adaptScale) < 0.001 && nb == self.adaptBitrateBps) {
+    if (nb == self.adaptBitrateBps) {
         self.goodStreak = 0;
         return;
     }
-    self.adaptScale = ns;
     self.adaptBitrateBps = nb;
     self.goodStreak = 0;
     [self applyAdaptiveValues];
-    NSLog(@"[adapt] 网络恢复 → 升档 scale=%.2f bitrate=%ld", ns, (long)nb);
+    NSLog(@"[adapt] 网络恢复 → 升码率 bitrate=%ld（分辨率固定 scale=%.2f）", (long)nb, self.adaptScale);
 }
 
 - (void)startStatTimer {

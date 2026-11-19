@@ -12,6 +12,9 @@
   .bar button { background: #2563eb; border: 0; color: #fff; padding: 7px 14px; border-radius: 6px; cursor: pointer; }
   .bar button.ghost { background: #21262d; border: 1px solid #2b333f; }
   .bar button:disabled { opacity: .5; cursor: default; }
+  #custBox { display: flex; gap: 6px; align-items: center; color: #8b949e; font-size: 12px; white-space: nowrap; }
+  #custBox input { width: 52px; padding: 5px 6px; }
+  #custBox button { padding: 6px 10px; font-size: 12px; }
   .status { font-size: 12px; color: #8b949e; margin-left: auto; display: flex; gap: 14px; }
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #f85149; margin-right: 5px; vertical-align: 1px; }
   .dot.on { background: #3fb950; }
@@ -70,36 +73,27 @@
   <input id="room" value="dev001" spellcheck="false" />
   <button id="connect">连接</button>
   <button id="disconnect" class="ghost">断开</button>
-  <!-- 画质档位：默认「标准」= AKUN 出厂值 0.35 / 12fps / 1.5Mbps；
-       授权给别人看用「省流」，自己中控看用「高清/超清」，切换即时生效不用重装 -->
-  <select id="quality" title="画质档位（改的是设备端的 scale/fps/码率，即时生效）">
-    <option value="0.35,30,700000,1200000" selected>流畅·默认 0.35 / 30fps / 0.7M（=AKUN清晰度，长跑不烫）</option>
-    <option value="0.35,45,900000,1500000">更跟手（局域网）0.35 / 45fps / 0.9M</option>
-    <option value="0.30,30,500000,800000">省流·授权用 0.30 / 30fps / 0.5M（字仍可读）</option>
-    <option value="0.30,24,400000,600000">极省 · 多机并发 0.30 / 24fps / 0.4M</option>
-    <option value="0.45,25,1200000,1800000">看字优先 0.45 / 25fps / 1.2M</option>
+  <!-- 自定义画质：填多少下发多少，不经过任何换算。
+       缩 = scale（0.10~1.00，越小手机端越省）；帧 = fps（10~60）；
+       码率/上限单位都是 k（码率建议给到上限的 70~80%）。 -->
+  <span id="custBox" title="自定义画质：缩 0.10~1.00、帧 10~60、码率与上限单位 k；改完点「应用」立即生效">
+    <label>缩</label><input id="cScale" value="0.40" size="4" style="width:52px" spellcheck="false" />
+    <label>帧</label><input id="cFps" value="60" size="3" style="width:46px" spellcheck="false" />
+    <label>码率k</label><input id="cBr" value="900" size="4" style="width:56px" spellcheck="false" />
+    <label>上限k</label><input id="cCap" value="1200" size="4" style="width:56px" spellcheck="false" />
+    <button id="applyCust">应用</button>
+  </span>
+  <select id="jb" title="播放端抖动缓冲：自动=按实测 jitter 自适应；填小了会冻帧">
+    <option value="auto" selected>缓冲·自动（约 20~40ms）</option>
+    <option value="0">缓冲 0ms（最跟手，易冻）</option>
+    <option value="20">缓冲 20ms（跟手，网络稳时用）</option>
+    <option value="40">缓冲 40ms</option>
+    <option value="80">缓冲 80ms</option>
+    <option value="120">缓冲 120ms</option>
   </select>
-  <!-- 档位自动换算：选"中控/授权"再填台数和上行总带宽，服务端按每台可用带宽算出
-       cap(单台上限) / scale(分辨率) / fps，一键下发；设备重连会自动套用上次的档。 -->
-  <select id="mode" title="局域网=不占外网上行的高档；巡检=几百台缩略；授权=低清档">
-    <option value="lan" selected>局域网 · 高档</option>
-    <option value="console">中控 · 默认档</option>
-    <option value="grid">巡检 · 缩略档</option>
-    <option value="auth">授权 · 低清档</option>
-  </select>
-  <select id="devs" title="同时连接的台数">
-    <option value="1" selected>1 台</option>
-    <option value="5">5 台</option>
-    <option value="10">10 台</option>
-    <option value="20">20 台</option>
-    <option value="30">30 台</option>
-  </select>
-  <label title="上行总带宽（Mbps）">上行</label><input id="uplink" value="50" size="3" style="width:52px" />
-  <button id="applyPreset" title="按 台数/上行 自动算出并下发档位">按档次下发</button>
-  <span id="presetInfo" style="color:#8b949e;font-size:12px"></span>
   <button id="hudBtn" class="ghost" title="显示/隐藏数据面板（快捷键 D）">数据面板</button>
   <button id="auxBtn" class="ghost" title="辅助功能：文字输入 / 锁屏唤醒 / 音量亮度 / 应用启停 / 剪贴板">辅助功能</button>
-  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v10 · 辅助功能全接</span>
+  <span class="ver" title="页面版本标记：看到这个标记说明拿到的是最新页面">页v31</span>
   <span id="peers"></span>
   <span class="status">
     <span><span id="videoDot" class="dot"></span>画面</span>
@@ -140,6 +134,7 @@
   <div class="grp">
     <input id="auxText" placeholder="要输入的文字（中文走剪贴板粘贴）" />
     <button id="auxSendText" title="写入设备剪贴板 + 键盘通道 Cmd+V 粘贴">输入</button>
+    <button id="auxPaste" title="读取电脑剪贴板 → 写进设备并 Cmd+V 粘贴（也可在画面上直接 Ctrl+V）">粘贴剪贴板</button>
   </div>
   <div class="grp">
     <input id="kbPad" placeholder="键盘直通：在这里敲字符会逐键发到手机（含 Shift 组合）" autocomplete="off" />
@@ -183,7 +178,8 @@
 <div class="stage is-idle" id="stage">
   <div class="screen" id="screen">
     <video id="video" autoplay playsinline muted></video>
-    <canvas id="rawCanvas"></canvas>
+    <canvas id="rawCanvas" tabindex="0"></canvas>
+    <span id="pasteTip" style="display:none;position:absolute;left:50%;bottom:10px;transform:translateX(-50%);background:rgba(0,0,0,.78);color:#7ee787;padding:6px 12px;border-radius:8px;font:13px -apple-system,'Microsoft Yahei',sans-serif;z-index:9;pointer-events:none"></span>
     <span class="hint">未连接</span>
   </div>
 </div>
@@ -221,22 +217,41 @@
     tsOut: 0, fpsT: 0, fpsN: 0, fps: 0,
     decSum: 0, decN: 0, decMs: 0,
     timer: null, keyTimer: null, lastFrame: 0, txBytes: 0,
+    isVp8: false, vp8Parts: [], vp8Key: false, vp8Bad: false,
   };
 
-  function rawUseCodec(fmtp) {
-    const m = /profile-level-id=([0-9a-fA-F]{6})/.exec(fmtp || '');
-    const codec = m ? ('avc1.' + m[1].toUpperCase()) : 'avc1.42E034';
-    if (RAW.dec && RAW.cfgd && RAW.codec === codec) return;
+  // 手机实际编码可能是 H264，也可能是 VP8（这台 iPhone 的 libwebrtc 没有可用 H264 编码器，
+  // 实测只给 H264 时一帧都发不出来）。两者在 WebCodecs 里的 codec 字符串、RTP 载荷格式
+  // （H264=NALU、VP8=PayloadDescriptor+分区分包）完全不同，必须分开处理。
+  function rawUseCodec(fmtp, mime) {
+    const isVp8 = /vp8/i.test(mime || '') || (!mime && !/profile-level-id/i.test(fmtp || ''));
+    let codec;
+    if (isVp8) {
+      codec = 'vp8';
+    } else {
+      const m = /profile-level-id=([0-9a-fA-F]{6})/.exec(fmtp || '');
+      codec = m ? ('avc1.' + m[1].toUpperCase()) : 'avc1.42E034';
+    }
+    if (RAW.dec && RAW.cfgd && RAW.codec === codec) { RAW.isVp8 = isVp8; return; }
     if (RAW.dec) { try { RAW.dec.close(); } catch (e) {} }
     RAW.codec = codec;
+    RAW.isVp8 = isVp8;
     RAW.sps = null; RAW.pps = null; RAW.cfgd = false;
+    RAW.fuParts = null; RAW.au = []; RAW.vp8Parts = [];
     RAW.dec = new VideoDecoder({
       output: rawOnFrame,
       error: (e) => { log('raw decoder error', e.message); RAW.cfgd = false; },
     });
-    RAW.dec.configure({ codec: codec, optimizeForLatency: true, avc: { format: 'annexb' } });
-    RAW.cfgd = true;
-    log('直绘 codec', codec);
+    const cfg = { codec: codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' };
+    if (!isVp8) cfg.avc = { format: 'annexb' };   // avc 参数只对 H264 有意义
+    try {
+      RAW.dec.configure(cfg);
+      RAW.cfgd = true;
+      log('直绘 codec', codec);
+    } catch (e) {
+      log('直绘 configure 失败', codec + ' ' + e.message);
+      RAW.cfgd = false;
+    }
   }
 
   function rawOnFrame(frame) {
@@ -246,11 +261,23 @@
       RAW.cv.width = w; RAW.cv.height = h;
       RAW.w = w; RAW.h = h;
     }
-    try { RAW.cx.drawImage(frame, 0, 0, w, h); } catch (e) {}
+    try {
+      if (RAW.gl) {
+        const gl = RAW.gl;
+        gl.viewport(0, 0, w, h);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      } else {
+        RAW.cx.drawImage(frame, 0, 0, w, h);
+      }
+    } catch (e) {}
     frame.close();
     RAW.got++;
     RAW.fpsN++;
     RAW.lastFrame = performance.now();
+    // 直绘的帧也要进公共统计：首帧耗时、跟手实测、卡屏自救全都依赖它
+    onFrameTick();
     if (RAW.cv.style.display !== 'block') {
       RAW.cv.style.display = 'block';
       video.style.display = 'none';
@@ -301,6 +328,62 @@
     RAW.auIdr = false;
   }
 
+  // ===== VP8 直绘组帧 =====
+  // VP8 的 RTP 载荷不是 H264 那种 NALU，而是 PayloadDescriptor(X/N/S/PartID) + 分区分包，
+  // WebCodecs 要的是一整个 VP8 帧（raw frame，不含任何 RTP 头），所以必须：
+  //   1. 逐包剥掉 payload descriptor（长度可变，有 PictureID/TL0PICIDX/TID 时更长）
+  //   2. 同时间戳的分包按顺序拼成一整帧
+  //   3. 只累积 PartID=0 的包（libwebrtc 的 VP8 编码器默认单分区）；
+  //      万一出现多分区（PartID>0），该帧视为不可重组，直接丢弃并索要关键帧。
+  function vp8Strip(p) {
+    let i = 1;
+    const X = (p[0] & 0x80) !== 0;
+    if (X) {
+      if (p.length < 2) return null;
+      const ext = p[1];
+      i = 2;
+      if (ext & 0x80) {                 // PictureID：1 或 2 字节
+        if (i >= p.length) return null;
+        if (p[i] & 0x80) i += 2; else i += 1;
+      }
+      if (ext & 0x40) i += 1;           // TL0PICIDX
+      if (ext & 0x20) i += 1;           // TID
+      if (ext & 0x10) i += 1;           // KEYIDX
+    }
+    if (i >= p.length) return null;
+    return p.subarray(i);
+  }
+
+  function rawFlushVp8() {
+    const parts = RAW.vp8Parts || [];
+    RAW.vp8Parts = [];
+    const bad = RAW.vp8Bad;
+    RAW.vp8Bad = false;
+    if (bad) { RAW.drop++; rawAskKey(); return; }
+    if (!parts.length || !RAW.cfgd || !RAW.dec) return;
+    let total = 0;
+    for (let i = 0; i < parts.length; i++) total += parts[i].length;
+    const buf = new Uint8Array(total);
+    let o = 0;
+    for (let i = 0; i < parts.length; i++) { buf.set(parts[i], o); o += parts[i].length; }
+    const tsUs = Math.round(RAW.auTs * 100 / 9);        // 90kHz → µs
+    RAW.tsOut = tsUs > RAW.tsOut ? tsUs : RAW.tsOut + 1000;
+    const t0 = performance.now();
+    try {
+      RAW.dec.decode(new EncodedVideoChunk({
+        type: RAW.vp8Key ? 'key' : 'delta',
+        timestamp: RAW.tsOut,
+        data: buf,
+      }));
+      RAW.decSum += performance.now() - t0; RAW.decN++;
+      if (RAW.decN >= 30) { RAW.decMs = RAW.decSum / RAW.decN; RAW.decSum = 0; RAW.decN = 0; }
+    } catch (e) {
+      RAW.drop++;
+      rawAskKey();
+    }
+    RAW.vp8Key = false;
+  }
+
   function rawAskKey() {
     if (RAW.ws && RAW.ws.readyState === 1) {
       try { RAW.ws.send(JSON.stringify({ t: 'keyframe' })); } catch (e) {}
@@ -326,10 +409,35 @@
     // 丢包就放弃当前分片和整个访问单元：残帧解出来只会花屏，等关键帧更干净
     if (RAW.seq >= 0) {
       const d = (seq - RAW.seq + 65536) % 65536;
-      if (d > 1) { RAW.drop += d - 1; RAW.fuParts = null; RAW.au = []; }
+      if (d > 1) { RAW.drop += d - 1; RAW.fuParts = null; RAW.au = []; RAW.vp8Parts = []; RAW.vp8Bad = true; }
     }
     RAW.seq = seq;
     const p = u8.subarray(off);
+
+    // ---- VP8 直绘分支 ----
+    if (RAW.isVp8) {
+      const S = (p[0] & 0x10) !== 0;
+      const partId = p[0] & 0x07;
+      // 换帧：先把上一帧拼完发出去
+      if (ts !== RAW.auTs) {
+        rawFlushVp8();
+        RAW.auTs = ts;
+      }
+      // 新帧起点（S=1 且 PartID=0）：若还有残留分包，说明上帧收尾丢了，整帧作废
+      if (S && partId === 0) {
+        if ((RAW.vp8Parts || []).length) { RAW.vp8Bad = true; RAW.vp8Parts = []; }
+        RAW.vp8New = true;
+      }
+      if (partId !== 0) { RAW.vp8Bad = true; return; }   // 多分区无法重组，按坏帧处理
+      const body = vp8Strip(p);
+      if (!body) return;
+      // 关键帧判定：分区0 首字节 bit0=0 即 key frame
+      if (S && (body[0] & 0x01) === 0) RAW.vp8Key = true;
+      if (!RAW.vp8Parts) RAW.vp8Parts = [];
+      RAW.vp8Parts.push(body);
+      return;
+    }
+
     if (ts !== RAW.auTs) {
       if (RAW.au.length) rawFlushAU();
       RAW.auTs = ts;
@@ -391,11 +499,53 @@
     setV('hRtt', '直连');
   }
 
+  // ---- 直绘上屏：优先 WebGL2 零拷贝 ----
+  // Canvas2D 的 drawImage 在 Chromium 内部要过一次采样/上传路径；WebGL2 的 texImage2D
+  // 可以直接吃 VideoFrame，YUV→RGB 与 GPU 上传都由浏览器内部完成，再配合 desynchronized
+  // 更贴近「解码完就上屏」。任何一步失败都退回 Canvas2D，不影响可用性。
+  function rawInitGL(cv) {
+    try {
+      const gl = cv.getContext('webgl2', {
+        alpha: false, desynchronized: true, premultipliedAlpha: false,
+        antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false,
+      });
+      if (!gl) return null;
+      const VS = '#version 300 es\nin vec2 a; out vec2 v;\nvoid main(){ v = vec2(a.x*0.5+0.5, 0.5-a.y*0.5); gl_Position = vec4(a, 0.0, 1.0); }';
+      const FS = '#version 300 es\nprecision highp float;\nin vec2 v;\nuniform sampler2D t;\nout vec4 o;\nvoid main(){ o = texture(t, v); }';
+      const mk = (type, src) => {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src); gl.compileShader(s);
+        return gl.getShaderParameter(s, gl.COMPILE_STATUS) ? s : null;
+      };
+      const vs = mk(gl.VERTEX_SHADER, VS), fs = mk(gl.FRAGMENT_SHADER, FS);
+      if (!vs || !fs) return null;
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+      gl.useProgram(prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(prog, 'a');
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.uniform1i(gl.getUniformLocation(prog, 't'), 0);
+      gl.clearColor(0, 0, 0, 1);
+      return gl;
+    } catch (e) { return null; }
+  }
+
   function startRawVideo(room) {
     RAW.room = room;
     RAW.stopped = false;
     RAW.cv = $('rawCanvas');
-    RAW.cx = RAW.cv.getContext('2d', { alpha: false, desynchronized: true });
+    RAW.gl = rawInitGL(RAW.cv);
+    RAW.cx = RAW.gl ? null : RAW.cv.getContext('2d', { alpha: false, desynchronized: true });
     RAW.seq = -1; RAW.au = []; RAW.auTs = -1; RAW.auIdr = false; RAW.fuParts = null;
     RAW.drop = 0; RAW.got = 0; RAW.tsOut = 0; RAW.fpsN = 0; RAW.fpsT = 0;
     const url = WS_BASE + '/ws?room=rtp-' + encodeURIComponent(room) + '&role=raw'
@@ -419,7 +569,7 @@
       if (typeof ev.data === 'string') {
         try {
           const m = JSON.parse(ev.data);
-          if (m && m.type === 'info') { log('直绘 info', m.fmtp); rawUseCodec(m.fmtp); }
+          if (m && m.type === 'info') { log('直绘 info codec=' + (m.codec || ''), m.fmtp || ''); rawUseCodec(m.fmtp, m.codec); }
         } catch (e) {}
         return;
       }
@@ -456,16 +606,18 @@
     RAW.got = 0; RAW.w = 0; RAW.h = 0;
   }
 
-  // 默认就走直绘（WS/TCP，真点对点）；浏览器没有 WebCodecs 时才回落 WebRTC
+  // 媒体通道：浏览器支持 WebCodecs 就走直绘（WS/TCP，钻在 frp 的 xtcp 洞里）；
+  // 不支持（例如用局域网 IP 打开，非安全上下文）才走 WebRTC。打不打洞由 frp 配置决定。
+
   function startVideoAuto(room) {
-    if (typeof VideoDecoder === 'function' && !/m=rtc/.test(location.search)) {
-      log('媒体走 WS 直绘（TCP 隧道，点对点）');
-      startRawVideo(room);
+    if (typeof VideoDecoder === 'function' && !/[?&]m=rtc/.test(location.search)) {
+      startRawVideo(room);   // 直绘：走 WS/TCP，流量钻在 frp 的 xtcp 洞里
     } else {
-      log('媒体走 WebRTC（此浏览器无 WebCodecs 或被强制指定）');
-      startVideo(room);
+      startVideo(room);      // 浏览器没 WebCodecs（局域网 IP 打开）或手动 ?m=rtc
     }
   }
+
+
 
   /* ---------------- 视频：WebSocket 信令 + WebRTC ---------------- */
   function startVideo(room) {
@@ -533,6 +685,45 @@
 
     pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
+    // 抖动缓冲：ontrack 那一刀设完会被浏览器自己调回去（实测仍攒到 189ms），
+    // 这里对每个接收器按住不放：连上后每 2 秒重设，永远按最小缓冲出帧。
+    const RXRS = new Set();
+    // 缓冲目标 = 播放端额外延迟，是"跟手"的最大单项（VNC 是 0 缓冲直通）。
+    //
+    // 【曾经的错】旧实现有两个问题，直接导致"画面缓慢跟着走"：
+    //   1. auto = jitter * 1.6 无节制自适应。抖动 40~50ms 时算到 64~80ms，
+    //      而 Chrome 实际缓冲会一路涨到 190~233ms，且不再回落 → 画面拖半秒。
+    //   2. 同时设置 jitterBufferTarget 和旧的 playoutDelayHint，两者互相覆盖，
+    //      结果两个都不可靠。
+    // 现在：auto 固定 40ms（能吸收常见抖动、又给不出膨胀空间），只设标准接口
+    // jitterBufferTarget；再加一条"积压追赶"——实测缓冲超过目标+80ms 就把目标
+    // 压到 0 持续 800ms，逼 Chrome 主动丢弃积压的旧帧，把延迟拉回跟手区间。
+    function jbBase() {
+      const sel = document.getElementById('jb');
+      const mode = sel ? sel.value : 'auto';
+      if (mode === 'auto') return 20;
+      const v = parseInt(mode, 10);
+      return isNaN(v) ? 40 : v;
+    }
+    function jbTarget() { return jbBase(); }
+    window.__jbTarget = jbTarget;
+    window.__chaseUntil = 0;
+    function tuneJitter() {
+      const base = jbBase();
+      const cur = Number(window.__bufMs) || 0;
+      let t = base;
+      // 积压追赶：正常抖动不该让缓冲长期高于目标 +80ms，那是"拖画面"，必须丢。
+      if (cur > base + 40) window.__chaseUntil = Date.now() + 800;
+      if (Date.now() < (window.__chaseUntil || 0)) t = 0;
+      RXRS.forEach((r) => {
+        try {
+          // 只用标准接口；playoutDelayHint 已废弃且会跟它打架，不能再碰。
+          if ('jitterBufferTarget' in r) r.jitterBufferTarget = t;
+        } catch (e) {}
+      });
+    }
+    if (window.__jbTimer) clearInterval(window.__jbTimer);
+    window.__jbTimer = setInterval(tuneJitter, 500);
     window.__dbgPc = pc;   // 调试：控制台可查 receiver 编码/抖动缓冲/码率
 
     // 优先 H.264：设备端走 VideoToolbox 硬编（AKUN 也是硬编 H.264），比 VP8 软编延迟低一大截。
@@ -551,10 +742,8 @@
       video.play().catch(() => {});
       setDot($('videoDot'), true);
       // 局域网直连不需要抖动缓冲：压到 0，画面立刻上屏（默认缓冲会白加 100~300ms）
-      try {
-        if ('jitterBufferTarget' in ev.receiver) ev.receiver.jitterBufferTarget = 0;
-        else if ('playoutDelayHint' in ev.receiver) ev.receiver.playoutDelayHint = 0;
-      } catch (e) {}
+      RXRS.add(ev.receiver);
+      tuneJitter();
     };
 
     pc.onicecandidate = (ev) => {
@@ -566,6 +755,7 @@
 
     pc.onconnectionstatechange = () => {
       log('pc state', pc.connectionState);
+      if (pc.connectionState === 'connected') tuneJitter();
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         setDot($('videoDot'), false);
       }
@@ -638,13 +828,16 @@
              (cap.cost != null && cap.budget != null && cap.cost > cap.budget * 1.15) ? 'bad' : 'ok');
         setV('dEnc', (rtc.encMs != null && rtc.encMs >= 0 ? rtc.encMs.toFixed(1) + ' ms' : '--'),
              (rtc.encMs > 15) ? 'warn' : '');
+        // 设备上报的 rtc.cap 实际是编码码率（bitrate），不是上限；标签写「上限」会误导，
+        // 真实上限见上方档位下拉（cap 那一列）。
         setV('dUp', (rtc.uplink != null ? Math.round(rtc.uplink) + ' kbps' : '--')
-             + ' 上限 ' + (rtc.cap != null ? Math.round(rtc.cap / 1000) + 'k' : '--'));
+             + ' / 码率 ' + (rtc.cap != null ? Math.round(rtc.cap / 1000) + 'k' : '--'));
         setV('dCfg', (cfg.fps != null ? cfg.fps + 'fps' : '--') + ' / '
              + (cfg.scale != null ? cfg.scale.toFixed(2) : '--'));
         return;
       }
       if (m && m.t === 'auxResult') { onAuxResult(m); return; }
+      if (m && m.t === 'clipkey') { showPasteTip('已粘贴到手机 · ' + (m.n || 0) + ' 字'); return; }
       log('ctrl recv', ev.data);
     };
   }
@@ -666,8 +859,20 @@
 
   let dragging = false;
   let pressStart = null;          // 按下时的归一化坐标 + 时间
-  const DRAG_THRESHOLD = 0.006;   // 归一化位移超过它才算拖动
+  const DRAG_THRESHOLD = 0.002;   // 归一化位移超过它才算拖动（原 0.006≈5px，起手要吃掉几像素，按 AKUN 的逐事件直发降到 2px 级）
   let lastTap = null;             // 上一次点击（用于把两次单击合并成系统双击）
+  // 设备端要求「触摸至少按住 50ms」，太短 SpringBoard 会当成无效触摸丢掉。
+  // 原来这个补时由设备端 usleep 完成，会占住它的控制消息接收线程（连点就顿）；
+  // 改成页面这边等一小会儿再发抬起：设备端收到时已经够 50ms，不用补时，通道也不会被占。
+  let pendingUpTimer = null;      // 延迟抬起中的定时器
+  let pendingUpPt = null;         // 延迟抬起的目标点
+  function flushPendingUp() {
+    if (pendingUpTimer) { clearTimeout(pendingUpTimer); pendingUpTimer = null; }
+    if (pendingUpPt) {
+      const q = pendingUpPt; pendingUpPt = null;
+      ctrl({ t: 'u', x: q.x, y: q.y });
+    }
+  }
   const DOUBLE_TAP_MS = 300;      // 两次点击间隔在这个范围内就算双击
   const DOUBLE_TAP_DIST = 0.04;   // 且落点要接近
 
@@ -676,6 +881,7 @@
     // 只有左键（或触摸）才是「点击」；右键/中键一律交给 contextmenu 处理。
     // 不加这行的话，右键按下会在光标处发一次按下+抬起（凭空点一下），再发 home，两件事一起发生。
     if (ev.pointerType === 'mouse' && ev.button !== 0) { pressStart = null; dragging = false; return; }
+    flushPendingUp();   // 上个点击的延迟抬起还没发，先结算掉，避免抬起串位到这次按下之后
     try { screenEl.setPointerCapture(ev.pointerId); } catch (e) {}
     dragging = false;
     const p = norm(ev);
@@ -698,7 +904,7 @@
     if (!pressStart) return;
     if (ev.pointerType === 'mouse' && ev.button !== 0 && ev.buttons !== 1) return;
     const now = performance.now();
-    if (now - lastMoveSent < 33) return;   // 与设备 30fps 抓屏对齐：发得比屏幕更新还快只会堆在注入队列里
+    if (now - lastMoveSent < 16) return;   // 跟设备实际帧率走：手机现在跑 60fps（帧距 16.7ms），33ms 只会让拖动每两帧才动一次，看着就是拖着走
     const p = norm(ev);
     if (!dragging) {
       const dx = Math.abs(p.x - pressStart.x);
@@ -715,8 +921,19 @@
     if (pressStart.dbl) { pressStart = null; dragging = false; return; }   // 双击：抬起已经由设备端补发
     const p = norm(ev);
     const dt = performance.now() - pressStart.t;
-    // 收尾统一发抬起；设备端会兜住最短按住时长（太短的按压 SpringBoard 不认）
-    ctrl({ t: 'u', x: dragging ? p.x : pressStart.x, y: dragging ? p.y : pressStart.y });
+    const ux = dragging ? p.x : pressStart.x;
+    const uy = dragging ? p.y : pressStart.y;
+    // 收尾统一发抬起。按住不足 50ms 的先挂起，等补够了再发（AKUN 也是异步延迟抬起，不挡后续事件）
+    if (dt < 50) {
+      pendingUpPt = { x: ux, y: uy };
+      pendingUpTimer = setTimeout(() => {
+        pendingUpTimer = null;
+        const q = pendingUpPt; pendingUpPt = null;
+        if (q) ctrl({ t: 'u', x: q.x, y: q.y });
+      }, Math.ceil(50 - dt));
+    } else {
+      ctrl({ t: 'u', x: ux, y: uy });
+    }
     // 以前这里有「按住 450ms 松手就回桌面」，真机上点慢一点就会莫名回桌面 —— 已删除。
     // 回桌面改用右键 / Esc（下面 contextmenu 与 keydown 都有），长按就老老实实长按，交给 iOS 自己弹菜单
     if (!dragging) lastTap = { t: performance.now(), x: pressStart.x, y: pressStart.y };
@@ -730,6 +947,7 @@
   // 右键 / 长按 → Home 键
   screenEl.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
+    flushPendingUp();
     lastTap = null;          // 右键之后第一下左键必须当单击，不能和右键前那次点击拼成双击
     pressStart = null;
     dragging = false;
@@ -770,7 +988,11 @@
       } catch (e) {}
     }
   }, 500);
-  function onVF() {
+  // 注意：这里必须是「帧计数逻辑」本身，供两条通道共用。
+  // 直绘通道走 canvas，video 元素是隐藏的、永远不产生 video frame，
+  // 所以只靠 requestVideoFrameCallback 的话：首帧耗时、跟手实测永远是 "--"，
+  // 而且 framesTotal 一直为 0 会让「卡屏自救」误判成「开窗一直黑」，每 1.5 秒狂发一次关键帧。
+  function onFrameTick() {
     frames++; framesTotal++;
     if (firstFrameMs < 0) {
       firstFrameMs = Math.round(performance.now() - tPage0);
@@ -799,6 +1021,10 @@
       $('fps').textContent = frames + ' fps';
       frames = 0; lastTs = now;
     }
+  }
+  // video 通道（WebRTC 接收）的帧回调包装；直绘通道由 rawOnFrame 直接调 onFrameTick()
+  function onVF() {
+    onFrameTick();
     if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVF);
   }
   if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVF);
@@ -835,8 +1061,10 @@
       const recv = inb.packetsReceived || 0;
       const lostPct = (lost + recv) > 0 ? (lost / (lost + recv) * 100) : 0;
       const jit = inb.jitter != null ? Math.round(inb.jitter * 1000) : null;
+      if (jit != null) window.__jitMs = jit;
       const bufMs = (inb.jitterBufferDelay != null && inb.jitterBufferEmittedCount)
         ? Math.round(inb.jitterBufferDelay / inb.jitterBufferEmittedCount * 1000) : null;
+      if (bufMs != null) window.__bufMs = bufMs;   // 供积压追赶判断用
       const decMs = (inb.totalDecodeTime != null && inb.framesDecoded)
         ? (inb.totalDecodeTime / inb.framesDecoded * 1000) : null;
       const rtt = rttFromPair != null ? rttFromPair : rttMs;
@@ -848,11 +1076,20 @@
       setV('hLost', lost + (lostPct > 0.001 ? '（' + lostPct.toFixed(1) + '%）' : '') + ' pkt',
            lostPct > 3 ? 'bad' : (lostPct > 1 ? 'warn' : 'ok'));
       setV('hJit', jit != null ? jit + ' ms' : '--', jit > 60 ? 'warn' : '');
-      setV('hBuf', bufMs != null ? bufMs + ' ms' : '--', bufMs > 100 ? 'warn' : 'ok');
+      const jbT = window.__jbTarget ? window.__jbTarget() : 0;
+      setV('hBuf', (bufMs != null ? bufMs + ' ms' : '--') + ' · 目标 ' + jbT + 'ms',
+           (bufMs != null && bufMs > 150) ? 'warn' : 'ok');
       setV('hDec', decMs != null ? decMs.toFixed(1) + ' ms/帧' : '--', decMs > 20 ? 'warn' : '');
-      setV('hFreeze', (inb.framesDropped || 0) + ' 丢 / ' + (inb.freezeCount || 0) + ' 冻'
+      // 累计值会一直挂着，看不出"现在"还卡不卡；同时给近 60s 增量。
+      if (!window.__win || (now - (window.__win.t || 0) > 60000)) {
+        window.__win = { t: now, drop: inb.framesDropped || 0, freeze: inb.freezeCount || 0 };
+      }
+      const dDrop = (inb.framesDropped || 0) - window.__win.drop;
+      const dFreeze = (inb.freezeCount || 0) - window.__win.freeze;
+      setV('hFreeze', '近60s ' + dDrop + ' 丢 / ' + dFreeze + ' 冻 ｜ 累计 '
+           + (inb.framesDropped || 0) + ' 丢 / ' + (inb.freezeCount || 0) + ' 冻'
            + ((inb.totalFreezesDuration || 0) > 0.5 ? '（冻 ' + (inb.totalFreezesDuration).toFixed(1) + 's）' : ''),
-           (inb.freezeCount || 0) > 0 ? 'warn' : 'ok');
+           (dFreeze > 0 || dDrop > 0) ? 'warn' : 'ok');
       setV('hNack', (inb.nackCount || 0) + ' / PLI ' + (inb.pliCount || 0));
       setV('hRtt', rtt != null ? rtt + ' ms' : '--', rtt > 150 ? 'bad' : (rtt > 60 ? 'warn' : 'ok'));
 
@@ -1065,6 +1302,40 @@
     if (ev.key === 'D') toggleHud();   // 只认大写：小写 d 让给手机当打字用
   });
 
+  /* ---------------- 电脑剪贴板 → 手机（走 input_text：设备剪贴板 + Cmd+V） ---------------- */
+  function isTextField(el) {
+    if (!el) return false;
+    const t = (el.tagName || '').toUpperCase();
+    return t === 'INPUT' || t === 'TEXTAREA' || el.isContentEditable === true;
+  }
+  function showPasteTip(t) {
+    const el = $('pasteTip');
+    if (!el) return;
+    el.textContent = t;
+    el.style.display = 'block';
+    clearTimeout(window.__pasteTipT);
+    window.__pasteTipT = setTimeout(() => { el.style.display = 'none'; }, 2500);
+  }
+  function pasteToPhone(txt, how) {
+    if (!txt) { setAuxOut('剪贴板是空的'); return; }
+    auxSend('input_text', { text: txt });
+    showPasteTip('已粘贴到手机 · ' + txt.length + ' 字');
+    setAuxOut(how + '：' + esc(txt.slice(0, 60)) + (txt.length > 60 ? '…' : '')
+              + ' <span class="muted">(' + txt.length + ' 字)</span>');
+  }
+  // 画面上的 Ctrl+V 由服务端全局监听（bridge-server.exe）接管：它直接读电脑剪贴板
+  // 下发设备，不依赖浏览器焦点，也不会和页面重复发送。页面这里只负责在收到
+  // clipkey 回执时提示一次。
+  $('auxPaste').onclick = async () => {
+    try {
+      const t = await navigator.clipboard.readText();
+      pasteToPhone(t, '已粘贴到手机');
+    } catch (e) {
+      setAuxOut('<span class="bad">读取电脑剪贴板被浏览器拦了（' + esc(e.message || '') + '）。'
+                + '可以改用：在画面里按 Ctrl+V</span>');
+    }
+  };
+
   /* ---------------- 按钮 ---------------- */
   $('connect').onclick = () => {
     const room = ($('room').value || 'dev001').trim();
@@ -1088,34 +1359,61 @@
     }
   })();
 
-  // 画质档位：直接打设备端配置接口，设备收到后立即重建编码参数，不重装、不断流
-  $('quality').onchange = async (ev) => {
-    const room = ($('room').value || 'dev001').trim();
-    const [scale, fps, bitrate, cap] = ev.target.value.split(',');
+  // 自定义画质：四个输入框填多少就下发多少，不做任何自动换算。
+  // 校验只挡住明显跑不通的值（scale 0.10~1.00 / fps 10~60 / 码率 50~5000k / 上限 >= 码率）
+  const CUST_KEY = 'akun_cust_cfg';
+  function readCust() {
+    return {
+      scale: $('cScale').value.trim(),
+      fps: $('cFps').value.trim(),
+      br: $('cBr').value.trim(),
+      cap: $('cCap').value.trim(),
+    };
+  }
+  function saveCust(v) { try { localStorage.setItem(CUST_KEY, JSON.stringify(v)); } catch (e) {} }
+  function loadCust() {
     try {
-      const r = await fetch(`/api/config?room=${encodeURIComponent(room)}&scale=${scale}&fps=${fps}&bitrate=${bitrate}`
-        + (cap ? `&cap=${cap}` : ''));
-      const j = await r.json();
-      log('画质下发', j.payload, '设备数', j.sent);
-      if (!j.sent) $('stat').textContent = '设备未连控制通道，档位没下发';
-    } catch (e) { log('画质下发失败', e.message); }
-  };
+      const s = JSON.parse(localStorage.getItem(CUST_KEY) || 'null');
+      if (!s) { return; }
+      if (s.scale) $('cScale').value = s.scale;
+      if (s.fps) $('cFps').value = s.fps;
+      if (s.br) $('cBr').value = s.br;
+      if (s.cap) $('cCap').value = s.cap;
+    } catch (e) {}
+  }
+  loadCust();
 
-  // 按「模式 + 台数 + 上行」自动换算档位并下发（授权时用低清档，中控回默认档）
-  $('applyPreset').onclick = async () => {
+  $('applyCust').onclick = async () => {
     const room = ($('room').value || 'dev001').trim();
-    const mode = $('mode').value;
-    const devs = $('devs').value;
-    const up = $('uplink').value || '50';
+    const v = readCust();
+    const scale = parseFloat(v.scale);
+    const fps = parseInt(v.fps, 10);
+    const br = parseInt(v.br, 10);
+    const cap = parseInt(v.cap, 10);
+    if (!(scale >= 0.10 && scale <= 1.00)) {
+      $('stat').textContent = '缩必须在 0.10 ~ 1.00 之间'; return;
+    }
+    if (!(fps >= 10 && fps <= 60)) {
+      $('stat').textContent = '帧必须在 10 ~ 60 之间'; return;
+    }
+    if (!(br >= 50 && br <= 5000)) {
+      $('stat').textContent = '码率必须在 50 ~ 5000k 之间'; return;
+    }
+    if (!(cap >= 50 && cap <= 5000)) {
+      $('stat').textContent = '上限必须在 50 ~ 5000k 之间'; return;
+    }
+    if (br > cap) { $('stat').textContent = '码率不能大于上限（先调上限）'; return; }
+    saveCust(v);
     try {
-      const r = await fetch(`/api/preset?room=${encodeURIComponent(room)}&mode=${mode}`
-        + `&devices=${devs}&uplink=${up}&apply=1`);
+      const r = await fetch(`/api/config?room=${encodeURIComponent(room)}`
+        + `&scale=${scale}&fps=${fps}&bitrate=${br * 1000}&cap=${cap * 1000}`);
       const j = await r.json();
-      $('presetInfo').textContent = `每台 ${j.perDev}kbps · 上限 ${Math.round(j.cap/1000)}k`
-        + ` · ${j.scale} / ${j.fps}fps · 已下发 ${j.sent} 台`;
-      log('档位下发', j.payload);
-      if (!j.sent) $('stat').textContent = '设备未连控制通道，档位没下发';
-    } catch (e) { log('档位换算失败', e.message); }
+      log('自定义下发', j.payload, '设备数', j.sent);
+      if (!j.sent) { $('stat').textContent = '设备未连控制通道，自定义没下发'; }
+      else {
+        $('stat').textContent = `自定义已下发：缩 ${scale} · ${fps}fps · 码率 ${br}k · 上限 ${cap}k`;
+      }
+    } catch (e) { log('自定义下发失败', e.message); }
   };
 
   function stopAll() {
