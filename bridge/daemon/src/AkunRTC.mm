@@ -48,6 +48,9 @@
 static NSDictionary *gLastRtcMetrics = nil;
 NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
 
+@interface AkunH264EncoderFactory : RTCDefaultVideoEncoderFactory
+@end
+
 @implementation AkunRTC
 
 - (instancetype)initWithServerBase:(NSString *)base deviceId:(NSString *)deviceId {
@@ -206,25 +209,6 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
 // 滑动时糊成一片，观感就是"拖/抖"。这里把编码器工厂的 supportedCodecs
 // 过滤成只有 H264，逼 answer 里只出现 video/H264，让它走 VideoToolbox 硬件编码。
 // 若本机 libwebrtc 真的没有 H264 编码器，则自动回退原始列表（不硬性失败）。
-@interface AkunH264EncoderFactory : RTCDefaultVideoEncoderFactory
-@end
-
-@implementation AkunH264EncoderFactory
-- (NSArray<RTCVideoCodecInfo *> *)supportedCodecs {
-    NSMutableArray<RTCVideoCodecInfo *> *only = [NSMutableArray array];
-    for (RTCVideoCodecInfo *c in [super supportedCodecs]) {
-        if ([c.name isEqualToString:@"H264"]) { [only addObject:c]; }
-    }
-    if (only.count == 0) {
-        NSLog(@"[codec] 本机 libwebrtc 无 H264 编码器，回退原列表");
-        return [super supportedCodecs];
-    }
-    NSLog(@"[codec] 编码器限定 H264，profile 数=%lu 参数=%@",
-          (unsigned long)only.count, [only valueForKey:@"parameters"]);
-    return only;
-}
-@end
-
 #pragma mark - WebRTC 初始化
 
 - (void)setupPeerConnection {
@@ -670,4 +654,20 @@ NSDictionary *AkunBridgeRtcMetrics(void) { return gLastRtcMetrics; }
     NSLog(@"[rtc] connection state -> %ld", (long)newState);
 }
 
+@end
+
+@implementation AkunH264EncoderFactory
+- (NSArray<RTCVideoCodecInfo *> *)supportedCodecs {
+    NSMutableArray<RTCVideoCodecInfo *> *only = [NSMutableArray array];
+    for (RTCVideoCodecInfo *c in [super supportedCodecs]) {
+        if ([c.name isEqualToString:@"H264"]) { [only addObject:c]; }
+    }
+    if (only.count == 0) {
+        NSLog(@"[codec] 本机 libwebrtc 无 H264 编码器，回退原列表");
+        return [super supportedCodecs];
+    }
+    NSLog(@"[codec] 编码器限定 H264，profile 数=%lu 参数=%@",
+          (unsigned long)only.count, [only valueForKey:@"parameters"]);
+    return only;
+}
 @end
