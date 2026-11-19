@@ -37,7 +37,7 @@ echo "== 4/6 组装 Layout（与 deb 落地结构 1:1）=="
 mkdir -p "$LAYOUT/usr/bin" "$LAYOUT/usr/lib" "$LAYOUT/Library/LaunchDaemons"
 cp .theos/obj/arm64/akund "$LAYOUT/usr/bin/akund"
 cp -R "$WEBRTC_DIR/WebRTC.framework" "$LAYOUT/usr/lib/"
-cp layout-tipa/Library/LaunchDaemons/com.akun.akund.plist "$LAYOUT/Library/LaunchDaemons/"
+cp layout/Library/LaunchDaemons/com.akun.akund.plist "$LAYOUT/Library/LaunchDaemons/"
 chmod 0755 "$LAYOUT/usr/bin/akund"
 chmod 0644 "$LAYOUT/Library/LaunchDaemons/"*.plist
 # 框架必须 ad-hoc 签名，否则 roothide 拒绝加载（mapped file has no cdhash）
